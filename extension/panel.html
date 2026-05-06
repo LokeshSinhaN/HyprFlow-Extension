@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      width: 100%;
+      height: 100vh;
+      padding: 20px;
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+      background-color: #0f0f0f;
+      color: #e5e5e5;
+      display: flex;
+      flex-direction: column;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 4px;
+    }
+    .header img {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+    }
+    h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #ffffff;
+      letter-spacing: -0.3px;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: #737373;
+      margin-bottom: 20px;
+    }
+    .input-group {
+      position: relative;
+      margin-bottom: 12px;
+    }
+    textarea {
+      width: 100%;
+      height: 90px;
+      padding: 12px 14px;
+      border: 1px solid #262626;
+      border-radius: 10px;
+      background-color: #1a1a1a;
+      color: #f5f5f5;
+      resize: none;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.5;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+    }
+    textarea::placeholder {
+      color: #525252;
+    }
+    .btn-group {
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      flex: 1;
+      padding: 11px 16px;
+      border: none;
+      border-radius: 9px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      transition: all 0.2s ease;
+    }
+    #runBtn {
+      background: linear-gradient(135deg, #2563eb, #3b82f6);
+      color: white;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+    }
+    #runBtn:hover {
+      background: linear-gradient(135deg, #1d4ed8, #2563eb);
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
+      transform: translateY(-1px);
+    }
+    #runBtn:disabled {
+      background: #262626;
+      color: #525252;
+      cursor: not-allowed;
+      box-shadow: none;
+      transform: none;
+    }
+    #stopBtn {
+      background: #1a1a1a;
+      color: #ef4444;
+      border: 1px solid #262626;
+      display: none;
+    }
+    #stopBtn:hover {
+      background: #262626;
+      border-color: #ef4444;
+    }
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 12px;
+      margin-bottom: 12px;
+      padding: 8px 12px;
+      background: #1a1a1a;
+      border-radius: 8px;
+      border: 1px solid #262626;
+      font-size: 11px;
+      color: #737373;
+      display: none;
+    }
+    .status-bar.active {
+      display: flex;
+    }
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #22c55e;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .logs-container {
+      flex-grow: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .logs-header {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #525252;
+      margin-bottom: 8px;
+    }
+    #logs {
+      flex-grow: 1;
+      overflow-y: auto;
+      background-color: #0a0a0a;
+      border-radius: 10px;
+      padding: 12px;
+      font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace;
+      font-size: 11px;
+      line-height: 1.6;
+      border: 1px solid #1a1a1a;
+    }
+    #logs::-webkit-scrollbar {
+      width: 4px;
+    }
+    #logs::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    #logs::-webkit-scrollbar-thumb {
+      background: #262626;
+      border-radius: 4px;
+    }
+    .log-entry {
+      margin-bottom: 4px;
+      word-break: break-word;
+      padding: 2px 0;
+    }
+    .log-step { color: #60a5fa; font-weight: 600; }
+    .log-decision { color: #34d399; }
+    .log-success { color: #22c55e; }
+    .log-error { color: #f87171; }
+    .log-info { color: #737373; }
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: #404040;
+      font-size: 12px;
+      gap: 8px;
+    }
+    .empty-state-icon {
+      font-size: 24px;
+      opacity: 0.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h2>⚡ Hyprflow</h2>
+  </div>
+  <div class="subtitle">AI browser automation at your fingertips</div>
+  
+  <div class="input-group">
+    <textarea id="promptInput" placeholder="Describe what you want to automate on this page..."></textarea>
+  </div>
+  
+  <div class="btn-group">
+    <button id="runBtn">▶ Run Agent</button>
+    <button id="stopBtn">■ Stop</button>
+  </div>
+
+  <div class="status-bar" id="statusBar">
+    <div class="status-dot"></div>
+    <span id="statusText">Agent is running...</span>
+  </div>
+  
+  <div class="logs-container">
+    <div class="logs-header">Execution Log</div>
+    <div id="logs">
+      <div class="empty-state">
+        <div class="empty-state-icon">🤖</div>
+        <div>Enter a task and click Run to start</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="panel.js"></script>
+</body>
+</html>

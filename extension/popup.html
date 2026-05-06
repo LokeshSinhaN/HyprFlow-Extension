@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 320px;
+      padding: 20px;
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+      background-color: #0f0f0f;
+      color: #e5e5e5;
+    }
+    h2 {
+      margin-top: 0;
+      font-size: 16px;
+      font-weight: 600;
+      color: #ffffff;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      font-size: 12px;
+      color: #737373;
+      margin-bottom: 16px;
+    }
+    textarea {
+      width: 100%;
+      height: 80px;
+      padding: 10px 12px;
+      box-sizing: border-box;
+      border: 1px solid #262626;
+      border-radius: 8px;
+      background-color: #1a1a1a;
+      color: #f5f5f5;
+      resize: none;
+      margin-bottom: 10px;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+    }
+    textarea::placeholder {
+      color: #525252;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      background: linear-gradient(135deg, #2563eb, #3b82f6);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      transition: all 0.2s;
+    }
+    button:hover {
+      background: linear-gradient(135deg, #1d4ed8, #2563eb);
+      transform: translateY(-1px);
+    }
+    button:disabled {
+      background: #262626;
+      color: #525252;
+      cursor: not-allowed;
+      transform: none;
+    }
+    #status {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #737373;
+      min-height: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h2>⚡ Hyprflow</h2>
+  <div class="subtitle">Use the side panel for full control →</div>
+  <textarea id="promptInput" placeholder="What do you want me to do on this page?"></textarea>
+  <button id="runBtn">▶ Run Agent</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
