@@ -5,6 +5,7 @@
 /storage/framework/sessions/*
 /storage/framework/views/*
 /storage/logs/*
+/test-results
 .env
 .env.backup
 .env.production

@@ -4,6 +4,7 @@
 // tab auto-detection, post-popup directives, and stability waiting.
 
 const API_URL = "http://127.0.0.1:8001/api/extension/loop";
+const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -11,6 +12,11 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 // ─── STATE ─────────────────────────────────────────────────────
 let isRunning = false;
 let currentTabId = null;
+
+// Persisted after each agent run so "Generate Code" can use them
+let lastAgentHistory = [];
+let lastAgentPrompt = '';
+let lastAgentStartUrl = '';
 
 // Tab auto-detection: track newly created tabs so we can detect popups
 let recentlyCreatedTabs = [];
@@ -57,6 +63,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         isRunning = false;
         sendResponse({ status: 'stopped' });
         return true;
+    }
+
+    // ─── GENERATE SELENIUM CODE ─────────────────────────────────
+    if (message.type === 'GENERATE_SELENIUM') {
+        if (!lastAgentHistory.length) {
+            sendResponse({ success: false, message: 'No agent history. Run the agent first.' });
+            return true;
+        }
+
+        // Fire async, keep channel open
+        (async () => {
+            sendLogToPanel('🔄 Generating Selenium code...', 'info');
+            try {
+                const res = await fetch(GENERATE_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({
+                        history: lastAgentHistory,
+                        goal: lastAgentPrompt,
+                        startUrl: lastAgentStartUrl
+                    })
+                });
+                if (!res.ok) {
+                    const text = await res.text();
+                    sendResponse({ success: false, message: `Server error ${res.status}: ${text.slice(0, 300)}` });
+                    sendLogToPanel(`❌ Code generation failed: ${res.status}`, 'error');
+                    return;
+                }
+                const result = await res.json();
+                sendResponse(result);
+                if (result.success) {
+                    sendLogToPanel('✅ Selenium code generated successfully.', 'success');
+                } else {
+                    sendLogToPanel(`❌ Code generation failed: ${result.message || 'Unknown error'}`, 'error');
+                }
+            } catch (e) {
+                sendResponse({ success: false, message: e.message });
+                sendLogToPanel(`❌ Code generation error: ${e.message}`, 'error');
+            }
+        })();
+
+        return true; // keep message channel open for async
     }
 });
 
@@ -293,6 +341,15 @@ function resolveElementInfo(selector, observedElements) {
 async function agentLoop(prompt, tabId) {
     const maxSteps = 50;
     let actionHistory = [];           // Full rich history for Selenium code gen
+
+    // Capture the starting URL for Selenium TARGET_URL
+    lastAgentPrompt = prompt;
+    lastAgentHistory = [];
+    lastAgentStartUrl = '';
+    try {
+        const tab = await new Promise(r => chrome.tabs.get(tabId, r));
+        if (tab && tab.url) lastAgentStartUrl = tab.url;
+    } catch (e) {}
     let clickedSelectors = [];        // Track clicked selectors to prevent re-clicks
     let toggledOptions = {};          // Track toggled dropdown options
     let postPopupDirective = '';      // Injected directive after non-navigable popups
@@ -589,9 +646,11 @@ async function agentLoop(prompt, tabId) {
     }
 
     isRunning = false;
+    // Persist history for "Generate Code" button
+    lastAgentHistory = actionHistory;
     sendLogToPanel("Loop ended.", 'info');
-    // Re-enable the Run button in the panel
-    chrome.runtime.sendMessage({ type: 'AGENT_DONE' }).catch(() => {});
+    // Re-enable buttons in the panel — include hasHistory so panel knows code gen is available
+    chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => {});
 }
 
 // ─── UTILITY ───────────────────────────────────────────────────

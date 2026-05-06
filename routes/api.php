@@ -19,3 +19,7 @@ Route::get('/extension/health', [ExtensionController::class, 'health'])
 // Extension loop — AI brain endpoint
 Route::post('/extension/loop', [ExtensionController::class, 'loop'])
     ->name('extension.loop');
+
+// Generate Selenium code from action history
+Route::post('/extension/generate-selenium', [ExtensionController::class, 'generateSelenium'])
+    ->name('extension.generateSelenium');

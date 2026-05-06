@@ -3,14 +3,17 @@
 namespace App\Http\Controllers;
 
 use App\Services\AiService;
+use App\Services\SeleniumService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
 class ExtensionController extends Controller
 {
-    public function __construct(private readonly AiService $ai)
-    {
+    public function __construct(
+        private readonly AiService $ai,
+        private readonly SeleniumService $selenium
+    ) {
     }
 
     /**
@@ -205,6 +208,47 @@ PROMPT;
         } catch (\Exception $e) {
             Log::error('Extension Loop Error: ' . $e->getMessage());
             return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * POST /api/extension/generate-selenium
+     *
+     * Receives the action history from the Chrome Extension after an agent run,
+     * processes the trace, and generates a production-ready Python Selenium script.
+     */
+    public function generateSelenium(Request $request): JsonResponse
+    {
+        $history = $request->input('history', []);
+        $goal = $request->input('goal', '');
+        $startUrl = $request->input('startUrl', '');
+
+        if (empty($history)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No action history provided. Run the AI agent first.',
+            ], 400);
+        }
+
+        if (!$goal) {
+            $goal = 'Automate the actions performed in the recorded trace.';
+        }
+
+        // If the SOP doesn't mention a URL, inject the startUrl the agent was running on
+        // so the generated Selenium code navigates to the correct website.
+        if ($startUrl && !preg_match('#https?://#i', $goal)) {
+            $goal = "Go to {$startUrl} and then: " . $goal;
+        }
+
+        try {
+            $result = $this->selenium->generateSelenium($history, $goal, $startUrl);
+            return response()->json($result);
+        } catch (\Exception $e) {
+            Log::error('Selenium generation error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
         }
     }
 
