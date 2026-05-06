@@ -90,7 +90,7 @@ All configuration is in `.env`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GEMINI_API_KEY` | — | Google Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model name |
+| `GEMINI_MODEL` | `gemini-3-flash` | Gemini model name |
 | `OPENAI_API_KEY` | — | OpenAI API key |
 | `OPENAI_MODEL` | `gpt-4o` | OpenAI model name |
 | `MISTRAL_API_KEY` | — | Mistral API key |
