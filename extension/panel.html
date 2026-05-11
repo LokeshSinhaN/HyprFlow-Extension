@@ -106,7 +106,8 @@
       transform: translateY(-1px);
     }
 
-    #runBtn:disabled, #generateBtn:disabled {
+    #runBtn:disabled,
+    #generateBtn:disabled {
       background: #262626;
       color: #525252;
       cursor: not-allowed;
@@ -384,7 +385,7 @@
 
   <div class="btn-row">
     <button id="runBtn">▶ Run Agent</button>
-    <button id="generateBtn" disabled>⚡ Generate Code</button>
+    <button id="generateBtn" disabled> Generate Code</button>
   </div>
   <div class="btn-row" style="margin-top:6px">
     <button id="stopBtn">■ Stop</button>
@@ -415,7 +416,7 @@
     <div class="logs-header">Execution Log</div>
     <div id="logs">
       <div class="empty-state">
-        <div class="empty-state-icon">🤖</div>
+        <!-- <div class="empty-state-icon">🤖</div> -->
         <div>Enter a task and click Run to start</div>
       </div>
     </div>

@@ -18,6 +18,13 @@ let lastAgentHistory = [];
 let lastAgentPrompt = '';
 let lastAgentStartUrl = '';
 
+// Load persisted state on startup (Manifest V3 service worker may have restarted)
+chrome.storage.local.get(['lastAgentHistory', 'lastAgentPrompt', 'lastAgentStartUrl'], (result) => {
+    if (result.lastAgentHistory) lastAgentHistory = result.lastAgentHistory;
+    if (result.lastAgentPrompt) lastAgentPrompt = result.lastAgentPrompt;
+    if (result.lastAgentStartUrl) lastAgentStartUrl = result.lastAgentStartUrl;
+});
+
 // Tab auto-detection: track newly created tabs so we can detect popups
 let recentlyCreatedTabs = [];
 const TAB_DETECTION_WINDOW_MS = 5000;
@@ -67,50 +74,63 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // ─── GENERATE SELENIUM CODE ─────────────────────────────────
     if (message.type === 'GENERATE_SELENIUM') {
+        // Try to recover from global or storage
         if (!lastAgentHistory.length) {
-            sendResponse({ success: false, message: 'No agent history. Run the agent first.' });
+            chrome.storage.local.get(['lastAgentHistory', 'lastAgentPrompt', 'lastAgentStartUrl'], (result) => {
+                if (result.lastAgentHistory && result.lastAgentHistory.length) {
+                    lastAgentHistory = result.lastAgentHistory;
+                    lastAgentPrompt = result.lastAgentPrompt || '';
+                    lastAgentStartUrl = result.lastAgentStartUrl || '';
+                    performGeneration(sendResponse);
+                } else {
+                    sendResponse({ success: false, message: 'No agent history. Run the agent first.' });
+                }
+            });
             return true;
         }
 
-        // Fire async, keep channel open
-        (async () => {
-            sendLogToPanel('🔄 Generating Selenium code...', 'info');
-            try {
-                const res = await fetch(GENERATE_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                    body: JSON.stringify({
-                        history: lastAgentHistory,
-                        goal: lastAgentPrompt,
-                        startUrl: lastAgentStartUrl
-                    })
-                });
-                if (!res.ok) {
-                    const text = await res.text();
-                    sendResponse({ success: false, message: `Server error ${res.status}: ${text.slice(0, 300)}` });
-                    sendLogToPanel(`❌ Code generation failed: ${res.status}`, 'error');
-                    return;
-                }
-                const result = await res.json();
-                sendResponse(result);
-                if (result.success) {
-                    sendLogToPanel('✅ Selenium code generated successfully.', 'success');
-                } else {
-                    sendLogToPanel(`❌ Code generation failed: ${result.message || 'Unknown error'}`, 'error');
-                }
-            } catch (e) {
-                sendResponse({ success: false, message: e.message });
-                sendLogToPanel(`❌ Code generation error: ${e.message}`, 'error');
-            }
-        })();
-
+        performGeneration(sendResponse);
         return true; // keep message channel open for async
     }
 });
 
+/**
+ * Actual generation logic pulled out to handle both sync and async storage recovery
+ */
+async function performGeneration(sendResponse) {
+    sendLogToPanel('Generating Selenium code...', 'info');
+    try {
+        const res = await fetch(GENERATE_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+                history: lastAgentHistory,
+                goal: lastAgentPrompt,
+                startUrl: lastAgentStartUrl
+            })
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            sendResponse({ success: false, message: `Server error ${res.status}: ${text.slice(0, 300)}` });
+            sendLogToPanel(`Code generation failed: ${res.status}`, 'error');
+            return;
+        }
+        const result = await res.json();
+        sendResponse(result);
+        if (result.success) {
+            sendLogToPanel('Selenium code generated successfully.', 'success');
+        } else {
+            sendLogToPanel(`Code generation failed: ${result.message || 'Unknown error'}`, 'error');
+        }
+    } catch (e) {
+        sendResponse({ success: false, message: e.message });
+        sendLogToPanel(`Code generation error: ${e.message}`, 'error');
+    }
+}
+
 // ─── LOGGING ───────────────────────────────────────────────────
 function sendLogToPanel(text, level = 'info') {
-    chrome.runtime.sendMessage({ type: 'LOG', text, level }).catch(() => {});
+    chrome.runtime.sendMessage({ type: 'LOG', text, level }).catch(() => { });
     if (level === 'error') console.error(text);
     else console.log(text);
 }
@@ -179,7 +199,7 @@ async function handleTabManagement(decision) {
             chrome.tabs.query({}, (allTabs) => {
                 // Find by global index across all windows
                 const target = allTabs.find((t, i) => i === targetIndex) ||
-                               allTabs.find(t => t.index === targetIndex);
+                    allTabs.find(t => t.index === targetIndex);
                 if (target) {
                     currentTabId = target.id;
                     chrome.tabs.update(currentTabId, { active: true }, async () => {
@@ -349,7 +369,7 @@ async function agentLoop(prompt, tabId) {
     try {
         const tab = await new Promise(r => chrome.tabs.get(tabId, r));
         if (tab && tab.url) lastAgentStartUrl = tab.url;
-    } catch (e) {}
+    } catch (e) { }
     let clickedSelectors = [];        // Track clicked selectors to prevent re-clicks
     let toggledOptions = {};          // Track toggled dropdown options
     let postPopupDirective = '';      // Injected directive after non-navigable popups
@@ -587,12 +607,12 @@ async function agentLoop(prompt, tabId) {
                             historyEntry.popup_title = newTabInfo.title;
                             historyEntry.auto_switched = true;
 
-                            sendLogToPanel(`🆕 New tab detected and switched: ${newTabInfo.title} (${newTabInfo.url})`, 'success');
+                            sendLogToPanel(`New tab detected and switched: ${newTabInfo.title} (${newTabInfo.url})`, 'success');
                         } else if (newTabInfo && !newTabInfo.isNavigable) {
                             // Non-navigable popup (PDF, document stream) — close it and stay
                             try {
                                 chrome.tabs.remove(newTabInfo.tabId);
-                            } catch (e) {}
+                            } catch (e) { }
                             historyEntry.popup_navigable = false;
                             postPopupDirective = 'The last click opened a non-navigable document/PDF tab. '
                                 + 'The system auto-closed it. You are on the MAIN page. '
@@ -648,9 +668,17 @@ async function agentLoop(prompt, tabId) {
     isRunning = false;
     // Persist history for "Generate Code" button
     lastAgentHistory = actionHistory;
+    
+    // Save to storage for Manifest V3 persistence
+    chrome.storage.local.set({ 
+        lastAgentHistory: actionHistory,
+        lastAgentPrompt: lastAgentPrompt,
+        lastAgentStartUrl: lastAgentStartUrl
+    });
+
     sendLogToPanel("Loop ended.", 'info');
     // Re-enable buttons in the panel — include hasHistory so panel knows code gen is available
-    chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => {});
+    chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => { });
 }
 
 // ─── UTILITY ───────────────────────────────────────────────────

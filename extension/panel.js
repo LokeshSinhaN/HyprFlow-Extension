@@ -149,7 +149,7 @@ document.addEventListener('DOMContentLoaded', () => {
     generateBtn.addEventListener('click', () => {
         generateBtn.disabled = true;
         generateBtn.textContent = '\u23f3 Generating...';
-        appendLog('\ud83d\udd04 Requesting Selenium code generation...', 'info');
+        appendLog(' Requesting Selenium code generation...', 'info');
 
         chrome.runtime.sendMessage({ type: 'GENERATE_SELENIUM' }, (response) => {
             generateBtn.textContent = '\u26a1 Generate Code';
