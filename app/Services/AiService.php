@@ -404,7 +404,16 @@ class AiService
         ]);
 
         try {
-            $client = OpenAI::client($apiKey);
+            $sslVerifyDisabled = filter_var(env('CURL_SSL_VERIFY_DISABLED', true), FILTER_VALIDATE_BOOLEAN);
+            if ($sslVerifyDisabled) {
+                $httpClient = $this->getGuzzleClient(['base_uri' => 'https://api.openai.com/v1']);
+                $client = OpenAI::factory()
+                    ->withApiKey($apiKey)
+                    ->withHttpClient($httpClient)
+                    ->make();
+            } else {
+                $client = OpenAI::client($apiKey);
+            }
 
             $messages = [];
             if ($systemPrompt) {
@@ -448,7 +457,16 @@ class AiService
         Log::debug('Calling OpenAI Vision API', ['model' => $model, 'prompt_length' => strlen($prompt)]);
 
         try {
-            $client = OpenAI::client($apiKey);
+            $sslVerifyDisabled = filter_var(env('CURL_SSL_VERIFY_DISABLED', true), FILTER_VALIDATE_BOOLEAN);
+            if ($sslVerifyDisabled) {
+                $httpClient = $this->getGuzzleClient(['base_uri' => 'https://api.openai.com/v1']);
+                $client = OpenAI::factory()
+                    ->withApiKey($apiKey)
+                    ->withHttpClient($httpClient)
+                    ->make();
+            } else {
+                $client = OpenAI::client($apiKey);
+            }
             
             $dataUri = $imageBase64;
             if (!str_starts_with($imageBase64, 'data:image')) {

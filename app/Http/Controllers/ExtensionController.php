@@ -29,6 +29,10 @@ class ExtensionController extends Controller
         $prompt = $request->input('prompt');
         $url = $request->input('url');
         $elements = $request->input('elements', []);
+        $imageBase64 = $request->input('image');
+        $somMap = $request->input('somMap', []);
+        $dropdownStates = $request->input('dropdownStates', []);
+        $sopProgress = $request->input('sopProgress', []);
 
         if (!$prompt) {
             return response()->json(['error' => 'Prompt is required'], 400);
@@ -45,15 +49,85 @@ class ExtensionController extends Controller
         $lastActionFailed = (bool) $request->input('lastActionFailed', false);
         $lastActionError = $request->input('lastActionError', '');
 
-        // Build clicked-elements list for the AI
-        $clickedList = !empty($clickedSelectors)
-            ? implode("\n", array_map(fn($s, $i) => ($i + 1) . ". " . $s, $clickedSelectors, array_keys($clickedSelectors)))
+        // Build clicked-elements list for the AI (filter out BLOCKED: prefixed ones)
+        $normalClicked = array_filter($clickedSelectors, fn($s) => !str_starts_with($s, 'BLOCKED:'));
+        $clickedList = !empty($normalClicked)
+            ? implode("\n", array_map(fn($s, $i) => ($i + 1) . ". " . $s, array_values($normalClicked), array_keys(array_values($normalClicked))))
             : 'None yet';
+
+        // Build blocked selectors list (dynamically populated when loops are detected)
+        $blockedSelectors = array_filter($clickedSelectors, fn($s) => str_starts_with($s, 'BLOCKED:'));
+        $blockedList = !empty($blockedSelectors)
+            ? implode("\n", array_map(fn($s) => "🚫 " . str_replace('BLOCKED:', '', $s), $blockedSelectors))
+            : 'None (no fields have been blocked yet)';
 
         // Build toggle state info
         $toggleStateInfo = !empty($toggledOptions)
             ? json_encode($toggledOptions, JSON_UNESCAPED_UNICODE)
             : 'None yet';
+
+        // Build dropdown states block
+        $dropdownStatesBlock = '';
+        if (!empty($dropdownStates)) {
+            $dropdownStatesBlock = "\n# CURRENT DROPDOWN VALUES (AUTHORITATIVE SOURCE OF TRUTH — DO NOT ASSUME!)\n";
+            $dropdownStatesBlock .= "⚠️ WARNING: These are the ACTUAL current values read from the DOM. Do NOT hallucinate or assume different values.\n";
+            foreach ($dropdownStates as $dropdown) {
+                $label = $dropdown['label'] ?? $dropdown['text'] ?? 'unknown';
+                $currentValue = $dropdown['currentValue'] ?? '(empty)';
+                $isPlaceholder = !empty($dropdown['isPlaceholder']);
+                $status = $isPlaceholder ? '⚠️ NOT SET (placeholder/default)' : '✓ SET';
+                $dropdownStatesBlock .= "- \"{$label}\" (selector: {$dropdown['selector']}): currently = \"{$currentValue}\" [{$status}]\n";
+            }
+            $dropdownStatesBlock .= "\nDROPDOWN RULES:\n";
+            $dropdownStatesBlock .= "1. If a dropdown shows a PLACEHOLDER (e.g., 'Select gender', 'Choose...', '--'), it is NOT set. You MUST select the correct value.\n";
+            $dropdownStatesBlock .= "2. If a dropdown ALREADY shows the desired value (e.g., shows 'Male' and task says Male), SKIP it.\n";
+            $dropdownStatesBlock .= "3. NEVER assume a dropdown is set without checking the values above.\n";
+            $dropdownStatesBlock .= "4. Use 'select_option' action for <select> dropdowns, NOT 'type'.\n";
+        }
+
+        // Build SoM map description (only when vision/image is provided)
+        $somDescription = '';
+        $hasVision = !empty($imageBase64) && strlen($imageBase64) > 1000;
+        if (!empty($somMap) && $hasVision) {
+            $somDescription = "\n# SET-OF-MARK (SoM) LABELS\n";
+            $somDescription .= "The screenshot shows numbered red boxes around elements.\n";
+            $somDescription .= "Use \"somIndex\" in your response to reference elements by their number.\n";
+            $somDescription .= "SoM Map: " . json_encode($somMap) . "\n";
+        }
+        
+        // Mode indicator for the AI
+        $modeIndicator = $hasVision
+            ? "MODE: VISION (screenshot provided — use visual + DOM data)"
+            : "MODE: DOM-ONLY (no screenshot — rely on element selectors, IDs, values, and field status)";
+
+        // Build form field status summary (helps AI see what's filled vs empty)
+        $formFieldStatus = '';
+        $inputFields = array_filter($elements, fn($el) =>
+            in_array($el['tagName'] ?? '', ['input', 'textarea', 'select'])
+        );
+        if (!empty($inputFields)) {
+            $filledFields = [];
+            $emptyFields = [];
+            foreach ($inputFields as $field) {
+                $fieldId = $field['id'] ?? $field['name'] ?? $field['selector'] ?? 'unknown';
+                $fieldType = $field['type'] ?? $field['tagName'] ?? '';
+                $currentVal = $field['currentValue'] ?? $field['selectedOptionText'] ?? '';
+                $isPlaceholder = !empty($field['isPlaceholderSelected']);
+                
+                if ($currentVal && !$isPlaceholder && $currentVal !== '') {
+                    $filledFields[] = "{$fieldId} ({$fieldType}): \"{$currentVal}\"";
+                } else {
+                    $emptyFields[] = "{$fieldId} ({$fieldType}): EMPTY";
+                }
+            }
+            if (!empty($emptyFields)) {
+                $formFieldStatus = "\n# FORM FIELD STATUS (EMPTY fields need to be filled!):\n";
+                $formFieldStatus .= "EMPTY/UNFILLED: " . implode(', ', array_slice($emptyFields, 0, 15)) . "\n";
+                if (!empty($filledFields)) {
+                    $formFieldStatus .= "ALREADY FILLED: " . implode(', ', array_slice($filledFields, 0, 15)) . "\n";
+                }
+            }
+        }
 
         // Limit elements to prevent massive payloads
         $sliceCount = min(max(count($elements), 60), count($elements));
@@ -66,14 +140,41 @@ class ExtensionController extends Controller
         // Build post-popup directive block (injected by background.js after non-navigable popups)
         $popupDirectiveBlock = '';
         if ($postPopupDirective !== '') {
-            $popupDirectiveBlock = "\n\n⚠️ SYSTEM DIRECTIVE (HIGHEST PRIORITY):\n{$postPopupDirective}\n";
+            $popupDirectiveBlock = "\n\n⚠️ NAVIGATION/STATE DIRECTIVE:\n{$postPopupDirective}\n";
         }
 
-        // 2. Build the full ReAct AI Prompt (ported from AutomationService::doAi)
+        // Build dynamic SOP progress block
+        $sopProgressBlock = '';
+        if (!empty($sopProgress) && !empty($history)) {
+            $uniqueFields = $sopProgress['uniqueFieldsInteracted'] ?? 0;
+            $totalActions = $sopProgress['totalSuccessfulActions'] ?? 0;
+            $recentRate = $sopProgress['recentNewFieldRate'] ?? 1;
+            $isStagnating = $sopProgress['isStagnating'] ?? false;
+            $stepCount = count($history);
+            
+            $sopProgressBlock = "\n# TASK PROGRESS (DYNAMIC — step {$stepCount}):\n";
+            $sopProgressBlock .= "- Unique fields interacted: {$uniqueFields}\n";
+            $sopProgressBlock .= "- Total successful actions: {$totalActions}\n";
+            $sopProgressBlock .= "- Recent new-field rate: " . round($recentRate * 100) . "% (0% = no new fields being touched)\n";
+            
+            if ($isStagnating) {
+                $sopProgressBlock .= "⚠️ STAGNATION DETECTED: You are no longer making progress on new fields.\n";
+                $sopProgressBlock .= "→ If all SOP steps have been attempted, SUBMIT the form and call 'finish'.\n";
+                $sopProgressBlock .= "→ Do NOT keep retrying fields that already failed multiple times.\n";
+            } elseif ($recentRate == 0 && $stepCount > 5) {
+                $sopProgressBlock .= "⚠️ WARNING: No new fields in recent steps. Consider if you've completed all SOP steps.\n";
+            }
+        }
+
+        // 2. Build the full ReAct AI Prompt with Vision + SoM + Enhanced State Checking
         $aiPrompt = <<<PROMPT
-You are an advanced autonomous browser agent using the ReAct (Reason + Act) framework.
+You are an advanced autonomous browser agent. {$modeIndicator}
+{$somDescription}
 Goal: {$prompt}
 {$popupDirectiveBlock}
+{$dropdownStatesBlock}
+{$formFieldStatus}
+{$sopProgressBlock}
 
 # CURRENT STATE
 URL: {$url}
@@ -87,15 +188,25 @@ You must review this history to understand what you have already tried.
 # CLICKED ELEMENTS (do NOT re-click the SAME selector — but elements with DEEPER or DIFFERENT CSS paths are always NEW):
 {$clickedList}
 
+# BLOCKED SELECTORS (ABSOLUTE BAN — these fields FAILED repeatedly and are permanently blocked):
+{$blockedList}
+⚠️ If a selector appears in BLOCKED SELECTORS, you MUST NOT interact with it. Skip it entirely and move to the next SOP step.
+
+# SCROLLING (use when elements are not visible in the viewport):
+- Use {"action":"scroll_down"} to scroll down and reveal hidden elements (like submit buttons at bottom of forms)
+- Use {"action":"scroll_up"} to scroll back up
+- If you cannot see a submit/save button in the screenshot, scroll down first
+
 # HIERARCHICAL ELEMENT RULE:
 When you click an element that reveals additional nested elements (e.g. expand → child inside → next action inside), every revealed element is a DISTINCT element with its own deeper selector. You MUST click each one in sequence as directed by the SOP. These are never "re-clicks" of a previous element.
 
 # RESPONSE FORMAT
 You MUST respond with EXACTLY ONE JSON object, no markdown blocks, no extra text.
 {
-    "thought": "1. Analyze current page state. 2. Verify what happened after last step. 3. Decide the exact next action.",
-    "action": "click|type|hover|select_option|extract|navigate|finish|switch_tab|new_tab|list_tabs|close_tab",
-    "selector": "exact css selector from the elements list",
+    "thought": "1. Analyze the SCREENSHOT and current page state. 2. Check CURRENT DROPDOWN VALUES section - if status shows 'NOT SET (placeholder/default)' you MUST select the value; if already correct, SKIP. 3. Verify what happened after last step. 4. Decide the exact next action.",
+    "action": "click|type|hover|select_option|scroll_down|scroll_up|extract|navigate|finish|switch_tab|new_tab|list_tabs|close_tab",
+    "somIndex": "number from red box on screenshot (if available, prefer this over selector)",
+    "selector": "MUST BE PROVIDED. exact css selector from the elements list (fallback if somIndex not available). NEVER leave this empty!",
     "text": "text to type (if type action)",
     "option": "exact text of the option to select (if select_option action)",
     "unselect": false,
@@ -104,11 +215,22 @@ You MUST respond with EXACTLY ONE JSON object, no markdown blocks, no extra text
     "summary": "brief summary of completion (if finish action)"
 }
 
+CRITICAL: The "selector" field MUST contain a valid CSS selector. NEVER respond with an empty or undefined selector. Always pick the most specific selector from the elements list.
+
 - If the goal is complete: {"thought":"...", "action":"finish", "summary":"brief summary"}
 - To extract data: {"thought":"...", "action":"extract", "selector":"optional container selector"}
 - For DROPDOWN menus with unselect: {"thought":"...", "action":"select_option", "selector":"...", "option":"value", "unselect":true}
 - For text input fields: {"thought":"...", "action":"type", "selector":"...", "text":"value"}
 - CRITICAL: When the target element is a <select> dropdown, use "select_option" instead of "type".
+
+# DROPDOWN STATE CHECKING (CRITICAL - MUST FOLLOW EXACTLY):
+- ALWAYS check the "CURRENT DROPDOWN VALUES" section above BEFORE deciding on any dropdown
+- If a dropdown shows a PLACEHOLDER like "Select gender", "Choose...", or "--", it is NOT SET. You MUST use select_option to set it.
+- If a dropdown ALREADY shows the exact desired value (e.g., shows "Male" and task says Male), SKIP it - proceed to next step
+- NEVER assume a dropdown is already set without verifying against the CURRENT DROPDOWN VALUES section
+- If the CURRENT DROPDOWN VALUES section shows "⚠️ NOT SET (placeholder/default)" for a dropdown, you MUST select the correct value
+- Use "select_option" action (NOT "type") for all <select> dropdowns
+- The "option" field must contain the exact text of the option to select (e.g., "Male", not "male")
 
 # FAILURE HANDLING (CRITICAL — prevents silent failure passthrough):
 - Each action in the history has an "actionSuccess" field (true/false).
@@ -182,15 +304,93 @@ You MUST respond with EXACTLY ONE JSON object, no markdown blocks, no extra text
   3. Click the first remaining unclicked element
 - NEVER click an element already clicked in this session — always progress forward.
 
+# SoM (Set-of-Mark) USAGE:
+- Look at the SCREENSHOT: red numbered boxes show interactive elements
+- Prefer using "somIndex" (the number in the box) over CSS selectors when available
+- The somIndex maps to exact selectors automatically
+- Example: "somIndex": "5" means click the element with box #5
+
+# DATE INPUT HANDLING (CRITICAL — prevents typing failures):
+- HTML5 date inputs (type="date") show "dd-mm-yyyy" or "mm/dd/yyyy" as placeholder
+- You MUST type dates in DD-MM-YYYY format (e.g., "18-05-2001") — the system auto-converts to the correct format
+- If a date field still shows the placeholder after typing, the system handles the conversion internally
+- Do NOT try different date formats yourself — just use the format from the SOP (e.g., "18-05-2001")
+- The system will automatically parse and convert any date format to what the browser needs
+
+# VISUAL VERIFICATION PRIORITY (CRITICAL — prevents hallucination):
+- The SCREENSHOT is the GROUND TRUTH of the page state
+- If the screenshot shows "Select gender" in a dropdown but some text says it's "Male", TRUST THE SCREENSHOT
+- NEVER assume a field is filled if the screenshot shows it empty/placeholder
+- After each action, visually verify in the NEXT screenshot that the action actually took effect
+- If a field still shows its placeholder in the screenshot, the previous action FAILED — retry it
+
+# FORM COMPLETION & SUBMISSION (DYNAMIC — driven by TASK PROGRESS above):
+- Check the "TASK PROGRESS" section above to understand your completion state
+- If "STAGNATION DETECTED" appears, you MUST submit the form immediately
+- If "Recent new-field rate: 0%" and you've interacted with many fields, you're likely done — submit
+- After attempting all SOP steps (check your ACTION HISTORY), click the submit/save button
+- If some fields couldn't be filled (loop detected), proceed to submit anyway — form validation will guide you
+- After clicking submit: if page changes or modal closes → call "finish"
+- If validation errors appear after submit → fix ONLY those errors, then re-submit
+- NEVER get stuck retrying a field that already failed 3+ times — move forward
+- If the FORM FIELD STATUS shows most fields are filled and you've been running many steps, SUBMIT NOW
+
 Only one action per response.
 PROMPT;
 
         try {
-            // 3. Ask the Brain (Gemini/OpenAI)
-            $response = $this->ai->generate($aiPrompt);
+            // 3. Ask the Brain (Gemini/OpenAI) - Use Vision if image provided and valid
+            $response = null;
+            $visionFailed = false;
+            $triedVision = false;
+
+            if ($imageBase64 && strlen($imageBase64) > 1000) {
+                $triedVision = true;
+                try {
+                    // Try OpenAI first for vision (better vision support)
+                    if (!empty(config('openai.api_key'))) {
+                        Log::info('Using OpenAI Vision for extension agent', ['image_size' => strlen($imageBase64)]);
+                        $response = $this->ai->generateVision($aiPrompt, $imageBase64, 'openai');
+                    }
+
+                    // If OpenAI failed, try Gemini
+                    if (!$response && !empty(config('gemini.api_key'))) {
+                        Log::info('Trying Gemini Vision for extension agent', ['image_size' => strlen($imageBase64)]);
+                        $response = $this->ai->generateVision($aiPrompt, $imageBase64, 'gemini');
+                    }
+                } catch (\Exception $visionError) {
+                    Log::warning('Vision failed, falling back to text-only', ['error' => $visionError->getMessage()]);
+                    $visionFailed = true;
+                }
+
+                // Check if vision response indicates an error
+                if ($response && (str_contains($response, 'Cannot read') || str_contains($response, 'does not support image') || str_contains($response, 'image input'))) {
+                    Log::warning('Vision model does not support images, using text-only');
+                    $visionFailed = true;
+                    $response = null;
+                }
+            } else {
+                $visionFailed = true;
+            }
+
+            // Fallback to text-only ONLY if we don't have a valid response
+            // (vision succeeded = $response is not null, so don't override it)
+            if ($response === null) {
+                $provider = $triedVision ? null : config('automation.primary_ai', 'gemini');
+                Log::info('Using text-only AI mode' . ($provider ? " with {$provider}" : ""), [
+                    'vision_tried' => $triedVision,
+                    'vision_failed' => $visionFailed,
+                    'had_image' => !empty($imageBase64)
+                ]);
+                $response = $this->ai->generate($aiPrompt, $provider);
+            } else {
+                Log::info('Vision AI response received successfully', ['response_length' => strlen($response)]);
+            }
 
             if ($response === null) {
-                return response()->json(['error' => 'AI generation failed'], 500);
+                $errorMsg = $this->ai->getLastError() ?: 'AI generation failed';
+                Log::error('AI generation failed', ['error' => $errorMsg]);
+                return response()->json(['error' => $errorMsg], 500);
             }
 
             // 4. Parse JSON from AI response (strip markdown if any)
@@ -198,11 +398,36 @@ PROMPT;
             $decision = json_decode(trim($cleanJson), true);
 
             if (!$decision || !isset($decision['action'])) {
-                Log::warning('Failed to parse AI decision', ['raw' => $response]);
+                Log::warning('Failed to parse AI decision', ['raw' => substr($response, 0, 500)]);
                 return response()->json(['error' => 'Invalid AI response format'], 500);
             }
 
-            // 5. Return decision to Extension
+            // 5. Resolve SoM index to selector if provided
+            if (!empty($decision['somIndex']) && !empty($somMap)) {
+                $somIndex = (string) $decision['somIndex'];
+                if (isset($somMap[$somIndex])) {
+                    $decision['selector'] = $somMap[$somIndex];
+                    Log::info("Resolved SoM index {$somIndex} to selector: {$decision['selector']}");
+                }
+            }
+
+            // 6. Validate selector is present and not empty
+            $action = $decision['action'] ?? '';
+            if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector'])) {
+                // If no selector, try to use somIndex, or return error
+                if (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
+                    $decision['selector'] = $somMap[(string)$decision['somIndex']];
+                    Log::info("Used somIndex to resolve missing selector: {$decision['selector']}");
+                } else {
+                    Log::warning('AI returned empty selector', ['action' => $action, 'decision' => $decision]);
+                    return response()->json([
+                        'error' => 'AI returned empty selector. Must provide CSS selector for ' . $action . ' action.',
+                        'retry' => true
+                    ], 500);
+                }
+            }
+
+            // 7. Return decision to Extension
             return response()->json($decision);
 
         } catch (\Exception $e) {

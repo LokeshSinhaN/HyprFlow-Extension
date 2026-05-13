@@ -357,9 +357,144 @@ function resolveElementInfo(selector, observedElements) {
     return { css: selector, xpath: '', id: '', text: '' };
 }
 
+// ─── VISION: Capture SoM Screenshot ───────────────────────────
+async function captureSoMScreenshot(tabId) {
+    const visionConfig = {
+        enabled: true,
+        maxWidth: 1024,
+        quality: 60, // Must be integer (0-100), not float
+        maxElements: 60,
+        somEnabled: true
+    };
+
+    try {
+        // First get element positions and SoM mapping from content script
+        const result = await executeContentScript(tabId, 'CAPTURE_SOM', visionConfig, 3);
+
+        if (!result || !result.success) {
+            sendLogToPanel(`SoM preparation failed: ${result?.error || 'Unknown error'}`, 'warn');
+            return null;
+        }
+
+        // Get the tab's windowId FIRST (must be done outside the Promise constructor)
+        let windowId = null;
+        try {
+            const tabInfo = await new Promise((resolve) => {
+                chrome.tabs.get(tabId, (tab) => {
+                    if (chrome.runtime.lastError) {
+                        resolve(null);
+                    } else {
+                        resolve(tab);
+                    }
+                });
+            });
+            windowId = tabInfo ? tabInfo.windowId : null;
+        } catch (e) {
+            sendLogToPanel(`Failed to get tab info: ${e.message}`, 'warn');
+        }
+
+        if (!windowId) {
+            sendLogToPanel('Could not determine windowId for screenshot, using text-only mode', 'warn');
+            return {
+                success: true,
+                image: null,
+                somMap: result.somMap,
+                elements: result.elements,
+                elementCount: result.elementCount,
+                pageUrl: result.pageUrl,
+                pageTitle: result.pageTitle
+            };
+        }
+
+        // Ensure the tab is active/focused before capturing
+        try {
+            await new Promise((resolve) => {
+                chrome.tabs.update(tabId, { active: true }, () => {
+                    if (chrome.runtime.lastError) resolve(null);
+                    else resolve(true);
+                });
+            });
+            await new Promise((resolve) => {
+                chrome.windows.update(windowId, { focused: true }, () => {
+                    if (chrome.runtime.lastError) resolve(null);
+                    else resolve(true);
+                });
+            });
+            // Small delay to let the tab become visible
+            await sleep(150);
+        } catch (e) {
+            // Non-critical, continue with capture attempt
+        }
+
+        // Capture the actual screenshot from the tab using the correct windowId
+        // Note: quality must be an integer (0-100), not a decimal
+        const screenshot = await new Promise((resolve) => {
+            chrome.tabs.captureVisibleTab(windowId, {
+                format: 'jpeg',
+                quality: 60 // Integer between 0 and 100
+            }, (dataUrl) => {
+                if (chrome.runtime.lastError) {
+                    sendLogToPanel(`Screenshot capture error: ${chrome.runtime.lastError.message}`, 'warn');
+                    resolve(null);
+                } else {
+                    resolve(dataUrl);
+                }
+            });
+        });
+
+        // If first attempt failed, retry once after a short delay
+        let finalScreenshot = screenshot;
+        if (!finalScreenshot) {
+            await sleep(500);
+            finalScreenshot = await new Promise((resolve) => {
+                chrome.tabs.captureVisibleTab(windowId, {
+                    format: 'jpeg',
+                    quality: 60
+                }, (dataUrl) => {
+                    if (chrome.runtime.lastError) {
+                        sendLogToPanel(`Screenshot retry failed: ${chrome.runtime.lastError.message}`, 'warn');
+                        resolve(null);
+                    } else {
+                        resolve(dataUrl);
+                    }
+                });
+            });
+        }
+
+        if (finalScreenshot) {
+            sendLogToPanel(`Captured SoM screenshot with ${Object.keys(result.somMap || {}).length} labeled elements`, 'info');
+
+            return {
+                success: true,
+                image: finalScreenshot,
+                somMap: result.somMap,
+                elements: result.elements,
+                elementCount: result.elementCount,
+                pageUrl: result.pageUrl,
+                pageTitle: result.pageTitle
+            };
+        } else {
+            sendLogToPanel('Screenshot capture returned null after retry, using text-only mode', 'warn');
+            // Fall back to text-only mode but still return elements
+            return {
+                success: true,
+                image: null,
+                somMap: result.somMap,
+                elements: result.elements,
+                elementCount: result.elementCount,
+                pageUrl: result.pageUrl,
+                pageTitle: result.pageTitle
+            };
+        }
+    } catch (e) {
+        sendLogToPanel(`SoM capture failed: ${e.message}`, 'warn');
+    }
+    return null;
+}
+
 // ─── MAIN AGENT LOOP ───────────────────────────────────────────
 async function agentLoop(prompt, tabId) {
-    const maxSteps = 50;
+    const maxSteps = 50; // Increased from default to handle complex SOPs
     let actionHistory = [];           // Full rich history for Selenium code gen
 
     // Capture the starting URL for Selenium TARGET_URL
@@ -379,10 +514,12 @@ async function agentLoop(prompt, tabId) {
     let failedActionCount = 0;       // Consecutive failures
     const maxFailedActions = 3;
     let lastObservedElements = [];    // Cache for element resolution
+    let lastSomMap = {};              // SoM index to selector mapping
     let lastActionFailed = false;     // Did the previous action fail?
     let lastActionError = '';         // Error message from last failed action
     let recentFingerprints = [];      // Last 3 page fingerprints for stale detection
     let staleStateCount = 0;          // Consecutive steps with identical fingerprints
+    let lastPageUrl = '';             // Track URL changes for vision triggering
 
     for (let step = 0; step < maxSteps && isRunning; step++) {
         sendLogToPanel(`--- Step ${step + 1} ---`, 'step');
@@ -396,35 +533,94 @@ async function agentLoop(prompt, tabId) {
         // 1. Wait for page stability (DOM + network)
         await waitForStability(currentTabId, 2000);
 
-        // 2. OBSERVE the page
-        const observeResult = await executeContentScript(currentTabId, 'OBSERVE');
-        if (!observeResult || !observeResult.elements) {
-            sendLogToPanel("Failed to observe page. Retrying...", 'error');
-            await sleep(2000);
-            await injectContentScript(currentTabId);
-            continue;
+        // 2. HYBRID MODE: DOM-primary with Vision-on-demand
+        // Vision is only triggered when the agent is confused/stuck
+        let observeResult = null;
+        let useVision = shouldUseVision(step, failedActionCount, lastActionFailed, actionHistory, lastPageUrl);
+
+        // Get current tab URL
+        let currentTabUrl = '';
+        try {
+            const tabInfo = await new Promise(resolve => chrome.tabs.get(currentTabId, resolve));
+            currentTabUrl = tabInfo?.url || '';
+        } catch (e) { }
+
+        // Track page changes for vision triggering
+        const pageChanged = currentTabUrl !== lastPageUrl && lastPageUrl !== '';
+        if (currentTabUrl) lastPageUrl = currentTabUrl;
+
+        // Also trigger vision on page navigation
+        if (pageChanged) useVision = true;
+
+        if (useVision) {
+            // VISION MODE: Capture screenshot + elements (slower but visual)
+            sendLogToPanel('🔍 Vision mode activated', 'info');
+            const somData = await captureSoMScreenshot(currentTabId);
+            if (somData && somData.success) {
+                observeResult = {
+                    url: somData.pageUrl || currentTabUrl || '',
+                    title: somData.pageTitle || '',
+                    elements: somData.elements,
+                    image: somData.image,
+                    somMap: somData.somMap
+                };
+                lastSomMap = somData.somMap || {};
+                lastObservedElements = somData.elements;
+            }
         }
-        lastObservedElements = observeResult.elements;
+
+        // DOM-ONLY MODE (default): Fast, reliable, no screenshot
+        if (!observeResult) {
+            observeResult = await executeContentScript(currentTabId, 'OBSERVE');
+            if (!observeResult || !observeResult.elements) {
+                sendLogToPanel("Failed to observe page. Retrying...", 'error');
+                await sleep(2000);
+                await injectContentScript(currentTabId);
+                continue;
+            }
+            observeResult.url = currentTabUrl || observeResult.url;
+            observeResult.image = null; // No image in DOM-only mode
+            observeResult.somMap = null;
+            lastObservedElements = observeResult.elements;
+        }
+
+        sendLogToPanel(`Page: ${observeResult.url}`, 'info');
 
         // Clear recently created tabs before the AI decision (so we can detect new ones after a click)
         recentlyCreatedTabs = [];
 
         // --- FINGERPRINT-BASED STALE-STATE DETECTION ---
+        // Dynamically detects when the agent is truly stuck (not just filling a form)
+        // Only triggers for NON-form-filling actions that should change the page
         const fingerprint = await executeContentScript(currentTabId, 'GET_FINGERPRINT', null, 2);
-        if (fingerprint && fingerprint.contentHash) {
+        if (fingerprint && fingerprint.contentHash && step > 5) {
             recentFingerprints.push(fingerprint.contentHash);
-            if (recentFingerprints.length > 3) recentFingerprints.shift();
+            if (recentFingerprints.length > 4) recentFingerprints.shift();
 
-            // If last 3 fingerprints are identical, the page hasn't changed
-            if (recentFingerprints.length === 3 &&
+            // Only check if last 4 fingerprints are ALL identical
+            if (recentFingerprints.length === 4 &&
                 recentFingerprints[0] === recentFingerprints[1] &&
-                recentFingerprints[1] === recentFingerprints[2]) {
-                staleStateCount++;
-                if (staleStateCount >= 2 && !postPopupDirective) {
-                    postPopupDirective = 'STALE STATE: The page has NOT changed for the last 3+ steps. '
-                        + 'Your previous actions had NO visible effect. '
-                        + 'You MUST try a completely different approach: different selector, different action type, or skip this step.';
-                    sendLogToPanel('⚠️ Stale state detected — page unchanged for 3+ steps', 'error');
+                recentFingerprints[1] === recentFingerprints[2] &&
+                recentFingerprints[2] === recentFingerprints[3]) {
+
+                // Dynamically check: are recent actions form-filling or navigation?
+                const recentActions = actionHistory.slice(-4).map(h => h.action);
+                const formFillingActions = ['type', 'select_option', 'scroll_down', 'scroll_up'];
+                const allFormFilling = recentActions.every(a => formFillingActions.includes(a));
+
+                // Only trigger stale state if recent actions are NOT form-filling
+                // (form filling on same page is normal — page fingerprint won't change)
+                if (!allFormFilling) {
+                    staleStateCount++;
+                    if (staleStateCount >= 3 && !postPopupDirective) {
+                        postPopupDirective = 'STALE STATE: The page has NOT changed for 4+ non-form steps. '
+                            + 'Your previous click/navigation actions had NO visible effect. '
+                            + 'Try a completely different approach or scroll to find new elements.';
+                        sendLogToPanel('⚠️ Stale state detected — page unchanged for 4+ steps', 'error');
+                    }
+                } else {
+                    // Form filling on same page is normal — don't count as stale
+                    staleStateCount = 0;
                 }
             } else {
                 staleStateCount = 0;
@@ -440,8 +636,45 @@ async function agentLoop(prompt, tabId) {
                 `Do NOT skip to the next SOP step. Do NOT call finish.`;
         }
 
+        // --- DYNAMIC SOP PROGRESS DETECTION ---
+        // Analyze action history to detect when the agent has completed all SOP steps
+        // and is stagnating (no new unique fields being interacted with)
+        if (!postPopupDirective && actionHistory.length > 5) {
+            const progressInfo = analyzeSopProgress(actionHistory, observeResult.elements);
+            if (progressInfo.isStagnating) {
+                postPopupDirective = progressInfo.directive;
+            }
+        }
+
         // 3. Build state payload for backend brain
         const sliceCount = Math.min(Math.max(observeResult.elements.length, 60), observeResult.elements.length);
+
+        // Build dropdown state info for the AI
+        // CRITICAL: Include ALL select elements, even those with placeholder/default values
+        let dropdownStates = [];
+        for (const el of observeResult.elements) {
+            if (el.tagName === 'select') {
+                const currentVal = el.selectedOptionText || el.text || '(empty/unset)';
+                // Use the content script's isPlaceholderSelected if available, otherwise detect from text
+                const isPlaceholder = el.isPlaceholderSelected ||
+                    currentVal.toLowerCase().includes('select') ||
+                    currentVal.toLowerCase().includes('choose') ||
+                    currentVal.toLowerCase().includes('pick') ||
+                    currentVal.toLowerCase().includes('--') ||
+                    currentVal === '(empty/unset)' ||
+                    currentVal === '';
+                dropdownStates.push({
+                    selector: el.selector,
+                    label: el.ariaLabel || el.name || el.id || el.text || 'unknown',
+                    currentValue: currentVal,
+                    isPlaceholder: isPlaceholder
+                });
+            }
+        }
+
+        // Compute dynamic SOP progress for the AI
+        const sopProgress = analyzeSopProgress(actionHistory, observeResult.elements);
+
         const statePayload = {
             prompt,
             url: observeResult.url,
@@ -454,7 +687,19 @@ async function agentLoop(prompt, tabId) {
             postPopupDirective,
             consecutiveListTabsCount,
             lastActionFailed,
-            lastActionError
+            lastActionError,
+            // Vision data
+            image: observeResult.image || null,
+            somMap: observeResult.somMap || {},
+            // Dropdown states
+            dropdownStates: dropdownStates,
+            // Dynamic SOP progress
+            sopProgress: {
+                uniqueFieldsInteracted: sopProgress.uniqueFieldsInteracted,
+                totalSuccessfulActions: sopProgress.totalSuccessfulActions,
+                recentNewFieldRate: sopProgress.recentNewFieldRate,
+                isStagnating: sopProgress.isStagnating
+            }
         };
 
         // 4. Ask the backend brain (AI) for the next action
@@ -470,10 +715,34 @@ async function agentLoop(prompt, tabId) {
                 const text = await response.text();
                 sendLogToPanel(`Brain API error ${response.status}: ${text.slice(0, 200)}`, 'error');
                 failedActionCount++;
+                // Skip to next iteration
+                actionSuccess = false;
+                actionHistory.push({
+                    step: step + 1,
+                    action: 'api_error',
+                    error: `HTTP ${response.status}`,
+                    actionSuccess: false
+                });
+                await waitForStability(currentTabId, 1500);
                 continue;
             }
 
-            aiDecision = await response.json();
+            const responseData = await response.json();
+
+            // Check if we got an error response (e.g., empty selector)
+            if (responseData.error) {
+                sendLogToPanel(`AI Error: ${responseData.error}`, 'error');
+                if (responseData.retry) {
+                    // Force a retry by not counting this as a proper step
+                    postPopupDirective = 'CRITICAL: You MUST provide a valid CSS selector. The previous response had an empty selector which is invalid. Look at the elements list and pick the correct selector.';
+                    failedActionCount++;
+                    // Re-observe and try again
+                    await waitForStability(currentTabId, 1500);
+                    continue;
+                }
+            }
+
+            aiDecision = responseData;
         } catch (error) {
             sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
             break;
@@ -501,16 +770,33 @@ async function agentLoop(prompt, tabId) {
         if (aiDecision.index !== undefined) historyEntry.index = aiDecision.index;
         if (aiDecision.unselect) historyEntry.unselect = true;
 
-        // 6. Loop detection
+        // 6. Loop detection — FRONTIER APPROACH: blacklist + force forward
         const loopResult = checkForLoop(aiDecision, actionRetryCount, lastActionKey);
         lastActionKey = loopResult.actionKey;
         if (loopResult.isLoop) {
             sendLogToPanel(loopResult.message, 'error');
             historyEntry.loopDetected = true;
+            historyEntry.actionSuccess = false;
             actionHistory.push(historyEntry);
-            // Force the AI to try something different next iteration
-            postPopupDirective = 'LOOP DETECTED. Your last action was repeated too many times without progress. '
-                + 'You MUST choose a completely DIFFERENT action or selector. Do NOT repeat the same action.';
+
+            // BLACKLIST this selector — prevent the AI from ever targeting it again
+            const blockedSelector = aiDecision.selector || '';
+            if (blockedSelector && !clickedSelectors.includes('BLOCKED:' + blockedSelector)) {
+                clickedSelectors.push('BLOCKED:' + blockedSelector);
+            }
+
+            // Force directive that explicitly names the blocked field
+            postPopupDirective = `LOOP BROKEN: The field "${blockedSelector}" has been BLOCKED after ${actionRetryCount[loopResult.actionKey] || 3}+ failed attempts. `
+                + `You CANNOT interact with this selector anymore. It is DEAD to you. `
+                + `IMMEDIATELY move to the NEXT unfilled field or click the SUBMIT/SAVE button. `
+                + `If all fields have been attempted, scroll down and click the submit button NOW.`;
+
+            // Auto-scroll the page down to reveal submit buttons that may be hidden
+            await executeContentScript(currentTabId, 'EXECUTE_ACTION', {
+                action: 'scroll_down',
+                selector: null
+            });
+
             continue;
         }
 
@@ -668,9 +954,9 @@ async function agentLoop(prompt, tabId) {
     isRunning = false;
     // Persist history for "Generate Code" button
     lastAgentHistory = actionHistory;
-    
+
     // Save to storage for Manifest V3 persistence
-    chrome.storage.local.set({ 
+    chrome.storage.local.set({
         lastAgentHistory: actionHistory,
         lastAgentPrompt: lastAgentPrompt,
         lastAgentStartUrl: lastAgentStartUrl
@@ -679,6 +965,158 @@ async function agentLoop(prompt, tabId) {
     sendLogToPanel("Loop ended.", 'info');
     // Re-enable buttons in the panel — include hasHistory so panel knows code gen is available
     chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => { });
+}
+
+// ─── HYBRID VISION: Dynamically decide when to use vision ──────
+// DOM-only is default (fast, reliable). Vision is triggered only when:
+// 1. First step (need to understand initial page layout)
+// 2. Page URL changed (navigated to new page)
+// 3. Multiple consecutive failures (agent is confused)
+// 4. After a click that might have changed page structure significantly
+// This is fully dynamic — no hardcoded step numbers.
+function shouldUseVision(step, failedActionCount, lastActionFailed, actionHistory, lastPageUrl) {
+    // First step — need to see the page layout
+    if (step === 0) return true;
+
+    // Multiple consecutive failures — agent is confused, needs visual context
+    if (failedActionCount >= 2) return true;
+
+    // Page URL changed — new page, need visual understanding
+    // (This is checked by the caller comparing currentTabUrl !== lastPageUrl)
+
+    // After 2+ loop detections in recent history — agent is stuck
+    const recentLoops = actionHistory.slice(-5).filter(h => h.loopDetected).length;
+    if (recentLoops >= 2) return true;
+
+    // If last action was a click and it succeeded — page might have changed visually
+    // (new modal, new section revealed, etc.)
+    if (actionHistory.length > 0) {
+        const lastAction = actionHistory[actionHistory.length - 1];
+        if (lastAction.action === 'click' && lastAction.actionSuccess) {
+            // Only use vision after clicks that likely changed the page
+            // (not after clicking form fields)
+            const clickedFormField = lastAction.selector &&
+                (lastAction.selector.includes('input') ||
+                    lastAction.selector.includes('textarea') ||
+                    lastAction.selector.includes('select'));
+            if (!clickedFormField) return true;
+        }
+    }
+
+    // Default: DOM-only (fast mode for form filling)
+    return false;
+}
+
+// ─── DYNAMIC SOP PROGRESS ANALYSIS ────────────────────────────
+// Analyzes action history to determine if the agent has completed all meaningful
+// actions and is now stagnating (repeating same patterns, no new fields being filled).
+// This is fully dynamic — no hardcoded step thresholds.
+function analyzeSopProgress(actionHistory, currentElements) {
+    const result = {
+        isStagnating: false,
+        directive: '',
+        uniqueFieldsInteracted: 0,
+        totalSuccessfulActions: 0,
+        recentNewFieldRate: 0
+    };
+
+    if (!actionHistory || actionHistory.length < 3) return result;
+
+    // 1. Count unique selectors that were successfully interacted with
+    const successfulSelectors = new Set();
+    const successfulActions = [];
+    const failedSelectors = new Set();
+    let loopDetections = 0;
+
+    for (const entry of actionHistory) {
+        if (entry.loopDetected) loopDetections++;
+        if (entry.actionSuccess && entry.selector) {
+            successfulSelectors.add(entry.selector);
+            successfulActions.push(entry);
+        }
+        if (!entry.actionSuccess && entry.selector) {
+            failedSelectors.add(entry.selector);
+        }
+    }
+
+    result.uniqueFieldsInteracted = successfulSelectors.size;
+    result.totalSuccessfulActions = successfulActions.length;
+
+    // 2. Analyze the RECENT history window (last 5 actions)
+    // Check if any NEW unique selectors are being interacted with
+    const recentWindow = actionHistory.slice(-5);
+    const olderSelectors = new Set(
+        actionHistory.slice(0, -5)
+            .filter(e => e.actionSuccess && e.selector)
+            .map(e => e.selector)
+    );
+    const recentNewSelectors = recentWindow.filter(e =>
+        e.actionSuccess && e.selector && !olderSelectors.has(e.selector)
+    );
+    result.recentNewFieldRate = recentNewSelectors.length / Math.max(recentWindow.length, 1);
+
+    // 3. Count how many form fields on the current page are EMPTY vs FILLED
+    let emptyFormFields = 0;
+    let filledFormFields = 0;
+    let totalFormFields = 0;
+    if (currentElements) {
+        for (const el of currentElements) {
+            if (['input', 'textarea', 'select'].includes(el.tagName)) {
+                totalFormFields++;
+                const hasValue = el.currentValue && el.currentValue.trim() !== '';
+                const isSelectFilled = el.tagName === 'select' && el.selectedOptionText && !el.isPlaceholderSelected;
+                if (hasValue || isSelectFilled) {
+                    filledFormFields++;
+                } else {
+                    emptyFormFields++;
+                }
+            }
+        }
+    }
+
+    // 4. Determine stagnation dynamically:
+    // - No new fields being interacted with in last 5 steps
+    // - OR: Most form fields are filled and agent keeps repeating
+    // - OR: Multiple loop detections have occurred
+    const noNewProgress = result.recentNewFieldRate === 0 && actionHistory.length > 8;
+    const mostFieldsFilled = totalFormFields > 0 && (filledFormFields / totalFormFields) > 0.7;
+    const multipleLoops = loopDetections >= 2;
+    const lastActionsAreRepeats = recentWindow.length >= 3 &&
+        new Set(recentWindow.map(e => e.selector)).size <= 2;
+
+    if (noNewProgress && (mostFieldsFilled || multipleLoops || lastActionsAreRepeats)) {
+        result.isStagnating = true;
+
+        // Build a dynamic directive based on actual state
+        const filledPct = totalFormFields > 0 ? Math.round((filledFormFields / totalFormFields) * 100) : 0;
+        const emptyFieldNames = currentElements
+            ? currentElements
+                .filter(el => ['input', 'textarea', 'select'].includes(el.tagName) &&
+                    !el.currentValue && (el.tagName !== 'select' || el.isPlaceholderSelected))
+                .map(el => el.id || el.name || el.ariaLabel || el.selector)
+                .slice(0, 5)
+            : [];
+
+        let directive = `PROGRESS ANALYSIS: You have successfully interacted with ${result.uniqueFieldsInteracted} unique fields. `;
+        directive += `Form completion: ${filledPct}% (${filledFormFields}/${totalFormFields} fields filled). `;
+
+        if (emptyFieldNames.length > 0 && emptyFieldNames.length <= 3) {
+            directive += `Remaining empty fields: ${emptyFieldNames.join(', ')}. Fill these if possible, then submit. `;
+        } else if (emptyFieldNames.length > 3) {
+            directive += `${emptyFieldNames.length} fields still empty but you appear stuck. `;
+        }
+
+        if (multipleLoops) {
+            directive += `${loopDetections} loop detections occurred — some fields may not be fillable with current approach. `;
+        }
+
+        directive += `ACTION REQUIRED: If you have attempted all SOP steps, click the submit/save button NOW. `;
+        directive += `Do NOT keep retrying fields that already failed. After submission, call "finish".`;
+
+        result.directive = directive;
+    }
+
+    return result;
 }
 
 // ─── UTILITY ───────────────────────────────────────────────────

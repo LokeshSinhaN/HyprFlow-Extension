@@ -1,8 +1,18 @@
 // Hyprflow Extension Content Script — runs in user's webpage context.
 // Acts as the "Hands" and "Eyes". Mirrors BrowserService.php intelligence.
+// Vision + SoM (Set-of-Mark) implementation for enhanced AI understanding
 
 if (typeof window.hyprflowListenerAdded === 'undefined') {
     window.hyprflowListenerAdded = true;
+
+    // --- Vision Configuration ---
+    const VISION_CONFIG = {
+        enabled: true,
+        maxWidth: 1024,
+        quality: 60, // Must be integer (0-100) for Chrome API
+        maxElements: 60,
+        somEnabled: true
+    };
 
     // --- Window.open Interception ---
     // Monkey-patch window.open to detect when clicks trigger new windows.
@@ -109,6 +119,17 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             return true;
         }
 
+        // ─── CAPTURE SCREENSHOT WITH SoM (Set-of-Mark) ──────────
+        if (message.type === 'CAPTURE_SOM') {
+            const config = message.payload || VISION_CONFIG;
+            captureScreenshotWithSoM(config).then(result => {
+                sendResponse(result);
+            }).catch(err => {
+                sendResponse({ error: err.message, success: false });
+            });
+            return true;
+        }
+
         // ─── EXECUTE ACTION ──────────────────────────────────────
         if (message.type === 'EXECUTE_ACTION') {
             const action = message.payload;
@@ -123,7 +144,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     }
 
                     if (el) {
-                        try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+                        try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
                     }
 
                     // ── CLICK ──
@@ -222,7 +243,11 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     // ── TYPE ──
                     else if (action.action === 'type' && el) {
                         el.focus();
-                        if (el.tagName.toLowerCase() === 'select') {
+                        const inputType = (el.getAttribute('type') || '').toLowerCase();
+                        const tag = el.tagName.toLowerCase();
+
+                        if (tag === 'select') {
+                            // If AI uses "type" on a select, treat it as select_option
                             const optionText = (action.text || '').trim();
                             const options = Array.from(el.options);
                             const targetOpt = options.find(o =>
@@ -230,15 +255,66 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                 o.value.toLowerCase() === optionText.toLowerCase()
                             );
                             if (targetOpt) {
-                                el.value = targetOpt.value;
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                setNativeValue(el, targetOpt.value);
+                                success = true;
+                            }
+                        } else if (inputType === 'date') {
+                            // SPECIAL: HTML5 date inputs require YYYY-MM-DD format
+                            // and need native setter to work with React/Vue/Angular
+                            const dateValue = parseDateToISO(action.text);
+                            if (dateValue) {
+                                setNativeValue(el, dateValue);
+                                success = true;
+                                extraData.parsedDate = dateValue;
+                            } else {
+                                // Fallback: try direct assignment
+                                setNativeValue(el, action.text);
                                 success = true;
                             }
                         } else {
-                            el.value = action.text;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            // INTELLIGENT TYPE: Multi-strategy with auto-dropdown detection
+                            el.focus();
+
+                            // Clear existing value first
+                            setNativeValue(el, '');
+                            await new Promise(r => setTimeout(r, 50));
+
+                            // Strategy 1: Try native setter
+                            setNativeValue(el, action.text);
+                            await new Promise(r => setTimeout(r, 100));
+
+                            // Strategy 2: If value didn't persist, use keyboard simulation
+                            if (el.value !== action.text) {
+                                extraData.fallbackToKeyboard = true;
+                                await simulateTyping(el, action.text);
+                            }
+
+                            // INTELLIGENT: Wait and check if typing triggered a dropdown/autocomplete
+                            await new Promise(r => setTimeout(r, 400));
+                            const dropdownResult = await detectAndSelectDropdownOption(el, action.text);
+                            if (dropdownResult.found) {
+                                extraData.autoSelectedDropdown = true;
+                                extraData.selectedDropdownText = dropdownResult.selectedText;
+                            }
+
+                            // POST-ACTION VERIFICATION: Check if value actually persisted
+                            await new Promise(r => setTimeout(r, 100));
+                            const currentVal = el.value;
+                            if (currentVal === '' && !dropdownResult.found) {
+                                // Value was cleared by framework — try one more time with execCommand
+                                extraData.valueCleared = true;
+                                await simulateTyping(el, action.text);
+                                await new Promise(r => setTimeout(r, 200));
+                                // Check for dropdown again after retry
+                                const retryDropdown = await detectAndSelectDropdownOption(el, action.text);
+                                if (retryDropdown.found) {
+                                    extraData.autoSelectedDropdown = true;
+                                    extraData.selectedDropdownText = retryDropdown.selectedText;
+                                }
+                            }
+
                             success = true;
+                            extraData.finalValue = el.value;
                         }
                     }
                     // ── SELECT OPTION ──
@@ -249,28 +325,45 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                         if (el.tagName.toLowerCase() === 'select') {
                             const options = Array.from(el.options);
-                            const targetOpt = options.find(o =>
+                            // Try exact match first, then partial/case-insensitive
+                            let targetOpt = options.find(o =>
                                 o.text.trim().toLowerCase() === optionText.toLowerCase() ||
                                 o.value.toLowerCase() === optionText.toLowerCase()
                             );
+                            // Also try partial match (e.g., "Male" matching "Male (M)")
+                            if (!targetOpt) {
+                                targetOpt = options.find(o =>
+                                    o.text.trim().toLowerCase().includes(optionText.toLowerCase()) ||
+                                    optionText.toLowerCase().includes(o.text.trim().toLowerCase())
+                                );
+                            }
                             if (targetOpt) {
                                 if (unselect) { targetOpt.selected = false; }
-                                else { el.value = targetOpt.value; }
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                else {
+                                    // Use native setter for React/Vue/Angular compatibility
+                                    setNativeValue(el, targetOpt.value);
+                                }
                                 optionSelected = true;
+                                extraData.selectedValue = targetOpt.value;
+                                extraData.selectedText = targetOpt.text.trim();
                             }
                         }
 
+                        // Fallback: click-based dropdown interaction (custom dropdowns)
                         if (!optionSelected) {
                             el.click();
-                            await new Promise(r => setTimeout(r, 300));
+                            await new Promise(r => setTimeout(r, 500));
                             const regex = new RegExp(optionText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
                             const allElements = Array.from(document.querySelectorAll(
-                                '[role="option"], [role="menuitem"], .dropdown-item, li, a, span, label'
+                                '[role="option"], [role="menuitem"], [role="listbox"] > *, ' +
+                                '.dropdown-item, .MuiMenuItem-root, .ant-select-item, ' +
+                                'li[data-value], li, a, span, label, div[role="option"]'
                             ));
                             for (const optEl of allElements) {
                                 const st = window.getComputedStyle(optEl);
                                 if (st.display === 'none' || st.visibility === 'hidden') continue;
+                                const rect = optEl.getBoundingClientRect();
+                                if (rect.width === 0 || rect.height === 0) continue;
                                 const txt = (optEl.textContent || '').trim();
                                 if (regex.test(txt) && txt.length < 150) {
                                     optEl.scrollIntoView({ block: 'center' });
@@ -278,6 +371,8 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                     optEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
                                     optEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
                                     optionSelected = true;
+                                    extraData.selectedViaClick = true;
+                                    extraData.selectedText = txt;
                                     break;
                                 }
                             }
@@ -287,6 +382,8 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         if (success) {
                             extraData.toggleAction = unselect ? 'unselected' : 'selected';
                             extraData.optionText = optionText;
+                        } else {
+                            extraData.error = `Option "${optionText}" not found in dropdown`;
                         }
                     }
                     // ── EXTRACT ──
@@ -301,6 +398,23 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         success = true;
                         sendResponse({ success: true, extractedText: extractedText.trim().substring(0, 5000), ...extraData });
                         return;
+                    }
+                    // ── SCROLL ──
+                    else if (action.action === 'scroll_down' || action.action === 'scroll_up') {
+                        const direction = action.action === 'scroll_down' ? 1 : -1;
+                        const scrollTarget = action.selector ? document.querySelector(action.selector) : null;
+                        const scrollContainer = scrollTarget ||
+                            document.querySelector('[class*="modal"]') ||
+                            document.querySelector('[role="dialog"]') ||
+                            document.querySelector('[class*="drawer"]') ||
+                            document.scrollingElement ||
+                            document.documentElement;
+                        const scrollAmount = Math.round(scrollContainer.clientHeight * 0.7);
+                        scrollContainer.scrollBy({ top: direction * scrollAmount, behavior: 'smooth' });
+                        await new Promise(r => setTimeout(r, 500));
+                        success = true;
+                        extraData.scrolled = direction * scrollAmount;
+                        extraData.scrollTarget = scrollContainer.tagName + (scrollContainer.className ? '.' + scrollContainer.className.split(' ')[0] : '');
                     }
                     // ── NAVIGATE ──
                     else if (action.action === 'navigate' && action.url) {
@@ -371,6 +485,308 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         return path.join(' > ');
     }
 
+    // ─── HELPER: Set value using native input setter (React/Vue/Angular compatible) ───
+    function setNativeValue(el, value) {
+        const tag = el.tagName.toLowerCase();
+        const inputType = (el.getAttribute('type') || '').toLowerCase();
+
+        // Use Object.getOwnPropertyDescriptor to get the native setter
+        // This bypasses React/Vue/Angular's synthetic event system
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+        )?.set;
+        const nativeSelectValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLSelectElement.prototype, 'value'
+        )?.set;
+        const nativeTextareaValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value'
+        )?.set;
+
+        if (tag === 'select' && nativeSelectValueSetter) {
+            nativeSelectValueSetter.call(el, value);
+        } else if (tag === 'textarea' && nativeTextareaValueSetter) {
+            nativeTextareaValueSetter.call(el, value);
+        } else if (nativeInputValueSetter) {
+            nativeInputValueSetter.call(el, value);
+        } else {
+            el.value = value;
+        }
+
+        // Dispatch events that React/Vue/Angular listen to
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // For React specifically, also dispatch a native input event
+        const nativeEvent = new Event('input', { bubbles: true });
+        Object.defineProperty(nativeEvent, 'target', { writable: false, value: el });
+        el.dispatchEvent(nativeEvent);
+
+        // For date inputs, also try setting via keyboard simulation as last resort
+        if (inputType === 'date' && el.value !== value) {
+            try {
+                // Some frameworks need the element to be focused first
+                el.focus();
+                el.setAttribute('value', value);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch (e) { /* ignore */ }
+        }
+    }
+
+    // ─── HELPER: Parse various date formats to ISO YYYY-MM-DD ───
+    function parseDateToISO(dateStr) {
+        if (!dateStr) return null;
+        const str = dateStr.trim();
+
+        // Already in YYYY-MM-DD format
+        if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+
+        // DD-MM-YYYY or DD/MM/YYYY
+        let match = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+        if (match) {
+            const [, day, month, year] = match;
+            return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        }
+
+        // MM-DD-YYYY or MM/DD/YYYY (US format) — try if day > 12
+        match = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+        if (match) {
+            const [, part1, part2, year] = match;
+            // If part1 > 12, it must be DD-MM-YYYY
+            if (parseInt(part1) > 12) {
+                return `${year}-${part2.padStart(2, '0')}-${part1.padStart(2, '0')}`;
+            }
+            // Default: assume DD-MM-YYYY (most common in non-US)
+            return `${year}-${part2.padStart(2, '0')}-${part1.padStart(2, '0')}`;
+        }
+
+        // YYYY/MM/DD
+        match = str.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+        if (match) {
+            const [, year, month, day] = match;
+            return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        }
+
+        // Try native Date parsing as last resort
+        try {
+            const d = new Date(str);
+            if (!isNaN(d.getTime())) {
+                return d.toISOString().split('T')[0];
+            }
+        } catch (e) { /* ignore */ }
+
+        return null;
+    }
+
+    // ─── HELPER: Detect and select dropdown/autocomplete options after typing ───
+    // This makes the agent intelligent enough to handle searchable dropdowns,
+    // autocomplete fields, comboboxes, etc. without explicit instructions.
+    async function detectAndSelectDropdownOption(inputEl, searchText) {
+        const result = { found: false, selectedText: '' };
+
+        // Look for dropdown/autocomplete popups that appeared after typing
+        // These are dynamically rendered elements near the input or in portals
+        const dropdownSelectors = [
+            // Generic dropdown patterns
+            '[role="listbox"]', '[role="menu"]', '[role="option"]',
+            '.dropdown-menu.show', '.autocomplete-results', '.suggestions',
+            // React/Material UI patterns
+            '.MuiAutocomplete-popper', '.MuiMenu-list', '.MuiPopover-paper',
+            // Ant Design patterns
+            '.ant-select-dropdown', '.ant-cascader-dropdown',
+            // Custom patterns (common in healthcare/enterprise apps)
+            '[class*="dropdown"][class*="open"]', '[class*="dropdown"][class*="show"]',
+            '[class*="autocomplete"]', '[class*="suggestion"]', '[class*="results"]',
+            '[class*="listbox"]', '[class*="options"]', '[class*="menu"][class*="open"]',
+            // Portal-based dropdowns (rendered at body level)
+            'body > [class*="dropdown"]', 'body > [class*="popover"]',
+            'body > [role="listbox"]', '[data-radix-popper-content-wrapper]',
+            // Generic visible list items that appeared
+            'ul[style*="display: block"]', 'ul[style*="opacity: 1"]',
+            'div[style*="display: block"] li', '.visible[role="option"]'
+        ];
+
+        // Wait a moment for dropdown to render
+        await new Promise(r => setTimeout(r, 200));
+
+        // Find all potential dropdown containers
+        for (const sel of dropdownSelectors) {
+            try {
+                const containers = document.querySelectorAll(sel);
+                for (const container of containers) {
+                    const style = window.getComputedStyle(container);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    const rect = container.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+
+                    // Look for clickable options inside this container
+                    const options = container.querySelectorAll(
+                        '[role="option"], li, a, div[class*="option"], div[class*="item"], ' +
+                        'span[class*="option"], button, [data-value]'
+                    );
+
+                    for (const opt of options) {
+                        const optStyle = window.getComputedStyle(opt);
+                        if (optStyle.display === 'none' || optStyle.visibility === 'hidden') continue;
+                        const optRect = opt.getBoundingClientRect();
+                        if (optRect.width === 0 || optRect.height === 0) continue;
+
+                        const optText = (opt.textContent || '').trim();
+                        // Match: exact, starts-with, or contains the search text
+                        if (optText && (
+                            optText.toLowerCase() === searchText.toLowerCase() ||
+                            optText.toLowerCase().includes(searchText.toLowerCase()) ||
+                            searchText.toLowerCase().includes(optText.toLowerCase())
+                        )) {
+                            // Found a match — click it
+                            opt.scrollIntoView({ block: 'center' });
+                            opt.click();
+                            opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            await new Promise(r => setTimeout(r, 200));
+                            result.found = true;
+                            result.selectedText = optText;
+                            return result;
+                        }
+                    }
+                }
+            } catch (e) { /* ignore selector errors */ }
+        }
+
+        // Also check for options that are direct siblings or nearby the input
+        const parent = inputEl.closest('.form-group, .field, [class*="input"], [class*="select"], [class*="search"]') || inputEl.parentElement;
+        if (parent) {
+            const nearbyOptions = parent.querySelectorAll(
+                '[role="option"], li, [class*="option"], [class*="item"], [class*="result"]'
+            );
+            for (const opt of nearbyOptions) {
+                const style = window.getComputedStyle(opt);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const rect = opt.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const optText = (opt.textContent || '').trim();
+                if (optText && optText.toLowerCase().includes(searchText.toLowerCase())) {
+                    opt.click();
+                    opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    await new Promise(r => setTimeout(r, 200));
+                    result.found = true;
+                    result.selectedText = optText;
+                    return result;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // ─── HELPER: Simulate keyboard typing character by character ───
+    // This is the most reliable way to fill React/Vue/Angular controlled inputs
+    // that reject programmatic value changes. It mimics real user typing.
+    async function simulateTyping(el, text) {
+        el.focus();
+
+        // Clear existing content using select-all + delete
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true }));
+        document.execCommand('selectAll', false, null);
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', bubbles: true }));
+        document.execCommand('delete', false, null);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        await new Promise(r => setTimeout(r, 50));
+
+        // Type each character using insertText (works with contentEditable and input fields)
+        for (let i = 0; i < text.length; i++) {
+            const char = text[i];
+
+            // Dispatch keydown
+            el.dispatchEvent(new KeyboardEvent('keydown', {
+                key: char, code: `Key${char.toUpperCase()}`,
+                charCode: char.charCodeAt(0), keyCode: char.charCodeAt(0),
+                bubbles: true, cancelable: true
+            }));
+
+            // Use execCommand insertText — this triggers React's onChange
+            document.execCommand('insertText', false, char);
+
+            // Dispatch keyup
+            el.dispatchEvent(new KeyboardEvent('keyup', {
+                key: char, code: `Key${char.toUpperCase()}`,
+                charCode: char.charCodeAt(0), keyCode: char.charCodeAt(0),
+                bubbles: true, cancelable: true
+            }));
+        }
+
+        // Final events to ensure framework picks up the change
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+    }
+
+    // ─── VISION: Screenshot Capture with SoM Annotation ───────
+    async function captureScreenshotWithSoM(config) {
+        try {
+            // Get viewport dimensions
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
+
+            // Get page URL and title
+            const pageUrl = window.location.href;
+            const pageTitle = document.title;
+
+            // Extract elements with bounding boxes
+            const elements = extractClickableElements();
+            const topElements = elements.slice(0, config.maxElements || 60);
+
+            let index = 1;
+            const somMap = {};
+
+            for (const el of topElements) {
+                const domEl = document.querySelector(el.selector);
+                if (!domEl) continue;
+
+                const rect = domEl.getBoundingClientRect();
+                if (rect.width < 5 || rect.height < 5) continue;
+
+                el.boundingBox = {
+                    x: rect.x + window.scrollX,
+                    y: rect.y + window.scrollY,
+                    width: rect.width,
+                    height: rect.height
+                };
+
+                // Store mapping for SoM
+                somMap[index.toString()] = el.selector;
+                el.somIndex = index;
+
+                index++;
+                if (index > 99) break;
+            }
+
+            // Return success with elements - background will capture screenshot
+            sendLogToContent('SoM prepared: ' + Object.keys(somMap).length + ' elements labeled');
+
+            return {
+                success: true,
+                elements: topElements,
+                elementCount: elements.length,
+                somMap: somMap,
+                viewportWidth: viewportWidth,
+                viewportHeight: viewportHeight,
+                pageUrl: pageUrl,
+                pageTitle: pageTitle,
+                needsImageCapture: true
+            };
+        } catch (error) {
+            console.error('SoM preparation failed:', error);
+            return { success: false, error: error.message, needsImageCapture: false };
+        }
+    }
+
+    // Helper to log from content script
+    function sendLogToContent(message) {
+        console.log('[Hyprflow SoM]', message);
+    }
+
     // ─── MAIN OBSERVATION FUNCTION ─────────────────────────────
     function extractClickableElements() {
         const out = [];
@@ -407,7 +823,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     try {
                         const labelEl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
                         if (labelEl) label = (labelEl.textContent || '').trim();
-                    } catch(e) {}
+                    } catch (e) { }
                 }
                 if (!label && (tag === 'input' || tag === 'select')) {
                     let sib = el.previousElementSibling;
@@ -436,8 +852,24 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     ? el.checked : (el.getAttribute('aria-checked') === 'true');
                 const isSelected = tag === 'option'
                     ? el.selected : (el.getAttribute('aria-selected') === 'true');
-                const selectedOptionText = tag === 'select' && el.options && el.selectedIndex >= 0
-                    ? (el.options[el.selectedIndex].text || '').trim() : null;
+
+                // Enhanced select/dropdown state detection
+                let selectedOptionText = null;
+                let isPlaceholderSelected = false;
+                if (tag === 'select' && el.options && el.selectedIndex >= 0) {
+                    const selectedOpt = el.options[el.selectedIndex];
+                    selectedOptionText = (selectedOpt.text || '').trim();
+                    // Detect if the selected option is a placeholder (disabled, empty value, or common placeholder text)
+                    isPlaceholderSelected = selectedOpt.disabled ||
+                        selectedOpt.value === '' ||
+                        /^(select|choose|pick|--)/i.test(selectedOptionText);
+                }
+
+                // Get current value for input/textarea/select elements
+                let currentValue = null;
+                if (tag === 'input' || tag === 'textarea') {
+                    currentValue = el.value || null;
+                }
 
                 out.push({
                     tagName: tag, text: text || null,
@@ -446,7 +878,11 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     type: inputType || null, name: el.getAttribute('name') || null,
                     roleHint, priority,
                     checked: isChecked || null, selected: isSelected || null,
-                    selectedOptionText, visible: true
+                    selectedOptionText,
+                    isPlaceholderSelected: isPlaceholderSelected || null,
+                    currentValue,
+                    visible: true,
+                    boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
                 });
             }
 
