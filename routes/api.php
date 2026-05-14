@@ -27,3 +27,7 @@ Route::post('/extension/generate-selenium', [ExtensionController::class, 'genera
 // Plan workflow before execution
 Route::post('/extension/plan', [ExtensionController::class, 'plan'])
     ->name('extension.plan');
+
+// Site-specific knowledge learning endpoint (Gap C)
+Route::post('/extension/learn', [ExtensionController::class, 'learn'])
+    ->name('extension.learn');

@@ -138,9 +138,19 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 let success = false;
                 let extraData = {};
                 try {
+                    // Enhancement 4: Pre-flight CSS Selector Validation
+                    if (action.selector && !['navigate', 'extract', 'scroll_down', 'scroll_up'].includes(action.action)) {
+                        try { document.createDocumentFragment().querySelector(action.selector); }
+                        catch (syntaxErr) {
+                            extraData.error = `INVALID_SELECTOR_SYNTAX: "${action.selector}" — ${syntaxErr.message}. Use valid CSS only.`;
+                            sendResponse({ success: false, ...extraData });
+                            return;
+                        }
+                    }
+
                     const el = action.selector ? document.querySelector(action.selector) : null;
-                    // Actions that can work WITHOUT a selector (they auto-detect targets)
-                    const selectorOptionalActions = ['navigate', 'extract', 'scroll_down', 'scroll_up'];
+                    // Actions that can work WITHOUT a selector
+                    const selectorOptionalActions = ['navigate', 'extract', 'scroll_down', 'scroll_up', 'click_coordinate', 'keyboard_event'];
                     if (!el && !selectorOptionalActions.includes(action.action)) {
                         throw new Error(`Selector not found: ${action.selector}`);
                     }
@@ -248,7 +258,48 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         const inputType = (el.getAttribute('type') || '').toLowerCase();
                         const tag = el.tagName.toLowerCase();
 
-                        if (tag === 'select') {
+                        // Enhancement 6: ContentEditable Support (YouTube comments, rich text editors)
+                        const isContentEditable = el.getAttribute('contenteditable') === 'true' ||
+                            el.getAttribute('contenteditable') === '' ||
+                            el.isContentEditable ||
+                            (el.closest && !!el.closest('[contenteditable="true"]'));
+
+                        if (isContentEditable) {
+                            extraData.isContentEditable = true;
+                            el.focus();
+                            await new Promise(r => setTimeout(r, 100));
+
+                            // Select all and delete existing content
+                            const selection = window.getSelection();
+                            const range = document.createRange();
+                            range.selectNodeContents(el);
+                            selection.removeAllRanges();
+                            selection.addRange(range);
+                            document.execCommand('delete', false, null);
+                            await new Promise(r => setTimeout(r, 50));
+
+                            // Insert text using execCommand (triggers framework listeners)
+                            document.execCommand('insertText', false, action.text);
+
+                            // Dispatch events
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+
+                            await new Promise(r => setTimeout(r, 100));
+                            const actualContent = (el.textContent || el.innerText || '').trim();
+                            extraData.finalValue = actualContent;
+                            success = actualContent.includes(action.text);
+
+                            if (!success) {
+                                // Fallback: direct textContent + keyboard simulation
+                                el.textContent = '';
+                                await simulateTyping(el, action.text);
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                extraData.fallbackToSimulateTyping = true;
+                                success = true;
+                                extraData.finalValue = (el.textContent || el.innerText || '').trim();
+                            }
+                        } else if (tag === 'select') {
                             // If AI uses "type" on a select, treat it as select_option
                             const optionText = (action.text || '').trim();
                             const options = Array.from(el.options);
@@ -565,12 +616,114 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             scrollContainer = document.scrollingElement || document.documentElement;
                         }
 
+                        // Enhancement 7: Scroll Verification + Auto-Recovery
+                        const scrollBefore = scrollContainer.scrollTop;
                         const scrollAmount = Math.round(scrollContainer.clientHeight * 0.7);
                         scrollContainer.scrollBy({ top: direction * scrollAmount, behavior: 'smooth' });
                         await new Promise(r => setTimeout(r, 500));
+                        const actualScrolled = scrollContainer.scrollTop - scrollBefore;
+
+                        if (Math.abs(actualScrolled) < 5) {
+                            // Scroll didn't move — try alternative containers
+                            const alternatives = [
+                                document.querySelector('[role="main"]'),
+                                document.querySelector('main'),
+                                document.querySelector('#content'),
+                                document.querySelector('[class*="content"]:not([role="dialog"])'),
+                                document.querySelector('[class*="scroll"]'),
+                                document.scrollingElement || document.documentElement
+                            ].filter(c => c && c !== scrollContainer && c.scrollHeight > c.clientHeight + 10);
+
+                            let recovered = false;
+                            for (const alt of alternatives) {
+                                const altBefore = alt.scrollTop;
+                                alt.scrollBy({ top: direction * Math.round(alt.clientHeight * 0.7), behavior: 'smooth' });
+                                await new Promise(r => setTimeout(r, 300));
+                                const altScrolled = alt.scrollTop - altBefore;
+                                if (Math.abs(altScrolled) > 5) {
+                                    extraData.scrollRecovery = true;
+                                    extraData.recoveredContainer = alt.tagName + (alt.id ? '#' + alt.id : '');
+                                    extraData.scrolled = altScrolled;
+                                    extraData.scrollTarget = alt.tagName + '.' + (alt.className || '').split(' ')[0];
+                                    recovered = true;
+                                    success = true;
+                                    break;
+                                }
+                            }
+                            if (!recovered) {
+                                extraData.scrolled = 0;
+                                extraData.scrollFailed = true;
+                                extraData.scrollTarget = scrollContainer.tagName;
+                                extraData.hint = 'No scrollable container found. Click elements directly or use Tab.';
+                                success = true; // Don't count as failure, but signal zero movement
+                            }
+                        } else {
+                            success = true;
+                            extraData.scrolled = actualScrolled;
+                            extraData.scrollTarget = scrollContainer.tagName + (scrollContainer.className ? '.' + scrollContainer.className.split(' ')[0] : '');
+                        }
+                    }
+                    // ── KEYBOARD EVENT (Enhancement 3b: for complex widgets) ──
+                    else if (action.action === 'keyboard_event') {
+                        const keys = action.keys || [action.key || 'Enter'];
+                        const targetEl = el || document.activeElement || document.body;
+                        targetEl.focus();
+                        await new Promise(r => setTimeout(r, 50));
+
+                        const keyMap = {
+                            'Enter': { key: 'Enter', code: 'Enter', keyCode: 13 },
+                            'Escape': { key: 'Escape', code: 'Escape', keyCode: 27 },
+                            'Tab': { key: 'Tab', code: 'Tab', keyCode: 9 },
+                            'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+                            'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+                            'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+                            'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+                            'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+                            'Space': { key: ' ', code: 'Space', keyCode: 32 },
+                            'Delete': { key: 'Delete', code: 'Delete', keyCode: 46 },
+                        };
+
+                        const dispatched = [];
+                        for (const keyName of keys) {
+                            const ki = keyMap[keyName] || { key: keyName, code: keyName, keyCode: keyName.charCodeAt(0) };
+                            targetEl.dispatchEvent(new KeyboardEvent('keydown', { key: ki.key, code: ki.code, keyCode: ki.keyCode, which: ki.keyCode, bubbles: true, cancelable: true }));
+                            targetEl.dispatchEvent(new KeyboardEvent('keypress', { key: ki.key, code: ki.code, keyCode: ki.keyCode, which: ki.keyCode, bubbles: true, cancelable: true }));
+                            targetEl.dispatchEvent(new KeyboardEvent('keyup', { key: ki.key, code: ki.code, keyCode: ki.keyCode, which: ki.keyCode, bubbles: true, cancelable: true }));
+                            dispatched.push(keyName);
+                            await new Promise(r => setTimeout(r, 100));
+                        }
                         success = true;
-                        extraData.scrolled = direction * scrollAmount;
-                        extraData.scrollTarget = scrollContainer.tagName + (scrollContainer.className ? '.' + scrollContainer.className.split(' ')[0] : '');
+                        extraData.keysDispatched = dispatched;
+                    }
+                    // ── CLICK COORDINATE (Enhancement 3b: fallback visual click) ──
+                    else if (action.action === 'click_coordinate') {
+                        // Click by SoM bounding box center coordinates
+                        let clickX, clickY, clickedEl;
+                        if (action.somIndex && action.boundingBox) {
+                            const bb = action.boundingBox;
+                            clickX = bb.x + bb.width / 2;
+                            clickY = bb.y + bb.height / 2;
+                        } else if (el) {
+                            const rect = el.getBoundingClientRect();
+                            clickX = rect.x + rect.width / 2;
+                            clickY = rect.y + rect.height / 2;
+                        } else {
+                            throw new Error('click_coordinate requires somIndex with boundingBox or a valid selector');
+                        }
+
+                        clickedEl = document.elementFromPoint(clickX, clickY);
+                        if (clickedEl) {
+                            clickedEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: clickX, clientY: clickY }));
+                            clickedEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: clickX, clientY: clickY }));
+                            clickedEl.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: clickX, clientY: clickY }));
+                            clickedEl.click();
+                            success = true;
+                            extraData.clickedTag = clickedEl.tagName;
+                            extraData.clickedText = (clickedEl.textContent || '').trim().slice(0, 50);
+                            extraData.coordinates = { x: clickX, y: clickY };
+                        } else {
+                            throw new Error(`No element at coordinates (${clickX}, ${clickY})`);
+                        }
                     }
                     // ── NAVIGATE ──
                     else if (action.action === 'navigate' && action.url) {

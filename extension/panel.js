@@ -172,6 +172,10 @@ document.addEventListener('DOMContentLoaded', () => {
             statusText.textContent = 'Waiting for plan approval...';
             stopBtn.style.display = 'none';
             planApprovalContainer.style.display = 'flex';
+            // Store plan for passing to agent loop on approval
+            if (message.payload && message.payload.plan) {
+                lastGeneratedPlan = message.payload.plan;
+            }
         }
         if (message.type === 'AGENT_DONE') {
             setRunning(false);
@@ -231,6 +235,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ─── APPROVE PLAN ───────────────────────────────────────────
+    let lastGeneratedPlan = []; // Store plan for passing to agent loop
     approvePlanBtn.addEventListener('click', () => {
         const prompt = promptInput.value.trim();
         planApprovalContainer.style.display = 'none';
@@ -240,7 +245,7 @@ document.addEventListener('DOMContentLoaded', () => {
         appendLog('✅ Plan approved by user. Executing actions...', 'success');
         chrome.runtime.sendMessage({
             type: 'APPROVE_PLAN',
-            payload: { prompt: prompt }
+            payload: { prompt: prompt, plan: lastGeneratedPlan }
         });
     });
 
