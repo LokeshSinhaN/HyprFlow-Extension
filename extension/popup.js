@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
               statusDiv.style.color = "#f87171";
               runBtn.disabled = false;
           } else if (response && response.status === 'started') {
-              statusDiv.innerText = "✓ Agent running — check side panel for logs";
+               statusDiv.innerText = "Agent running — check side panel for logs";
               statusDiv.style.color = "#34d399";
           } else if (response && response.status === 'already_running') {
               statusDiv.innerText = "Agent is already running.";
@@ -39,7 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.runtime.onMessage.addListener((message) => {
         if (message.type === 'AGENT_DONE') {
             runBtn.disabled = false;
-            statusDiv.innerText = "✓ Agent completed.";
+            statusDiv.innerText = "Agent completed.";
             statusDiv.style.color = "#34d399";
         }
     });

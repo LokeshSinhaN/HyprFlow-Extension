@@ -126,7 +126,7 @@ async function generatePlan(prompt, rejected = false) {
         const result = await res.json();
         if (result.plan && Array.isArray(result.plan)) {
             currentPlanSteps = result.plan; // Enhancement 1: Store for plan-aware execution
-            sendLogToPanel('📋 Plan of Action:', 'info');
+            sendLogToPanel('Plan of Action:', 'info');
             result.plan.forEach(step => sendLogToPanel(step, 'step'));
             chrome.runtime.sendMessage({ type: 'PLAN_GENERATED', payload: { plan: result.plan } }).catch(() => { });
         }
@@ -383,7 +383,7 @@ function checkForLoop(decision, actionRetryCount, lastActionKey) {
         if (count >= MAX_RETRIES) {
             return {
                 isLoop: true,
-                message: `⚠️ LOOP DETECTED: "${actionType}" repeated ${count} times on same target. Breaking loop.`,
+                message: `LOOP DETECTED: "${actionType}" repeated ${count} times on same target. Breaking loop.`,
                 actionKey
             };
         }
@@ -586,7 +586,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // Check consecutive failure limit
                 if (failedActionCount >= maxFailedActions) {
-                    sendLogToPanel(`🛑 Stopped: ${maxFailedActions} consecutive action failures.`, 'error');
+                    sendLogToPanel(`Stopped: ${maxFailedActions} consecutive action failures.`, 'error');
                     break;
                 }
 
@@ -594,7 +594,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 // SPEED: Reduce wait for form-filling steps (type/select don't change DOM structure)
                 const prevAction = actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null;
                 const isFormFilling = prevAction && ['type', 'select_option'].includes(prevAction.action) && prevAction.actionSuccess;
-                sendLogToPanel('⏳ Waiting for page stability...', 'info');
+                sendLogToPanel('Waiting for page stability...', 'info');
                 await waitForStability(currentTabId, isFormFilling ? 500 : 2000);
 
                 // 2. HYBRID MODE: DOM-primary with Vision-on-demand
@@ -618,7 +618,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 if (useVision) {
                     // VISION MODE: Capture screenshot + elements (slower but visual)
-                    sendLogToPanel('🔍 Vision mode activated', 'info');
+                    sendLogToPanel('Vision mode activated', 'info');
                     const somData = await captureSoMScreenshot(currentTabId);
                     if (somData && somData.success) {
                         observeResult = {
@@ -635,7 +635,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // DOM-ONLY MODE (default): Fast, reliable, no screenshot
                 if (!observeResult) {
-                    sendLogToPanel('👁️ Observing page elements...', 'info');
+                    sendLogToPanel('Observing page elements...', 'info');
                     observeResult = await executeContentScript(currentTabId, 'OBSERVE');
                     if (!observeResult || !observeResult.elements) {
                         sendLogToPanel("Failed to observe page. Retrying...", 'error');
@@ -681,7 +681,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                 postPopupDirective = 'STALE STATE: The page has NOT changed for 4+ non-form steps. '
                                     + 'Your previous click/navigation actions had NO visible effect. '
                                     + 'Try a completely different approach or scroll to find new elements.';
-                                sendLogToPanel('⚠️ Stale state detected — page unchanged for 4+ steps', 'error');
+                                sendLogToPanel('Stale state detected — page unchanged for 4+ steps', 'error');
                             }
                         } else {
                             // Form filling on same page is normal — don't count as stale
@@ -773,7 +773,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 // 4. Ask the backend brain (AI) for the next action
                 let aiDecision;
                 try {
-                    sendLogToPanel('🧠 Thinking... (waiting for AI response)', 'info');
+                    sendLogToPanel('Thinking... (waiting for AI response)', 'info');
                     const controller = new AbortController();
                     const apiTimeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
                     const response = await fetch(API_URL, {
@@ -818,7 +818,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     aiDecision = responseData;
                 } catch (error) {
                     if (error.name === 'AbortError') {
-                        sendLogToPanel('⚠️ AI API timed out after 60s. Retrying...', 'error');
+                        sendLogToPanel('AI API timed out after 60s. Retrying...', 'error');
                         failedActionCount++;
                         actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
                         continue;
@@ -836,7 +836,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 // Enhancement 1: Plan step tracking
                 if (aiDecision.planStepCompleted && currentPlanStepIndex < planSteps.length) {
                     currentPlanStepIndex++;
-                    sendLogToPanel(`✅ Plan step ${currentPlanStepIndex} completed`, 'success');
+                    sendLogToPanel(`Plan step ${currentPlanStepIndex} completed`, 'success');
                 }
 
                 // 5. Build rich history entry
@@ -874,11 +874,11 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                     // ── SMART RECOVERY: If loop was on scroll, auto-attempt submit button ──
                     if (actionType === 'scroll_down' || actionType === 'scroll_up') {
-                        sendLogToPanel('🔍 Scroll loop detected — auto-attempting to find and click submit button...', 'info');
+                        sendLogToPanel('Scroll loop detected — auto-attempting to find and click submit button...', 'info');
                         const submitResult = await executeContentScript(currentTabId, 'FIND_AND_CLICK_SUBMIT', null, 3);
 
                         if (submitResult && submitResult.success) {
-                            sendLogToPanel(`✅ Auto-clicked submit: "${submitResult.clickedText}" (${submitResult.clickedSelector})`, 'success');
+                            sendLogToPanel(`Auto-clicked submit: "${submitResult.clickedText}" (${submitResult.clickedSelector})`, 'success');
                             actionHistory.push({
                                 step: actionHistory.length + 1,
                                 thought: 'Auto-recovery: Found and clicked submit button after scroll loop',
@@ -895,7 +895,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                 + 'If validation errors appeared, fix them and re-submit.';
                             continue;
                         } else {
-                            sendLogToPanel('⚠️ Auto-submit not found. Directing AI to try direct selectors...', 'warn');
+                            sendLogToPanel('Auto-submit not found. Directing AI to try direct selectors...', 'warn');
                             postPopupDirective = 'SCROLL LOOP BROKEN: The submit button was never found in the elements list. '
                                 + 'CRITICAL: Try clicking with these selectors in order: '
                                 + '1) button[type="submit"] '
@@ -928,7 +928,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // 7a. Handle ACTION_SEQUENCE (Gap B: Multi-Action Chaining)
                 if (aiDecision.action === 'action_sequence' && aiDecision.actions && aiDecision.actions.length > 0) {
-                    sendLogToPanel(`⚡ Action sequence (${aiDecision.actions.length} actions)...`, 'info');
+                    sendLogToPanel(`Action sequence (${aiDecision.actions.length} actions)...`, 'info');
                     let seqSuccess = 0;
                     const seqResults = [];
                     for (const subAction of aiDecision.actions.slice(0, 5)) {
@@ -947,7 +947,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     historyEntry.actionSuccess = seqSuccess > 0;
                     historyEntry.sequenceResults = seqResults;
                     historyEntry.sequenceCompleted = seqSuccess;
-                    sendLogToPanel(`✅ Sequence: ${seqSuccess}/${aiDecision.actions.length}`, seqSuccess > 0 ? 'success' : 'error');
+                    sendLogToPanel(`Sequence: ${seqSuccess}/${aiDecision.actions.length}`, seqSuccess > 0 ? 'success' : 'error');
                     failedActionCount = seqSuccess > 0 ? 0 : failedActionCount + 1;
                     lastActionFailed = seqSuccess === 0;
                     lastActionError = seqSuccess === 0 ? 'Action sequence failed' : '';
@@ -962,7 +962,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     const batchResult = await executeContentScript(currentTabId, 'BATCH_FILL', { fields: aiDecision.fields }, 3);
 
                     if (batchResult && batchResult.success) {
-                        sendLogToPanel(`✅ Batch filled ${batchResult.filledCount}/${aiDecision.fields.length} fields`, 'success');
+                        sendLogToPanel(`Batch filled ${batchResult.filledCount}/${aiDecision.fields.length} fields`, 'success');
                         historyEntry.actionSuccess = true;
                         historyEntry.batchResults = batchResult.results;
                         historyEntry.filledCount = batchResult.filledCount;
@@ -992,7 +992,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 // 8. Execute the action
                 let actionResult = null;
                 let actionSuccess = false;
-                sendLogToPanel(`⚡ Executing: ${aiDecision.action} on ${aiDecision.selector || '(page)'}...`, 'info');
+                sendLogToPanel(`Executing: ${aiDecision.action} on ${aiDecision.selector || '(page)'}...`, 'info');
 
                 // ── Tab management actions ──
                 if (['switch_tab', 'new_tab', 'list_tabs', 'close_tab'].includes(aiDecision.action)) {
@@ -1000,7 +1000,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     if (aiDecision.action === 'list_tabs') {
                         consecutiveListTabsCount++;
                         if (consecutiveListTabsCount >= 3) {
-                            sendLogToPanel('⚠️ list_tabs called 3+ times. Forcing agent to proceed.', 'error');
+                            sendLogToPanel('list_tabs called 3+ times. Forcing agent to proceed.', 'error');
                             postPopupDirective = 'STOP calling list_tabs. There is NO hidden tab. '
                                 + 'You are on the main page. IMMEDIATELY proceed to the next SOP step.';
                             actionHistory.push(historyEntry);
@@ -1030,10 +1030,10 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         totalScrollAttempts++;
                         // If excessive scrolling (across any targets), auto-attempt submit
                         if (totalScrollAttempts > 10) {
-                            sendLogToPanel(`⚠️ ${totalScrollAttempts} total scroll attempts — auto-attempting submit...`, 'warn');
+                            sendLogToPanel(`${totalScrollAttempts} total scroll attempts — auto-attempting submit...`, 'warn');
                             const submitResult = await executeContentScript(currentTabId, 'FIND_AND_CLICK_SUBMIT', null, 3);
                             if (submitResult && submitResult.success) {
-                                sendLogToPanel(`✅ Auto-clicked submit: "${submitResult.clickedText}"`, 'success');
+                                sendLogToPanel(`Auto-clicked submit: "${submitResult.clickedText}"`, 'success');
                                 actionHistory.push({
                                     step: actionHistory.length + 1,
                                     thought: 'Auto-recovery: Excessive scroll attempts, clicked submit',
@@ -1068,7 +1068,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                     + `1) Click target element directly from elements list. `
                                     + `2) Use keyboard Tab/Enter. `
                                     + `3) Try different scroll container.`;
-                                sendLogToPanel('⚠️ Scroll returned 0 — injecting recovery directive', 'warn');
+                                sendLogToPanel('Scroll returned 0 — injecting recovery directive', 'warn');
                             }
                         }
 
@@ -1118,7 +1118,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                 + `Use "click" action targeting the option element (look for [role="option"], li, or similar). `
                                 + `Do NOT call "finish" — the value is NOT properly selected until you click the dropdown option. `
                                 + `Do NOT re-type the value. The dropdown should still be visible.`;
-                            sendLogToPanel('⚠️ Dropdown appeared but option not auto-selected — AI must click it next step', 'warn');
+                            sendLogToPanel('Dropdown appeared but option not auto-selected — AI must click it next step', 'warn');
                             historyEntry.dropdownVisibleNotSelected = true;
                             historyEntry.visibleOptions = actionResult.visibleOptionTexts;
                         }
@@ -1127,7 +1127,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         if (actionResult.autoSelectedDropdown) {
                             historyEntry.autoSelectedDropdown = true;
                             historyEntry.selectedDropdownText = actionResult.selectedDropdownText;
-                            sendLogToPanel(`✅ Auto-selected dropdown option: "${actionResult.selectedDropdownText}"`, 'success');
+                            sendLogToPanel(`Auto-selected dropdown option: "${actionResult.selectedDropdownText}"`, 'success');
                         }
 
                         // ── ENHANCED: Combobox with no dropdown appeared ──
@@ -1138,7 +1138,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                 + `2) The field needs a click first to activate it before typing. `
                                 + `3) There may be a loading delay. Try clicking the field's dropdown arrow/chevron button. `
                                 + `Do NOT call "finish" — the combobox value is NOT set.`;
-                            sendLogToPanel('⚠️ Combobox field — no dropdown appeared after typing', 'warn');
+                            sendLogToPanel('Combobox field — no dropdown appeared after typing', 'warn');
                         }
 
                         // ── NEW TAB DETECTION AFTER CLICK ──
@@ -1176,11 +1176,11 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                         + 'Do NOT call list_tabs or re-click the same button. '
                                         + 'IMMEDIATELY proceed to the next SOP step.';
 
-                                    sendLogToPanel('📄 Non-navigable popup detected and closed. Continuing on main page.', 'info');
+                                    sendLogToPanel('Non-navigable popup detected and closed. Continuing on main page.', 'info');
                                 } else if (windowOpenDetected) {
                                     // window.open was called but we couldn't find the tab via Chrome API
                                     // The tab might be in a different window — try to find it
-                                    sendLogToPanel('🔍 window.open detected, scanning for new tab...', 'info');
+                                    sendLogToPanel('window.open detected, scanning for new tab...', 'info');
                                     await sleep(2000);
                                     const lateDetect = await detectNewTabAfterClick();
                                     if (lateDetect && lateDetect.isNavigable) {
@@ -1191,7 +1191,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                         await waitForStability(currentTabId, 3000);
                                         historyEntry.popup_url = lateDetect.url;
                                         historyEntry.auto_switched = true;
-                                        sendLogToPanel(`🆕 Late tab detection: ${lateDetect.url}`, 'success');
+                                        sendLogToPanel(`Late tab detection: ${lateDetect.url}`, 'success');
                                     }
                                 }
                             }
@@ -1212,7 +1212,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     lastActionFailed = true;
                     lastActionError = (actionResult && actionResult.error) || '';
                     if (failedActionCount > 0 && failedActionCount < maxFailedActions) {
-                        sendLogToPanel(`⚠️ Action failed (${failedActionCount}/${maxFailedActions} before stop)`, 'error');
+                        sendLogToPanel(`Action failed (${failedActionCount}/${maxFailedActions} before stop)`, 'error');
                     }
                 }
 
@@ -1229,7 +1229,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
             } catch (stepError) {
                 // ── PER-STEP ERROR CATCH: log and continue instead of silently dying ──
-                sendLogToPanel(`❌ Step ${step + 1} crashed: ${stepError.message}`, 'error');
+                sendLogToPanel(`Step ${step + 1} crashed: ${stepError.message}`, 'error');
                 console.error('Step crash:', stepError);
                 failedActionCount++;
                 actionHistory.push({
@@ -1239,7 +1239,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     actionSuccess: false
                 });
                 if (failedActionCount >= maxFailedActions) {
-                    sendLogToPanel(`🛑 Stopped: ${maxFailedActions} consecutive failures (including crashes).`, 'error');
+                    sendLogToPanel(`Stopped: ${maxFailedActions} consecutive failures (including crashes).`, 'error');
                     break;
                 }
                 // Continue to next step instead of dying silently
