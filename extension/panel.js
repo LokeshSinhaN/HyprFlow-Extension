@@ -7,6 +7,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const statusBar = document.getElementById('statusBar');
     const statusText = document.getElementById('statusText');
 
+    const planApprovalContainer = document.getElementById('planApprovalContainer');
+    const approvePlanBtn = document.getElementById('approvePlanBtn');
+    const rejectPlanBtn = document.getElementById('rejectPlanBtn');
+
     // Code banner elements
     const codeBanner = document.getElementById('codeBanner');
     const codeBannerHeader = document.getElementById('codeBannerHeader');
@@ -163,6 +167,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (message.type === 'LOG') {
             appendLog(message.text, message.level);
         }
+        if (message.type === 'PLAN_GENERATED') {
+            stopWatchdog();
+            statusText.textContent = 'Waiting for plan approval...';
+            stopBtn.style.display = 'none';
+            planApprovalContainer.style.display = 'flex';
+        }
         if (message.type === 'AGENT_DONE') {
             setRunning(false);
             appendLog('\u2705 Agent completed.', 'success');
@@ -213,9 +223,37 @@ document.addEventListener('DOMContentLoaded', () => {
             if (response && response.status === 'stopped') {
                 appendLog("\u23f9 Agent stopped by user.", "error");
                 setRunning(false);
+                planApprovalContainer.style.display = 'none';
                 // Still enable generate — partial history is usable
                 generateBtn.disabled = false;
             }
+        });
+    });
+
+    // ─── APPROVE PLAN ───────────────────────────────────────────
+    approvePlanBtn.addEventListener('click', () => {
+        const prompt = promptInput.value.trim();
+        planApprovalContainer.style.display = 'none';
+        stopBtn.style.display = 'block';
+        statusText.textContent = 'Agent is running...';
+        startWatchdog();
+        appendLog('✅ Plan approved by user. Executing actions...', 'success');
+        chrome.runtime.sendMessage({
+            type: 'APPROVE_PLAN',
+            payload: { prompt: prompt }
+        });
+    });
+
+    // ─── REJECT PLAN ────────────────────────────────────────────
+    rejectPlanBtn.addEventListener('click', () => {
+        const prompt = promptInput.value.trim();
+        planApprovalContainer.style.display = 'none';
+        stopBtn.style.display = 'block';
+        statusText.textContent = 'Requesting alternative plan...';
+        appendLog('❌ Plan rejected. Requesting alternative workflow...', 'error');
+        chrome.runtime.sendMessage({
+            type: 'REJECT_PLAN',
+            payload: { prompt: prompt }
         });
     });
 

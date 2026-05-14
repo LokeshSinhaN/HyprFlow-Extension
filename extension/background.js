@@ -5,6 +5,7 @@
 
 const API_URL = "http://127.0.0.1:8001/api/extension/loop";
 const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
+const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -60,7 +61,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             currentTabId = tabs[0].id;
             await injectContentScript(currentTabId);
             sendResponse({ status: 'started' });
-            agentLoop(prompt, currentTabId);
+            
+            await generatePlan(prompt, false);
+            // Wait for APPROVE_PLAN message from panel before starting loop
         });
 
         return true;
@@ -92,7 +95,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         performGeneration(sendResponse);
         return true; // keep message channel open for async
     }
+
+    if (message.type === 'APPROVE_PLAN') {
+        const prompt = message.payload.prompt;
+        agentLoop(prompt, currentTabId);
+        return true;
+    }
+
+    if (message.type === 'REJECT_PLAN') {
+        const prompt = message.payload.prompt;
+        generatePlan(prompt, true);
+        return true;
+    }
 });
+
+async function generatePlan(prompt, rejected = false) {
+    sendLogToPanel(rejected ? 'Drafting Alternative Workflow Plan...' : 'Drafting Workflow Plan...', 'info');
+    try {
+        const res = await fetch(PLAN_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ prompt, rejected })
+        });
+        if (!res.ok) {
+            sendLogToPanel(`Plan generation failed: ${res.status}`, 'warn');
+            return;
+        }
+        const result = await res.json();
+        if (result.plan && Array.isArray(result.plan)) {
+            sendLogToPanel('📋 Plan of Action:', 'info');
+            result.plan.forEach(step => sendLogToPanel(step, 'step'));
+            chrome.runtime.sendMessage({ type: 'PLAN_GENERATED', payload: { plan: result.plan } }).catch(() => {});
+        }
+    } catch (e) {
+        sendLogToPanel(`Plan generation error: ${e.message}`, 'warn');
+    }
+}
 
 /**
  * Actual generation logic pulled out to handle both sync and async storage recovery

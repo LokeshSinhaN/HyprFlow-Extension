@@ -559,4 +559,68 @@ PROMPT;
             'timestamp' => now()->toIso8601String(),
         ]);
     }
+
+    /**
+     * POST /api/extension/plan
+     *
+     * Receives the user prompt and generates a structured Plan of Action (Workflow/SOP)
+     * before the agent starts executing tasks.
+     */
+    public function plan(Request $request): JsonResponse
+    {
+        $prompt = $request->input('prompt');
+        $isRejected = $request->input('rejected', false);
+
+        if (!$prompt) {
+            return response()->json(['error' => 'Prompt is required'], 400);
+        }
+
+        $rejectionNote = $isRejected 
+            ? "CRITICAL: The user REJECTED your previous plan. You MUST generate a COMPLETELY DIFFERENT plan of action. Propose an alternative workflow." 
+            : "";
+
+        $aiPrompt = <<<PROMPT
+You are a master workflow planner for an autonomous browser agent.
+Your task is to analyze the user's goal and break it down into a clear, step-by-step Standard Operating Procedure (SOP).
+
+User Goal: {$prompt}
+{$rejectionNote}
+
+# RESPONSE FORMAT
+You MUST respond with EXACTLY ONE JSON object, containing an array of steps.
+{
+    "plan": [
+        "Step 1: Navigate to the appropriate section.",
+        "Step 2: Fill out the necessary fields.",
+        "Step 3: Click save and verify the result."
+    ]
+}
+
+Make the steps concise and actionable. Limit to maximum 10 steps.
+PROMPT;
+
+        try {
+            $provider = config('automation.primary_ai', 'gemini');
+            $response = $this->ai->generate($aiPrompt, $provider);
+
+            if ($response === null) {
+                $errorMsg = $this->ai->getLastError() ?: 'AI planning failed';
+                Log::error('AI planning failed', ['error' => $errorMsg]);
+                return response()->json(['error' => $errorMsg], 500);
+            }
+
+            $cleanJson = preg_replace('/```(?:json)?\s*(.*?)\s*```/s', '$1', $response);
+            $planData = json_decode(trim($cleanJson), true);
+
+            if (!$planData || !isset($planData['plan'])) {
+                Log::warning('Failed to parse AI plan', ['raw' => substr($response, 0, 500)]);
+                return response()->json(['error' => 'Invalid AI response format'], 500);
+            }
+
+            return response()->json(['plan' => $planData['plan']]);
+        } catch (\Exception $e) {
+            Log::error('Plan Generation Error: ' . $e->getMessage());
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
 }

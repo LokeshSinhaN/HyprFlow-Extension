@@ -23,3 +23,7 @@ Route::post('/extension/loop', [ExtensionController::class, 'loop'])
 // Generate Selenium code from action history
 Route::post('/extension/generate-selenium', [ExtensionController::class, 'generateSelenium'])
     ->name('extension.generateSelenium');
+
+// Plan workflow before execution
+Route::post('/extension/plan', [ExtensionController::class, 'plan'])
+    ->name('extension.plan');
