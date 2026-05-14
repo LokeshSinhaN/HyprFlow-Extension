@@ -139,7 +139,9 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 let extraData = {};
                 try {
                     const el = action.selector ? document.querySelector(action.selector) : null;
-                    if (!el && action.action !== 'navigate' && action.action !== 'extract') {
+                    // Actions that can work WITHOUT a selector (they auto-detect targets)
+                    const selectorOptionalActions = ['navigate', 'extract', 'scroll_down', 'scroll_up'];
+                    if (!el && !selectorOptionalActions.includes(action.action)) {
                         throw new Error(`Selector not found: ${action.selector}`);
                     }
 
@@ -273,7 +275,27 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             }
                         } else {
                             // INTELLIGENT TYPE: Multi-strategy with auto-dropdown detection
+                            // ENHANCED: Combobox-aware — detects if field is a searchable dropdown
+                            // and ensures the dropdown option is actually clicked, not just typed.
                             el.focus();
+
+                            // Detect if this is a combobox/searchable dropdown
+                            const isCombobox = el.getAttribute('role') === 'combobox' ||
+                                el.getAttribute('aria-haspopup') === 'listbox' ||
+                                el.getAttribute('aria-haspopup') === 'true' ||
+                                el.getAttribute('aria-autocomplete') === 'list' ||
+                                el.getAttribute('aria-autocomplete') === 'both' ||
+                                !!el.getAttribute('aria-controls') ||
+                                !!el.getAttribute('aria-owns') ||
+                                !!el.closest('[class*="combobox"]') ||
+                                !!el.closest('[class*="autocomplete"]') ||
+                                !!el.closest('[class*="searchable"]') ||
+                                !!el.closest('[class*="react-select"]') ||
+                                !!el.closest('[data-radix-combobox-input]');
+
+                            if (isCombobox) {
+                                extraData.isCombobox = true;
+                            }
 
                             // Clear existing value first
                             setNativeValue(el, '');
@@ -284,17 +306,35 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             await new Promise(r => setTimeout(r, 100));
 
                             // Strategy 2: If value didn't persist, use keyboard simulation
-                            if (el.value !== action.text) {
-                                extraData.fallbackToKeyboard = true;
+                            // For comboboxes, ALWAYS use keyboard simulation (triggers search/filter)
+                            if (el.value !== action.text || isCombobox) {
+                                if (el.value !== action.text) {
+                                    extraData.fallbackToKeyboard = true;
+                                }
+                                // Clear again before keyboard sim for comboboxes
+                                if (isCombobox) {
+                                    setNativeValue(el, '');
+                                    await new Promise(r => setTimeout(r, 50));
+                                }
                                 await simulateTyping(el, action.text);
                             }
 
-                            // INTELLIGENT: Wait and check if typing triggered a dropdown/autocomplete
-                            await new Promise(r => setTimeout(r, 400));
-                            const dropdownResult = await detectAndSelectDropdownOption(el, action.text);
-                            if (dropdownResult.found) {
-                                extraData.autoSelectedDropdown = true;
-                                extraData.selectedDropdownText = dropdownResult.selectedText;
+                            // INTELLIGENT: Dropdown detection — ONLY for combobox/searchable fields
+                            // Regular text inputs (name, email, address, etc.) should NEVER trigger
+                            // dropdown detection — it wastes time and causes false positives.
+                            let dropdownResult = { found: false, dropdownVisible: false, visibleOptionTexts: [] };
+
+                            if (isCombobox) {
+                                // For comboboxes, wait for API response and detect dropdown
+                                await new Promise(r => setTimeout(r, 600));
+                                dropdownResult = await detectAndSelectDropdownOption(el, action.text);
+                                if (dropdownResult.found) {
+                                    extraData.autoSelectedDropdown = true;
+                                    extraData.selectedDropdownText = dropdownResult.selectedText;
+                                    if (dropdownResult.matchScore) {
+                                        extraData.matchScore = dropdownResult.matchScore;
+                                    }
+                                }
                             }
 
                             // POST-ACTION VERIFICATION: Check if value actually persisted
@@ -304,12 +344,59 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                 // Value was cleared by framework — try one more time with execCommand
                                 extraData.valueCleared = true;
                                 await simulateTyping(el, action.text);
+                                await new Promise(r => setTimeout(r, 300));
+
+                                // Only retry dropdown detection for combobox fields
+                                if (isCombobox) {
+                                    const retryDropdown = await detectAndSelectDropdownOption(el, action.text);
+                                    if (retryDropdown.found) {
+                                        extraData.autoSelectedDropdown = true;
+                                        extraData.selectedDropdownText = retryDropdown.selectedText;
+                                        if (retryDropdown.matchScore) {
+                                            extraData.matchScore = retryDropdown.matchScore;
+                                        }
+                                    } else if (retryDropdown.dropdownVisible && retryDropdown.visibleOptionTexts.length > 0) {
+                                        extraData.dropdownDetectedButNotSelected = true;
+                                        extraData.visibleOptionTexts = retryDropdown.visibleOptionTexts;
+                                    }
+                                }
+                            }
+
+                            // Flag dropdown-visible-but-not-selected ONLY for combobox fields
+                            if (isCombobox && !dropdownResult.found && dropdownResult.dropdownVisible &&
+                                dropdownResult.visibleOptionTexts.length > 0) {
+                                extraData.dropdownDetectedButNotSelected = true;
+                                extraData.visibleOptionTexts = dropdownResult.visibleOptionTexts;
+                            }
+
+                            // ENHANCED: For comboboxes, verify selection actually happened
+                            // A properly selected combobox usually changes the input value or
+                            // hides the input and shows a chip/tag
+                            if (isCombobox && !dropdownResult.found) {
                                 await new Promise(r => setTimeout(r, 200));
-                                // Check for dropdown again after retry
-                                const retryDropdown = await detectAndSelectDropdownOption(el, action.text);
-                                if (retryDropdown.found) {
+                                // Check if the input is now hidden (replaced by chip/tag)
+                                const postStyle = window.getComputedStyle(el);
+                                const postRect = el.getBoundingClientRect();
+                                const inputHidden = postStyle.display === 'none' ||
+                                    postStyle.visibility === 'hidden' ||
+                                    postRect.height === 0;
+
+                                if (inputHidden) {
+                                    // Input was replaced by a selection chip — success
                                     extraData.autoSelectedDropdown = true;
-                                    extraData.selectedDropdownText = retryDropdown.selectedText;
+                                    extraData.selectionConfirmedByHiddenInput = true;
+                                } else {
+                                    // Input still visible — check if aria-expanded is now false
+                                    // (dropdown closed = selection might have happened)
+                                    const expanded = el.getAttribute('aria-expanded');
+                                    if (expanded === 'false' && el.value !== action.text) {
+                                        // Dropdown closed and value changed — likely selected
+                                        extraData.autoSelectedDropdown = true;
+                                        extraData.selectionConfirmedByAriaState = true;
+                                    } else if (!extraData.dropdownDetectedButNotSelected) {
+                                        // Combobox but no dropdown appeared at all
+                                        extraData.comboboxNoDropdownAppeared = true;
+                                    }
                                 }
                             }
 
@@ -403,12 +490,81 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     else if (action.action === 'scroll_down' || action.action === 'scroll_up') {
                         const direction = action.action === 'scroll_down' ? 1 : -1;
                         const scrollTarget = action.selector ? document.querySelector(action.selector) : null;
-                        const scrollContainer = scrollTarget ||
-                            document.querySelector('[class*="modal"]') ||
-                            document.querySelector('[role="dialog"]') ||
-                            document.querySelector('[class*="drawer"]') ||
-                            document.scrollingElement ||
-                            document.documentElement;
+
+                        // ENHANCED: Smart scroll container detection
+                        // CRITICAL FIX: When a modal/dialog is open, ALWAYS prefer scrolling
+                        // the modal content — even if the AI explicitly said "body" or "html".
+                        // The AI doesn't know the correct scrollable element inside the modal.
+                        let scrollContainer = null;
+
+                        // First, check if a modal/dialog is currently open
+                        const openDialog = document.querySelector('[role="dialog"]') ||
+                            document.querySelector('[data-state="open"][class*="dialog"]') ||
+                            document.querySelector('[class*="modal"][class*="open"]') ||
+                            document.querySelector('[class*="modal"]:not([style*="display: none"])');
+
+                        // Determine if the explicit target is a page-level element (body, html, documentElement)
+                        const isPageLevelTarget = scrollTarget &&
+                            (scrollTarget === document.body ||
+                                scrollTarget === document.documentElement ||
+                                scrollTarget.tagName === 'HTML' ||
+                                scrollTarget.tagName === 'BODY');
+
+                        if (openDialog && (!scrollTarget || isPageLevelTarget)) {
+                            // Modal is open — find the scrollable content INSIDE the modal
+                            // Priority: Radix scroll area > overflow:auto/scroll child > dialog itself
+
+                            // 1. Radix UI scroll areas
+                            const radixScroll = openDialog.querySelector('[data-radix-scroll-area-viewport]') ||
+                                document.querySelector('[data-radix-scroll-area-viewport]');
+                            if (radixScroll && radixScroll.scrollHeight > radixScroll.clientHeight) {
+                                scrollContainer = radixScroll;
+                            }
+
+                            // 2. Any child with overflow-y: auto/scroll that is actually scrollable
+                            if (!scrollContainer) {
+                                const scrollableChildren = Array.from(openDialog.querySelectorAll('div, section, main, [class*="content"], [class*="body"]'));
+                                for (const child of scrollableChildren) {
+                                    const cs = window.getComputedStyle(child);
+                                    if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll' || cs.overflow === 'auto' || cs.overflow === 'scroll') &&
+                                        child.scrollHeight > child.clientHeight + 10) {
+                                        scrollContainer = child;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // 3. The dialog itself (if it's scrollable)
+                            if (!scrollContainer) {
+                                const dialogStyle = window.getComputedStyle(openDialog);
+                                if ((dialogStyle.overflowY === 'auto' || dialogStyle.overflowY === 'scroll') &&
+                                    openDialog.scrollHeight > openDialog.clientHeight + 10) {
+                                    scrollContainer = openDialog;
+                                }
+                            }
+
+                            // 4. Last resort: find the largest child div that could be scrollable
+                            if (!scrollContainer) {
+                                let largestChild = null;
+                                let largestHeight = 0;
+                                for (const child of openDialog.querySelectorAll('div')) {
+                                    if (child.scrollHeight > largestHeight && child.scrollHeight > child.clientHeight) {
+                                        largestHeight = child.scrollHeight;
+                                        largestChild = child;
+                                    }
+                                }
+                                scrollContainer = largestChild || openDialog;
+                            }
+
+                            extraData.modalScrollOverride = true;
+                        } else if (scrollTarget && !isPageLevelTarget) {
+                            // Explicit non-page-level target provided — use it
+                            scrollContainer = scrollTarget;
+                        } else {
+                            // No modal open, no specific target — scroll the page
+                            scrollContainer = document.scrollingElement || document.documentElement;
+                        }
+
                         const scrollAmount = Math.round(scrollContainer.clientHeight * 0.7);
                         scrollContainer.scrollBy({ top: direction * scrollAmount, behavior: 'smooth' });
                         await new Promise(r => setTimeout(r, 500));
@@ -429,6 +585,152 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 sendResponse({ success, ...extraData });
             })();
 
+            return true;
+        }
+
+        // ─── FIND AND CLICK SUBMIT BUTTON (direct recovery) ────
+        if (message.type === 'FIND_AND_CLICK_SUBMIT') {
+            (async () => {
+                try {
+                    const submitSelectors = [
+                        'button[type="submit"]',
+                        'input[type="submit"]',
+                        '[role="dialog"] button[type="submit"]',
+                        '[role="dialog"] form button:last-of-type',
+                        'form button[type="submit"]',
+                        'button[class*="submit" i]',
+                        'button[class*="save" i]',
+                    ];
+                    const submitTexts = ['add patient', 'save', 'submit', 'create', 'add', 'register', 'confirm', 'update'];
+                    let clicked = false;
+                    let clickedSelector = '';
+                    let clickedText = '';
+
+                    // Strategy 1: Direct CSS selectors
+                    for (const sel of submitSelectors) {
+                        try {
+                            const buttons = document.querySelectorAll(sel);
+                            for (const btn of buttons) {
+                                const style = window.getComputedStyle(btn);
+                                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                                const rect = btn.getBoundingClientRect();
+                                if (rect.width === 0 || rect.height === 0) continue;
+                                const btnText = (btn.textContent || '').trim().toLowerCase();
+                                if (btnText.includes('cancel') || btnText.includes('close') || btnText.includes('reset')) continue;
+                                btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                await new Promise(r => setTimeout(r, 300));
+                                btn.click();
+                                btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                clicked = true;
+                                clickedSelector = generateCss(btn);
+                                clickedText = (btn.textContent || '').trim();
+                                break;
+                            }
+                        } catch (e) { /* ignore */ }
+                        if (clicked) break;
+                    }
+
+                    // Strategy 2: Search all buttons by text content
+                    if (!clicked) {
+                        const allButtons = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
+                        for (const btn of allButtons) {
+                            const btnText = (btn.textContent || btn.value || '').trim().toLowerCase();
+                            const style = window.getComputedStyle(btn);
+                            if (style.display === 'none' || style.visibility === 'hidden') continue;
+                            if (btnText.includes('cancel') || btnText.includes('close') || btnText.includes('reset')) continue;
+                            for (const word of submitTexts) {
+                                if (btnText.includes(word)) {
+                                    btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                    await new Promise(r => setTimeout(r, 300));
+                                    btn.click();
+                                    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                    clicked = true;
+                                    clickedSelector = generateCss(btn);
+                                    clickedText = (btn.textContent || '').trim();
+                                    break;
+                                }
+                            }
+                            if (clicked) break;
+                        }
+                    }
+
+                    // Strategy 3: Last button inside form in dialog
+                    if (!clicked) {
+                        const form = document.querySelector('[role="dialog"] form') || document.querySelector('form');
+                        if (form) {
+                            const formButtons = form.querySelectorAll('button');
+                            if (formButtons.length > 0) {
+                                const lastBtn = formButtons[formButtons.length - 1];
+                                const btnText = (lastBtn.textContent || '').trim().toLowerCase();
+                                if (!btnText.includes('cancel') && !btnText.includes('close')) {
+                                    lastBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                    await new Promise(r => setTimeout(r, 300));
+                                    lastBtn.click();
+                                    clicked = true;
+                                    clickedSelector = generateCss(lastBtn);
+                                    clickedText = (lastBtn.textContent || '').trim();
+                                }
+                            }
+                        }
+                    }
+
+                    sendResponse({ success: clicked, clickedSelector, clickedText, method: 'FIND_AND_CLICK_SUBMIT' });
+                } catch (e) {
+                    sendResponse({ success: false, error: e.message });
+                }
+            })();
+            return true;
+        }
+
+        // ─── BATCH FILL FORM FIELDS ──────────────────────────────
+        if (message.type === 'BATCH_FILL') {
+            const fields = message.payload?.fields || [];
+            (async () => {
+                const results = [];
+                for (const field of fields) {
+                    try {
+                        const el = document.querySelector(field.selector);
+                        if (!el) { results.push({ selector: field.selector, success: false, error: 'Not found' }); continue; }
+                        el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        el.focus();
+                        const tag = el.tagName.toLowerCase();
+                        const inputType = (el.getAttribute('type') || '').toLowerCase();
+                        if (tag === 'select') {
+                            const options = Array.from(el.options);
+                            const optText = (field.text || field.option || '').trim();
+                            const targetOpt = options.find(o => o.text.trim().toLowerCase() === optText.toLowerCase() || o.value.toLowerCase() === optText.toLowerCase())
+                                || options.find(o => o.text.trim().toLowerCase().includes(optText.toLowerCase()));
+                            if (targetOpt) { setNativeValue(el, targetOpt.value); results.push({ selector: field.selector, success: true, value: targetOpt.text.trim() }); }
+                            else { results.push({ selector: field.selector, success: false, error: 'Option not found' }); }
+                        } else if (inputType === 'date') {
+                            const dateValue = parseDateToISO(field.text);
+                            setNativeValue(el, dateValue || field.text);
+                            results.push({ selector: field.selector, success: true, value: dateValue || field.text });
+                        } else {
+                            const isCombobox = el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || !!el.getAttribute('aria-controls');
+                            setNativeValue(el, '');
+                            await new Promise(r => setTimeout(r, 30));
+                            setNativeValue(el, field.text);
+                            await new Promise(r => setTimeout(r, 50));
+                            if (el.value !== field.text || isCombobox) {
+                                if (isCombobox) setNativeValue(el, '');
+                                await simulateTyping(el, field.text);
+                            }
+                            if (isCombobox) {
+                                await new Promise(r => setTimeout(r, 600));
+                                const dropResult = await detectAndSelectDropdownOption(el, field.text);
+                                results.push({ selector: field.selector, success: true, value: el.value, isCombobox: true, autoSelected: dropResult.found });
+                            } else {
+                                results.push({ selector: field.selector, success: true, value: el.value });
+                            }
+                        }
+                        await new Promise(r => setTimeout(r, 80));
+                    } catch (e) { results.push({ selector: field.selector, success: false, error: e.message }); }
+                }
+                sendResponse({ success: true, results, filledCount: results.filter(r => r.success).length });
+            })();
             return true;
         }
     });
@@ -579,101 +881,398 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
     }
 
     // ─── HELPER: Detect and select dropdown/autocomplete options after typing ───
-    // This makes the agent intelligent enough to handle searchable dropdowns,
-    // autocomplete fields, comboboxes, etc. without explicit instructions.
+    // ENHANCED: Polling-based detection with expanded selectors and fuzzy matching.
+    // Handles API-backed searchable dropdowns, comboboxes, Radix UI, shadcn/ui,
+    // CMDK, React-Select, Headless UI, and any custom dropdown pattern dynamically.
     async function detectAndSelectDropdownOption(inputEl, searchText) {
-        const result = { found: false, selectedText: '' };
+        const result = { found: false, selectedText: '', dropdownVisible: false, visibleOptionTexts: [] };
 
-        // Look for dropdown/autocomplete popups that appeared after typing
-        // These are dynamically rendered elements near the input or in portals
+        // Comprehensive dropdown container selectors covering all major UI libraries
         const dropdownSelectors = [
-            // Generic dropdown patterns
-            '[role="listbox"]', '[role="menu"]', '[role="option"]',
+            // ARIA standard patterns (most reliable)
+            '[role="listbox"]', '[role="menu"]',
             '.dropdown-menu.show', '.autocomplete-results', '.suggestions',
-            // React/Material UI patterns
-            '.MuiAutocomplete-popper', '.MuiMenu-list', '.MuiPopover-paper',
-            // Ant Design patterns
+
+            // Radix UI / shadcn/ui (used by Medora, modern React apps)
+            '[data-radix-popper-content-wrapper]',
+            '[data-radix-menu-content]',
+            '[data-radix-select-content]',
+            '[data-radix-combobox-content]',
+            '[data-radix-popover-content]',
+
+            // CMDK (Command Menu — popular in modern apps)
+            '[cmdk-list]', '[cmdk-group]',
+
+            // React-Select
+            '[class*="react-select__menu"]',
+            '[class*="-menu"][id*="react-select"]',
+
+            // Headless UI (Tailwind ecosystem)
+            '[data-headless-state="open"]',
+            '[data-headlessui-state*="open"]',
+
+            // Material UI / MUI
+            '.MuiAutocomplete-popper', '.MuiAutocomplete-listbox',
+            '.MuiMenu-list', '.MuiPopover-paper',
+            '.MuiPopper-root',
+
+            // Ant Design
             '.ant-select-dropdown', '.ant-cascader-dropdown',
+            '.ant-select-dropdown-menu',
+
+            // PrimeReact / PrimeFaces
+            '.p-autocomplete-panel', '.p-dropdown-panel',
+            '.p-listbox', '.p-multiselect-panel',
+
+            // Chakra UI
+            '[class*="chakra-menu__menu-list"]',
+            '[class*="chakra-popover__content"]',
+
             // Custom patterns (common in healthcare/enterprise apps)
             '[class*="dropdown"][class*="open"]', '[class*="dropdown"][class*="show"]',
-            '[class*="autocomplete"]', '[class*="suggestion"]', '[class*="results"]',
-            '[class*="listbox"]', '[class*="options"]', '[class*="menu"][class*="open"]',
-            // Portal-based dropdowns (rendered at body level)
-            'body > [class*="dropdown"]', 'body > [class*="popover"]',
-            'body > [role="listbox"]', '[data-radix-popper-content-wrapper]',
-            // Generic visible list items that appeared
-            'ul[style*="display: block"]', 'ul[style*="opacity: 1"]',
-            'div[style*="display: block"] li', '.visible[role="option"]'
+            '[class*="dropdown"][class*="visible"]', '[class*="dropdown"][class*="active"]',
+            '[class*="autocomplete"]', '[class*="suggestion"]',
+            '[class*="listbox"]', '[class*="combobox"][class*="list"]', '[class*="typeahead"]',
+            '[class*="search-results"]', '[class*="search-dropdown"]',
+
+            // Portal-based dropdowns (rendered at body level — common in React)
+            // NOTE: Removed overly broad 'body > div[style*="position"]' selectors
+            // as they match modals/dialogs and cause false positives
+            'body > [role="listbox"]',
+            'body > [class*="popover"]:not([role="dialog"])',
+
+            // Floating UI (used by many modern libs)
+            '[data-floating-ui-portal]',
+            '[data-popper-placement]',
+            '[data-popper-reference-hidden="false"]'
         ];
 
-        // Wait a moment for dropdown to render
-        await new Promise(r => setTimeout(r, 200));
+        // Option element selectors (what to look for INSIDE containers)
+        // NOTE: Removed bare 'li', 'a', 'button' — too broad, matches modal/form elements
+        // Only match elements that are clearly dropdown options
+        const optionSelectors = [
+            '[role="option"]',
+            '[cmdk-item]',
+            '[data-radix-collection-item]',
+            '[data-value]',
+            '[class*="react-select__option"]',
+            '[class*="option"]:not([class*="optional"])',
+            '[class*="item"]:not([class*="item-group"]):not([class*="form-item"]):not([class*="nav-item"])',
+            '[class*="result"]',
+            'li[role="option"]', 'li[data-value]', 'li[class*="option"]', 'li[class*="item"]',
+            'div[tabindex]', 'div[data-index]',
+            'div[class*="cursor-pointer"]', 'div[class*="hover"]',
+            '.ant-select-item-option',
+            '.MuiAutocomplete-option', '.MuiMenuItem-root',
+            '.p-autocomplete-item', '.p-dropdown-item',
+            '.dropdown-item',
+            // Radix popper children — often plain divs acting as options
+            '[data-radix-popper-content-wrapper] > div > div',
+            '[data-radix-popper-content-wrapper] > div > div > div'
+        ].join(', ');
 
-        // Find all potential dropdown containers
-        for (const sel of dropdownSelectors) {
-            try {
-                const containers = document.querySelectorAll(sel);
-                for (const container of containers) {
-                    const style = window.getComputedStyle(container);
-                    if (style.display === 'none' || style.visibility === 'hidden') continue;
-                    const rect = container.getBoundingClientRect();
-                    if (rect.width === 0 || rect.height === 0) continue;
+        // Fallback: for containers where standard selectors don't match,
+        // look for any visible div/span children that have text and look clickable
+        const fallbackOptionSelector = 'div, span, li, a';
 
-                    // Look for clickable options inside this container
-                    const options = container.querySelectorAll(
-                        '[role="option"], li, a, div[class*="option"], div[class*="item"], ' +
-                        'span[class*="option"], button, [data-value]'
-                    );
+        // Elements that should NEVER be considered dropdown containers
+        const excludeContainerSelectors = '[role="dialog"], [role="form"], form, [class*="modal"], [class*="dialog"], [class*="drawer"]';
 
-                    for (const opt of options) {
-                        const optStyle = window.getComputedStyle(opt);
-                        if (optStyle.display === 'none' || optStyle.visibility === 'hidden') continue;
-                        const optRect = opt.getBoundingClientRect();
-                        if (optRect.width === 0 || optRect.height === 0) continue;
+        // ENHANCED: Fuzzy text matching function
+        function textMatches(optText, searchText) {
+            if (!optText || !searchText) return false;
+            const optLower = optText.toLowerCase().trim();
+            const searchLower = searchText.toLowerCase().trim();
+            const firstLine = optLower.split('\n')[0].trim();
 
-                        const optText = (opt.textContent || '').trim();
-                        // Match: exact, starts-with, or contains the search text
-                        if (optText && (
-                            optText.toLowerCase() === searchText.toLowerCase() ||
-                            optText.toLowerCase().includes(searchText.toLowerCase()) ||
-                            searchText.toLowerCase().includes(optText.toLowerCase())
-                        )) {
-                            // Found a match — click it
-                            opt.scrollIntoView({ block: 'center' });
-                            opt.click();
-                            opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                            opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                            await new Promise(r => setTimeout(r, 200));
+            // Exact match
+            if (optLower === searchLower) return true;
+            if (firstLine === searchLower) return true;
+
+            // First line starts with search text
+            if (firstLine.startsWith(searchLower)) return true;
+
+            // Search text is contained in option (or first line)
+            if (optLower.includes(searchLower)) return true;
+            if (firstLine.includes(searchLower)) return true;
+
+            // Option text starts with search text (common for autocomplete)
+            if (optLower.startsWith(searchLower)) return true;
+
+            // Search text contains the option's first line (reverse containment)
+            if (searchLower.includes(firstLine) && firstLine.length > 2) return true;
+
+            // Word-boundary match: search text matches a word in the option
+            const words = firstLine.split(/[\s,;|]+/);
+            if (words.some(w => w === searchLower || w.startsWith(searchLower))) return true;
+
+            return false;
+        }
+
+        // ENHANCED: Score-based matching for best option selection
+        function matchScore(optText, searchText) {
+            if (!optText || !searchText) return 0;
+            const optLower = optText.toLowerCase().trim();
+            const searchLower = searchText.toLowerCase().trim();
+            const firstLine = optLower.split('\n')[0].trim();
+
+            if (firstLine === searchLower) return 100;  // Perfect first-line match
+            if (optLower === searchLower) return 95;    // Perfect full-text match
+            if (firstLine.startsWith(searchLower)) return 80;  // Starts with
+            if (optLower.startsWith(searchLower)) return 75;
+            if (firstLine.includes(searchLower)) return 60;    // Contains in first line
+            if (optLower.includes(searchLower)) return 40;     // Contains anywhere
+            if (searchLower.includes(firstLine) && firstLine.length > 2) return 30;
+            return 0;
+        }
+
+        // ENHANCED: Polling loop — wait up to 1500ms for dropdown to appear
+        // API-backed dropdowns (like insurance payer search) need time to fetch results
+        const MAX_DROPDOWN_WAIT_MS = 1500;
+        const POLL_INTERVAL_MS = 150;
+        let totalElapsed = 0;
+
+        while (totalElapsed < MAX_DROPDOWN_WAIT_MS) {
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            totalElapsed += POLL_INTERVAL_MS;
+
+            // Scan all dropdown container selectors
+            for (const sel of dropdownSelectors) {
+                try {
+                    const containers = document.querySelectorAll(sel);
+                    for (const container of containers) {
+                        const style = window.getComputedStyle(container);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        if (parseFloat(style.opacity) === 0) continue;
+                        const rect = container.getBoundingClientRect();
+                        if (rect.width < 10 || rect.height < 10) continue;
+
+                        // CRITICAL: Skip containers that are clearly NOT dropdowns
+                        // (modals, dialogs, forms, drawers — these match broad selectors)
+                        // BUT: Never skip known dropdown containers (Radix popper, listbox, etc.)
+                        const isDefinitelyDropdown = container.matches(
+                            '[data-radix-popper-content-wrapper], [data-radix-menu-content], ' +
+                            '[data-radix-select-content], [data-radix-combobox-content], ' +
+                            '[role="listbox"], [cmdk-list], [data-floating-ui-portal], ' +
+                            '[data-popper-placement], .MuiAutocomplete-popper, .MuiAutocomplete-listbox, ' +
+                            '.ant-select-dropdown, [class*="react-select__menu"]'
+                        );
+                        if (!isDefinitelyDropdown) {
+                            if (container.matches(excludeContainerSelectors)) continue;
+                            if (container.closest('[role="dialog"]') && !container.closest('[role="listbox"]')) continue;
+                        }
+
+                        // Skip containers that are too large to be a dropdown
+                        // (dropdowns are typically < 500px tall; modals are larger)
+                        if (rect.height > 600 && rect.width > 500) continue;
+
+                        // Found a visible dropdown container — look for options inside
+                        let options = container.querySelectorAll(optionSelectors);
+
+                        // FALLBACK: If standard selectors find nothing in a known dropdown container,
+                        // try the fallback selector (any div/span/li children with text)
+                        // This handles custom components like Medora's payer dropdown where
+                        // options are plain divs without role="option" or class*="option"
+                        if (options.length === 0) {
+                            const isKnownDropdown = container.matches(
+                                '[data-radix-popper-content-wrapper], [data-radix-menu-content], ' +
+                                '[data-radix-select-content], [data-radix-combobox-content], ' +
+                                '[role="listbox"], [cmdk-list], [data-floating-ui-portal], ' +
+                                '[data-popper-placement], .MuiAutocomplete-popper'
+                            );
+                            if (isKnownDropdown) {
+                                // Use fallback: get all direct-ish children that could be options
+                                options = container.querySelectorAll(fallbackOptionSelector);
+                            }
+                            if (options.length === 0) continue;
+                        }
+
+                        // Count actually visible options with text content
+                        let visibleOptionCount = 0;
+                        for (const opt of options) {
+                            const os = window.getComputedStyle(opt);
+                            if (os.display === 'none' || os.visibility === 'hidden') continue;
+                            const or = opt.getBoundingClientRect();
+                            if (or.width < 5 || or.height < 5) continue;
+                            const ot = (opt.textContent || '').trim();
+                            if (ot && ot.length > 0 && ot.length < 500) visibleOptionCount++;
+                            if (visibleOptionCount >= 1) break; // At least 1 real option needed
+                        }
+                        if (visibleOptionCount === 0) continue;
+
+                        // Mark that we found a REAL visible dropdown with actual options
+                        result.dropdownVisible = true;
+
+                        // Collect visible option texts for AI feedback
+                        let bestMatch = null;
+                        let bestScore = 0;
+
+                        for (const opt of options) {
+                            const optStyle = window.getComputedStyle(opt);
+                            if (optStyle.display === 'none' || optStyle.visibility === 'hidden') continue;
+                            if (parseFloat(optStyle.opacity) === 0) continue;
+                            const optRect = opt.getBoundingClientRect();
+                            if (optRect.width < 5 || optRect.height < 5) continue;
+
+                            const optText = (opt.textContent || '').trim();
+                            if (!optText || optText.length > 500) continue;
+
+                            // Collect for AI feedback (first line only, limit to 10)
+                            const firstLine = optText.split('\n')[0].trim();
+                            if (result.visibleOptionTexts.length < 10 && firstLine.length < 100) {
+                                if (!result.visibleOptionTexts.includes(firstLine)) {
+                                    result.visibleOptionTexts.push(firstLine);
+                                }
+                            }
+
+                            // Score this option
+                            const score = matchScore(optText, searchText);
+                            if (score > bestScore) {
+                                bestScore = score;
+                                bestMatch = opt;
+                            }
+                        }
+
+                        // If we found a good match (score >= 30), click it
+                        if (bestMatch && bestScore >= 30) {
+                            bestMatch.scrollIntoView({ block: 'center' });
+                            await new Promise(r => setTimeout(r, 50));
+
+                            // Multi-event click for maximum framework compatibility
+                            bestMatch.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                            bestMatch.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                            bestMatch.click();
+
+                            // Some frameworks need pointer events
+                            bestMatch.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                            bestMatch.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+
+                            await new Promise(r => setTimeout(r, 300));
+
                             result.found = true;
-                            result.selectedText = optText;
+                            result.selectedText = (bestMatch.textContent || '').trim().split('\n')[0].trim();
+                            result.matchScore = bestScore;
                             return result;
                         }
                     }
-                }
-            } catch (e) { /* ignore selector errors */ }
+                } catch (e) { /* ignore selector errors */ }
+            }
+
+            // Also check ARIA-linked dropdown (via aria-controls on the input)
+            const ariaControls = inputEl.getAttribute('aria-controls') || inputEl.getAttribute('aria-owns');
+            if (ariaControls) {
+                try {
+                    const linkedContainer = document.getElementById(ariaControls);
+                    if (linkedContainer) {
+                        const lcStyle = window.getComputedStyle(linkedContainer);
+                        const lcRect = linkedContainer.getBoundingClientRect();
+                        if (lcStyle.display !== 'none' && lcStyle.visibility !== 'hidden' &&
+                            lcRect.width > 0 && lcRect.height > 0) {
+
+                            result.dropdownVisible = true;
+                            const options = linkedContainer.querySelectorAll(optionSelectors);
+                            let bestMatch = null;
+                            let bestScore = 0;
+
+                            for (const opt of options) {
+                                const optStyle = window.getComputedStyle(opt);
+                                if (optStyle.display === 'none' || optStyle.visibility === 'hidden') continue;
+                                const optRect = opt.getBoundingClientRect();
+                                if (optRect.width < 5 || optRect.height < 5) continue;
+                                const optText = (opt.textContent || '').trim();
+                                if (!optText || optText.length > 500) continue;
+
+                                const firstLine = optText.split('\n')[0].trim();
+                                if (result.visibleOptionTexts.length < 10 && firstLine.length < 100) {
+                                    if (!result.visibleOptionTexts.includes(firstLine)) {
+                                        result.visibleOptionTexts.push(firstLine);
+                                    }
+                                }
+
+                                const score = matchScore(optText, searchText);
+                                if (score > bestScore) {
+                                    bestScore = score;
+                                    bestMatch = opt;
+                                }
+                            }
+
+                            if (bestMatch && bestScore >= 30) {
+                                bestMatch.scrollIntoView({ block: 'center' });
+                                await new Promise(r => setTimeout(r, 50));
+                                bestMatch.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                                bestMatch.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                                bestMatch.click();
+                                bestMatch.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                                bestMatch.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                                await new Promise(r => setTimeout(r, 300));
+                                result.found = true;
+                                result.selectedText = (bestMatch.textContent || '').trim().split('\n')[0].trim();
+                                result.matchScore = bestScore;
+                                return result;
+                            }
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
+
+            // If dropdown is visible but no match yet, keep polling (API might still be loading)
+            // If no dropdown visible at all after 600ms, stop early
+            if (!result.dropdownVisible && totalElapsed > 600) break;
         }
 
-        // Also check for options that are direct siblings or nearby the input
-        const parent = inputEl.closest('.form-group, .field, [class*="input"], [class*="select"], [class*="search"]') || inputEl.parentElement;
-        if (parent) {
-            const nearbyOptions = parent.querySelectorAll(
-                '[role="option"], li, [class*="option"], [class*="item"], [class*="result"]'
-            );
+        // Final attempt: check for options that are direct siblings or nearby the input
+        const parentContainers = [
+            inputEl.closest('[class*="combobox"]'),
+            inputEl.closest('[class*="select"]'),
+            inputEl.closest('[class*="search"]'),
+            inputEl.closest('[class*="autocomplete"]'),
+            inputEl.closest('.form-group'),
+            inputEl.closest('.field'),
+            inputEl.parentElement?.parentElement,
+            inputEl.parentElement
+        ].filter(Boolean);
+
+        for (const parent of parentContainers) {
+            const nearbyOptions = parent.querySelectorAll(optionSelectors);
+            let bestMatch = null;
+            let bestScore = 0;
+
             for (const opt of nearbyOptions) {
+                if (opt === inputEl) continue; // Skip the input itself
                 const style = window.getComputedStyle(opt);
                 if (style.display === 'none' || style.visibility === 'hidden') continue;
                 const rect = opt.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
+                if (rect.width < 5 || rect.height < 5) continue;
                 const optText = (opt.textContent || '').trim();
-                if (optText && optText.toLowerCase().includes(searchText.toLowerCase())) {
-                    opt.click();
-                    opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    await new Promise(r => setTimeout(r, 200));
-                    result.found = true;
-                    result.selectedText = optText;
-                    return result;
+                if (!optText || optText.length > 500) continue;
+
+                const firstLine = optText.split('\n')[0].trim();
+                if (result.visibleOptionTexts.length < 10 && firstLine.length < 100) {
+                    if (!result.visibleOptionTexts.includes(firstLine)) {
+                        result.visibleOptionTexts.push(firstLine);
+                    }
                 }
+
+                const score = matchScore(optText, searchText);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = opt;
+                }
+            }
+
+            if (bestMatch && bestScore >= 30) {
+                bestMatch.scrollIntoView({ block: 'center' });
+                await new Promise(r => setTimeout(r, 50));
+                bestMatch.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                bestMatch.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                bestMatch.click();
+                bestMatch.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                bestMatch.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                await new Promise(r => setTimeout(r, 300));
+                result.found = true;
+                result.selectedText = (bestMatch.textContent || '').trim().split('\n')[0].trim();
+                result.matchScore = bestScore;
+                return result;
             }
         }
 
@@ -840,13 +1439,46 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 else if (tag === 'a') roleHint = 'link';
                 else if (tag === 'option') roleHint = 'option';
 
+                // ENHANCED: Detect combobox/searchable dropdown elements
+                // These require type-then-select interaction (not just type or select_option)
+                const elRole = el.getAttribute('role') || '';
+                const ariaHasPopup = el.getAttribute('aria-haspopup') || '';
+                const ariaAutocomplete = el.getAttribute('aria-autocomplete') || '';
+                const ariaExpanded = el.getAttribute('aria-expanded');
+                const ariaControls = el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '';
+
+                let isCombobox = false;
+                if (elRole === 'combobox' || elRole === 'searchbox' ||
+                    ariaHasPopup === 'listbox' || ariaHasPopup === 'true' ||
+                    ariaAutocomplete === 'list' || ariaAutocomplete === 'both' ||
+                    ariaControls !== '' ||
+                    !!el.closest('[class*="combobox"]') ||
+                    !!el.closest('[class*="autocomplete"]') ||
+                    !!el.closest('[class*="searchable"]') ||
+                    !!el.closest('[class*="react-select"]') ||
+                    !!el.closest('[data-radix-combobox-input]')) {
+                    isCombobox = true;
+                    roleHint = 'combobox'; // Override roleHint for AI understanding
+                }
+
                 const text = (el.textContent || el.value || label || '').trim().slice(0, 200);
 
                 let priority = 0;
                 if (tag === 'input' || tag === 'textarea') priority = 10;
+                if (isCombobox) priority = 11; // Comboboxes get highest priority (need special handling)
                 if (tag === 'select' || roleHint === 'listbox') priority = 5;
                 if (tag === 'button' || roleHint === 'button') priority = 3;
                 if (tag === 'a' || roleHint === 'link') priority = 2;
+
+                // BOOST: Submit/Save/Add buttons get highest priority so they're always
+                // included in the elements list — prevents "can't find submit button" problem
+                if (roleHint === 'button' || tag === 'button' || inputType === 'submit') {
+                    const buttonText = (el.textContent || el.value || '').trim().toLowerCase();
+                    if (inputType === 'submit' || el.type === 'submit' ||
+                        /\b(submit|save|add|create|register|confirm|update|next|continue)\b/.test(buttonText)) {
+                        priority = 12;
+                    }
+                }
 
                 const isChecked = (inputType === 'checkbox' || inputType === 'radio')
                     ? el.checked : (el.getAttribute('aria-checked') === 'true');
@@ -871,6 +1503,29 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     currentValue = el.value || null;
                 }
 
+                // ENHANCED: Build combobox state info for AI decision-making
+                let comboboxState = null;
+                if (isCombobox) {
+                    comboboxState = {
+                        isCombobox: true,
+                        expanded: ariaExpanded === 'true',
+                        hasPopup: ariaHasPopup || 'listbox',
+                        autocomplete: ariaAutocomplete || null,
+                        controls: ariaControls || null,
+                        // Check if a value is already selected (chip/tag visible nearby)
+                        hasSelectedChip: !!el.closest('[class*="select"], [class*="combobox"]')
+                            ?.querySelector('[class*="chip"], [class*="tag"], [class*="badge"], [class*="value"][class*="container"] > div, [data-radix-select-value]')
+                    };
+                    // For comboboxes, also check if there's a displayed value
+                    if (!currentValue) {
+                        const chipEl = el.closest('[class*="select"], [class*="combobox"]')
+                            ?.querySelector('[class*="singleValue"], [class*="chip"], [class*="tag"], [class*="selected-value"]');
+                        if (chipEl) {
+                            currentValue = (chipEl.textContent || '').trim() || null;
+                        }
+                    }
+                }
+
                 out.push({
                     tagName: tag, text: text || null,
                     selector: generateCss(el), xpath: getXPath(el),
@@ -881,6 +1536,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     selectedOptionText,
                     isPlaceholderSelected: isPlaceholderSelected || null,
                     currentValue,
+                    comboboxState: comboboxState,
                     visible: true,
                     boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
                 });

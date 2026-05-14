@@ -147,15 +147,19 @@ async function injectContentScript(tabId) {
     }
 }
 
-// ─── CONTENT SCRIPT COMMUNICATION WITH RETRIES ────────────────
+// ─── CONTENT SCRIPT COMMUNICATION WITH RETRIES + TIMEOUT ────────
 async function executeContentScript(tabId, actionType, payload = null, retries = 5) {
     for (let i = 0; i < retries; i++) {
-        const result = await new Promise((resolve) => {
-            chrome.tabs.sendMessage(tabId, { type: actionType, payload }, (response) => {
-                if (chrome.runtime.lastError) resolve(null);
-                else resolve(response);
-            });
-        });
+        const result = await Promise.race([
+            new Promise((resolve) => {
+                chrome.tabs.sendMessage(tabId, { type: actionType, payload }, (response) => {
+                    if (chrome.runtime.lastError) resolve(null);
+                    else resolve(response);
+                });
+            }),
+            // Timeout: prevent infinite hang if content script never responds
+            new Promise((resolve) => setTimeout(() => resolve(null), 15000))
+        ]);
         if (result) return result;
 
         console.log(`Message failed, retrying (${i + 1}/${retries})...`);
@@ -306,6 +310,9 @@ async function detectNewTabAfterClick(tabCountBefore) {
 }
 
 // ─── LOOP DETECTION (ported from AutomationService::checkForLoop) ──
+// ENHANCED: Scroll actions now include their selector in the key so different
+// scroll targets are tracked independently. Scroll also gets a higher retry
+// threshold since scrolling multiple times in long forms is normal.
 function checkForLoop(decision, actionRetryCount, lastActionKey) {
     const actionType = decision.action || '';
     let actionId = '';
@@ -316,10 +323,17 @@ function checkForLoop(decision, actionRetryCount, lastActionKey) {
         actionId = decision.option || '';
     } else if (actionType === 'navigate') {
         actionId = decision.url || '';
+    } else if (actionType === 'scroll_down' || actionType === 'scroll_up') {
+        // FIXED: Include selector so different scroll targets are tracked separately
+        // scroll_down on form ≠ scroll_down on body ≠ scroll_down on modal
+        actionId = decision.selector || 'default';
     }
 
     const actionKey = actionType + '_' + actionId;
-    const MAX_RETRIES = 3;
+
+    // Dynamic retry threshold: scroll actions get more retries since
+    // long forms/modals legitimately need multiple scrolls to reach the bottom
+    const MAX_RETRIES = (actionType === 'scroll_down' || actionType === 'scroll_up') ? 5 : 3;
 
     if (actionKey === lastActionKey) {
         const count = (actionRetryCount[actionKey] || 0) + 1;
@@ -511,6 +525,7 @@ async function agentLoop(prompt, tabId) {
     let consecutiveListTabsCount = 0; // Detect list_tabs loops
     let actionRetryCount = {};        // Loop detection counters
     let lastActionKey = '';           // Last action key for loop detection
+    let totalScrollAttempts = 0;     // Track ALL scroll attempts across targets
     let failedActionCount = 0;       // Consecutive failures
     const maxFailedActions = 3;
     let lastObservedElements = [];    // Cache for element resolution
@@ -521,7 +536,10 @@ async function agentLoop(prompt, tabId) {
     let staleStateCount = 0;          // Consecutive steps with identical fingerprints
     let lastPageUrl = '';             // Track URL changes for vision triggering
 
+    try { // ── OUTER TRY: guarantees AGENT_DONE fires even on unhandled crash ──
     for (let step = 0; step < maxSteps && isRunning; step++) {
+      try { // ── PER-STEP TRY-CATCH: prevents silent crashes ──
+        const stepStartTime = Date.now();
         sendLogToPanel(`--- Step ${step + 1} ---`, 'step');
 
         // Check consecutive failure limit
@@ -531,7 +549,11 @@ async function agentLoop(prompt, tabId) {
         }
 
         // 1. Wait for page stability (DOM + network)
-        await waitForStability(currentTabId, 2000);
+        // SPEED: Reduce wait for form-filling steps (type/select don't change DOM structure)
+        const prevAction = actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null;
+        const isFormFilling = prevAction && ['type', 'select_option'].includes(prevAction.action) && prevAction.actionSuccess;
+        sendLogToPanel('⏳ Waiting for page stability...', 'info');
+        await waitForStability(currentTabId, isFormFilling ? 500 : 2000);
 
         // 2. HYBRID MODE: DOM-primary with Vision-on-demand
         // Vision is only triggered when the agent is confused/stuck
@@ -571,6 +593,7 @@ async function agentLoop(prompt, tabId) {
 
         // DOM-ONLY MODE (default): Fast, reliable, no screenshot
         if (!observeResult) {
+            sendLogToPanel('👁️ Observing page elements...', 'info');
             observeResult = await executeContentScript(currentTabId, 'OBSERVE');
             if (!observeResult || !observeResult.elements) {
                 sendLogToPanel("Failed to observe page. Retrying...", 'error');
@@ -705,11 +728,16 @@ async function agentLoop(prompt, tabId) {
         // 4. Ask the backend brain (AI) for the next action
         let aiDecision;
         try {
+            sendLogToPanel('🧠 Thinking... (waiting for AI response)', 'info');
+            const controller = new AbortController();
+            const apiTimeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
             const response = await fetch(API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify(statePayload)
+                body: JSON.stringify(statePayload),
+                signal: controller.signal
             });
+            clearTimeout(apiTimeout);
 
             if (!response.ok) {
                 const text = await response.text();
@@ -744,6 +772,12 @@ async function agentLoop(prompt, tabId) {
 
             aiDecision = responseData;
         } catch (error) {
+            if (error.name === 'AbortError') {
+                sendLogToPanel('⚠️ AI API timed out after 60s. Retrying...', 'error');
+                failedActionCount++;
+                actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
+                continue;
+            }
             sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
             break;
         }
@@ -779,19 +813,53 @@ async function agentLoop(prompt, tabId) {
             historyEntry.actionSuccess = false;
             actionHistory.push(historyEntry);
 
-            // BLACKLIST this selector — prevent the AI from ever targeting it again
+            const actionType = aiDecision.action || '';
             const blockedSelector = aiDecision.selector || '';
+
+            // BLACKLIST this selector
             if (blockedSelector && !clickedSelectors.includes('BLOCKED:' + blockedSelector)) {
                 clickedSelectors.push('BLOCKED:' + blockedSelector);
             }
 
-            // Force directive that explicitly names the blocked field
-            postPopupDirective = `LOOP BROKEN: The field "${blockedSelector}" has been BLOCKED after ${actionRetryCount[loopResult.actionKey] || 3}+ failed attempts. `
-                + `You CANNOT interact with this selector anymore. It is DEAD to you. `
-                + `IMMEDIATELY move to the NEXT unfilled field or click the SUBMIT/SAVE button. `
-                + `If all fields have been attempted, scroll down and click the submit button NOW.`;
+            // ── SMART RECOVERY: If loop was on scroll, auto-attempt submit button ──
+            if (actionType === 'scroll_down' || actionType === 'scroll_up') {
+                sendLogToPanel('🔍 Scroll loop detected — auto-attempting to find and click submit button...', 'info');
+                const submitResult = await executeContentScript(currentTabId, 'FIND_AND_CLICK_SUBMIT', null, 3);
 
-            // Auto-scroll the page down to reveal submit buttons that may be hidden
+                if (submitResult && submitResult.success) {
+                    sendLogToPanel(`✅ Auto-clicked submit: "${submitResult.clickedText}" (${submitResult.clickedSelector})`, 'success');
+                    actionHistory.push({
+                        step: actionHistory.length + 1,
+                        thought: 'Auto-recovery: Found and clicked submit button after scroll loop',
+                        action: 'click',
+                        selector: submitResult.clickedSelector,
+                        actionSuccess: true,
+                        autoSubmit: true,
+                        buttonText: submitResult.clickedText
+                    });
+                    await waitForStability(currentTabId, 3000);
+                    postPopupDirective = 'AUTO-SUBMIT ATTEMPTED: The system found and clicked "'
+                        + submitResult.clickedText + '". Check if the form submitted successfully. '
+                        + 'If the modal closed or success message appeared, call "finish". '
+                        + 'If validation errors appeared, fix them and re-submit.';
+                    continue;
+                } else {
+                    sendLogToPanel('⚠️ Auto-submit not found. Directing AI to try direct selectors...', 'warn');
+                    postPopupDirective = 'SCROLL LOOP BROKEN: The submit button was never found in the elements list. '
+                        + 'CRITICAL: Try clicking with these selectors in order: '
+                        + '1) button[type="submit"] '
+                        + '2) [role="dialog"] form button:last-of-type '
+                        + '3) Any button containing "Add", "Save", or "Submit" text. '
+                        + 'Use "click" action with these selectors directly.';
+                    continue;
+                }
+            }
+
+            // For non-scroll loops: keep existing behavior
+            postPopupDirective = `LOOP BROKEN: The field "${blockedSelector}" has been BLOCKED. `
+                + `You CANNOT interact with this selector anymore. `
+                + `IMMEDIATELY move to the NEXT unfilled field or click the SUBMIT/SAVE button.`;
+
             await executeContentScript(currentTabId, 'EXECUTE_ACTION', {
                 action: 'scroll_down',
                 selector: null
@@ -807,9 +875,43 @@ async function agentLoop(prompt, tabId) {
             break;
         }
 
+        // 7b. Handle BATCH_FILL — fill multiple form fields in one step
+        if (aiDecision.action === 'batch_fill' && aiDecision.fields && aiDecision.fields.length > 0) {
+            sendLogToPanel(`Batch filling ${aiDecision.fields.length} fields...`, 'info');
+            const batchResult = await executeContentScript(currentTabId, 'BATCH_FILL', { fields: aiDecision.fields }, 3);
+
+            if (batchResult && batchResult.success) {
+                sendLogToPanel(`✅ Batch filled ${batchResult.filledCount}/${aiDecision.fields.length} fields`, 'success');
+                historyEntry.actionSuccess = true;
+                historyEntry.batchResults = batchResult.results;
+                historyEntry.filledCount = batchResult.filledCount;
+                failedActionCount = 0;
+                lastActionFailed = false;
+                lastActionError = '';
+
+                // Track each filled field in clickedSelectors
+                for (const r of (batchResult.results || [])) {
+                    if (r.success && r.selector) {
+                        clickedSelectors.push(r.selector);
+                    }
+                }
+            } else {
+                historyEntry.actionSuccess = false;
+                historyEntry.error = 'Batch fill failed';
+                failedActionCount++;
+                lastActionFailed = true;
+                lastActionError = 'Batch fill returned no result';
+            }
+
+            actionHistory.push(historyEntry);
+            await waitForStability(currentTabId, 800);
+            continue;
+        }
+
         // 8. Execute the action
         let actionResult = null;
         let actionSuccess = false;
+        sendLogToPanel(`⚡ Executing: ${aiDecision.action} on ${aiDecision.selector || '(page)'}...`, 'info');
 
         // ── Tab management actions ──
         if (['switch_tab', 'new_tab', 'list_tabs', 'close_tab'].includes(aiDecision.action)) {
@@ -842,6 +944,35 @@ async function agentLoop(prompt, tabId) {
         else {
             consecutiveListTabsCount = 0;
 
+            // Track total scroll attempts across ALL targets
+            if (aiDecision.action === 'scroll_down' || aiDecision.action === 'scroll_up') {
+                totalScrollAttempts++;
+                // If excessive scrolling (across any targets), auto-attempt submit
+                if (totalScrollAttempts > 10) {
+                    sendLogToPanel(`⚠️ ${totalScrollAttempts} total scroll attempts — auto-attempting submit...`, 'warn');
+                    const submitResult = await executeContentScript(currentTabId, 'FIND_AND_CLICK_SUBMIT', null, 3);
+                    if (submitResult && submitResult.success) {
+                        sendLogToPanel(`✅ Auto-clicked submit: "${submitResult.clickedText}"`, 'success');
+                        actionHistory.push({
+                            step: actionHistory.length + 1,
+                            thought: 'Auto-recovery: Excessive scroll attempts, clicked submit',
+                            action: 'click',
+                            selector: submitResult.clickedSelector,
+                            actionSuccess: true,
+                            autoSubmit: true
+                        });
+                        await waitForStability(currentTabId, 3000);
+                        postPopupDirective = 'AUTO-SUBMIT: Clicked "' + submitResult.clickedText + '" after excessive scrolling. Check result and call finish if successful.';
+                        continue;
+                    }
+                }
+            } else {
+                // Reset scroll counter when a non-scroll action happens
+                if (aiDecision.action !== 'scroll_down' && aiDecision.action !== 'scroll_up') {
+                    totalScrollAttempts = 0;
+                }
+            }
+
             actionResult = await executeContentScript(currentTabId, 'EXECUTE_ACTION', aiDecision);
             sendLogToPanel(`Action result: ${JSON.stringify(actionResult)}`, 'info');
 
@@ -868,6 +999,42 @@ async function agentLoop(prompt, tabId) {
                 if (actionResult.toggleAction && actionResult.optionText) {
                     const key = (aiDecision.selector || '') + '::' + actionResult.optionText;
                     toggledOptions[key] = actionResult.toggleAction;
+                }
+
+                // ── ENHANCED: DROPDOWN DETECTION FEEDBACK ──
+                // When the content script detects a dropdown appeared after typing
+                // but couldn't auto-select an option, inject a directive for the AI
+                // to manually click the correct option in the next step.
+                if (actionResult.dropdownDetectedButNotSelected && aiDecision.action === 'type' &&
+                    actionResult.visibleOptionTexts && actionResult.visibleOptionTexts.length > 0) {
+                    const optionsList = actionResult.visibleOptionTexts.slice(0, 5).join('", "');
+                    postPopupDirective = `DROPDOWN VISIBLE BUT NOT AUTO-SELECTED: After typing "${aiDecision.text}" into the field "${aiDecision.selector}", `
+                        + `a dropdown/autocomplete list appeared with visible options: ["${optionsList}"]. `
+                        + `You MUST click the correct matching option from this dropdown in your NEXT action. `
+                        + `Use "click" action targeting the option element (look for [role="option"], li, or similar). `
+                        + `Do NOT call "finish" — the value is NOT properly selected until you click the dropdown option. `
+                        + `Do NOT re-type the value. The dropdown should still be visible.`;
+                    sendLogToPanel('⚠️ Dropdown appeared but option not auto-selected — AI must click it next step', 'warn');
+                    historyEntry.dropdownVisibleNotSelected = true;
+                    historyEntry.visibleOptions = actionResult.visibleOptionTexts;
+                }
+
+                // ── ENHANCED: Track successful auto-selection for history ──
+                if (actionResult.autoSelectedDropdown) {
+                    historyEntry.autoSelectedDropdown = true;
+                    historyEntry.selectedDropdownText = actionResult.selectedDropdownText;
+                    sendLogToPanel(`✅ Auto-selected dropdown option: "${actionResult.selectedDropdownText}"`, 'success');
+                }
+
+                // ── ENHANCED: Combobox with no dropdown appeared ──
+                if (actionResult.comboboxNoDropdownAppeared && aiDecision.action === 'type') {
+                    postPopupDirective = `COMBOBOX WARNING: The field "${aiDecision.selector}" is a searchable combobox, `
+                        + `but no dropdown appeared after typing "${aiDecision.text}". Possible causes: `
+                        + `1) The search term didn't match any options. Try a shorter/different search term. `
+                        + `2) The field needs a click first to activate it before typing. `
+                        + `3) There may be a loading delay. Try clicking the field's dropdown arrow/chevron button. `
+                        + `Do NOT call "finish" — the combobox value is NOT set.`;
+                    sendLogToPanel('⚠️ Combobox field — no dropdown appeared after typing', 'warn');
                 }
 
                 // ── NEW TAB DETECTION AFTER CLICK ──
@@ -948,23 +1115,46 @@ async function agentLoop(prompt, tabId) {
         actionHistory.push(historyEntry);
 
         // 10. Wait for UI to settle before next iteration
-        await waitForStability(currentTabId, 1500);
+        // SPEED: Shorter wait for form-filling actions
+        const justFilledField = aiDecision && ['type', 'select_option'].includes(aiDecision.action) && actionSuccess;
+        await waitForStability(currentTabId, justFilledField ? 500 : 1500);
+
+        // Log step duration for performance tracking
+        const stepDuration = ((Date.now() - stepStartTime) / 1000).toFixed(1);
+        sendLogToPanel(`Step ${step + 1} completed in ${stepDuration}s`, 'info');
+
+      } catch (stepError) {
+        // ── PER-STEP ERROR CATCH: log and continue instead of silently dying ──
+        sendLogToPanel(`❌ Step ${step + 1} crashed: ${stepError.message}`, 'error');
+        console.error('Step crash:', stepError);
+        failedActionCount++;
+        actionHistory.push({
+            step: step + 1,
+            action: 'step_crash',
+            error: stepError.message,
+            actionSuccess: false
+        });
+        if (failedActionCount >= maxFailedActions) {
+            sendLogToPanel(`🛑 Stopped: ${maxFailedActions} consecutive failures (including crashes).`, 'error');
+            break;
+        }
+        // Continue to next step instead of dying silently
+        continue;
+      } // end per-step try-catch
     }
 
-    isRunning = false;
-    // Persist history for "Generate Code" button
-    lastAgentHistory = actionHistory;
-
-    // Save to storage for Manifest V3 persistence
-    chrome.storage.local.set({
-        lastAgentHistory: actionHistory,
-        lastAgentPrompt: lastAgentPrompt,
-        lastAgentStartUrl: lastAgentStartUrl
-    });
-
-    sendLogToPanel("Loop ended.", 'info');
-    // Re-enable buttons in the panel — include hasHistory so panel knows code gen is available
-    chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => { });
+    } finally {
+        // ── GUARANTEE: AGENT_DONE always fires, even on crash ──
+        isRunning = false;
+        lastAgentHistory = actionHistory;
+        chrome.storage.local.set({
+            lastAgentHistory: actionHistory,
+            lastAgentPrompt: lastAgentPrompt,
+            lastAgentStartUrl: lastAgentStartUrl
+        });
+        sendLogToPanel('Loop ended.', 'info');
+        chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => { });
+    }
 }
 
 // ─── HYBRID VISION: Dynamically decide when to use vision ──────

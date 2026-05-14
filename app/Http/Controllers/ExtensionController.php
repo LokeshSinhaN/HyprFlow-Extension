@@ -85,6 +85,35 @@ class ExtensionController extends Controller
             $dropdownStatesBlock .= "4. Use 'select_option' action for <select> dropdowns, NOT 'type'.\n";
         }
 
+        // Build combobox states block (searchable dropdowns that need type-then-select)
+        $comboboxStatesBlock = '';
+        $comboboxElements = array_filter($elements, fn($el) =>
+            !empty($el['comboboxState']) && ($el['comboboxState']['isCombobox'] ?? false)
+        );
+        if (!empty($comboboxElements)) {
+            $comboboxStatesBlock = "\n# COMBOBOX / SEARCHABLE DROPDOWN FIELDS (require type → then click option):\n";
+            $comboboxStatesBlock .= "⚠️ These fields are NOT regular inputs. They are searchable dropdowns.\n";
+            $comboboxStatesBlock .= "Pattern: type search text → wait for dropdown → click the matching option.\n";
+            $comboboxStatesBlock .= "The system auto-detects and clicks options when possible, but verify in history.\n\n";
+            foreach ($comboboxElements as $cbEl) {
+                $cbLabel = $cbEl['ariaLabel'] ?? $cbEl['name'] ?? $cbEl['id'] ?? $cbEl['selector'] ?? 'unknown';
+                $cbValue = $cbEl['currentValue'] ?? '(empty)';
+                $cbState = $cbEl['comboboxState'];
+                $hasChip = !empty($cbState['hasSelectedChip']);
+                $status = ($cbValue && $cbValue !== '(empty)') || $hasChip ? '✓ HAS VALUE' : '⚠️ EMPTY (needs selection)';
+                $comboboxStatesBlock .= "- \"{$cbLabel}\" (selector: {$cbEl['selector']}): value=\"{$cbValue}\" [{$status}]";
+                if ($hasChip) {
+                    $comboboxStatesBlock .= " [has selection chip]";
+                }
+                $comboboxStatesBlock .= "\n";
+            }
+            $comboboxStatesBlock .= "\nCOMBOBOX RULES:\n";
+            $comboboxStatesBlock .= "1. Use \"type\" action to search, then the system auto-selects the matching option.\n";
+            $comboboxStatesBlock .= "2. If auto-selection fails, you'll get a directive to manually click the option.\n";
+            $comboboxStatesBlock .= "3. A combobox is ONLY properly set when it shows a chip/tag (not raw text).\n";
+            $comboboxStatesBlock .= "4. If the combobox already has a chip with the correct value, SKIP it.\n";
+        }
+
         // Build SoM map description (only when vision/image is provided)
         $somDescription = '';
         $hasVision = !empty($imageBase64) && strlen($imageBase64) > 1000;
@@ -173,6 +202,7 @@ You are an advanced autonomous browser agent. {$modeIndicator}
 Goal: {$prompt}
 {$popupDirectiveBlock}
 {$dropdownStatesBlock}
+{$comboboxStatesBlock}
 {$formFieldStatus}
 {$sopProgressBlock}
 
@@ -196,6 +226,11 @@ You must review this history to understand what you have already tried.
 - Use {"action":"scroll_down"} to scroll down and reveal hidden elements (like submit buttons at bottom of forms)
 - Use {"action":"scroll_up"} to scroll back up
 - If you cannot see a submit/save button in the screenshot, scroll down first
+- IMPORTANT: If scrolling fails to reveal the submit button after 2-3 attempts, try clicking directly:
+  1) button[type="submit"]
+  2) [role="dialog"] form button:last-of-type
+  3) Any button containing "Add", "Save", or "Submit" text
+- The system will auto-attempt to find and click submit buttons if scroll loops are detected
 
 # HIERARCHICAL ELEMENT RULE:
 When you click an element that reveals additional nested elements (e.g. expand → child inside → next action inside), every revealed element is a DISTINCT element with its own deeper selector. You MUST click each one in sequence as directed by the SOP. These are never "re-clicks" of a previous element.
@@ -204,11 +239,12 @@ When you click an element that reveals additional nested elements (e.g. expand �
 You MUST respond with EXACTLY ONE JSON object, no markdown blocks, no extra text.
 {
     "thought": "1. Analyze the SCREENSHOT and current page state. 2. Check CURRENT DROPDOWN VALUES section - if status shows 'NOT SET (placeholder/default)' you MUST select the value; if already correct, SKIP. 3. Verify what happened after last step. 4. Decide the exact next action.",
-    "action": "click|type|hover|select_option|scroll_down|scroll_up|extract|navigate|finish|switch_tab|new_tab|list_tabs|close_tab",
+    "action": "click|type|hover|select_option|scroll_down|scroll_up|extract|navigate|batch_fill|finish|switch_tab|new_tab|list_tabs|close_tab",
     "somIndex": "number from red box on screenshot (if available, prefer this over selector)",
     "selector": "MUST BE PROVIDED. exact css selector from the elements list (fallback if somIndex not available). NEVER leave this empty!",
     "text": "text to type (if type action)",
     "option": "exact text of the option to select (if select_option action)",
+    "fields": [{"selector":"#field_id","text":"value"}, ...],
     "unselect": false,
     "url": "url to navigate to (if navigate action)",
     "index": "tab index integer (if switch_tab action)",
@@ -231,6 +267,24 @@ CRITICAL: The "selector" field MUST contain a valid CSS selector. NEVER respond 
 - If the CURRENT DROPDOWN VALUES section shows "⚠️ NOT SET (placeholder/default)" for a dropdown, you MUST select the correct value
 - Use "select_option" action (NOT "type") for all <select> dropdowns
 - The "option" field must contain the exact text of the option to select (e.g., "Male", not "male")
+
+# SEARCHABLE DROPDOWN / COMBOBOX HANDLING (CRITICAL — type-then-select pattern):
+- Some dropdowns are NOT <select> elements — they are searchable input fields (comboboxes/autocomplete)
+- These elements have roleHint="combobox" or comboboxState in the elements list
+- PATTERN: You type text into the search field → a dropdown list appears → you MUST click the matching option
+- After typing into a combobox, the system AUTOMATICALLY attempts to detect and click the dropdown option
+- If the action result shows "autoSelectedDropdown": true in history, the selection succeeded — move to next step
+- If the action result shows "dropdownVisibleNotSelected": true, a dropdown appeared but wasn't auto-clicked
+  → You MUST observe the page and click the correct option element in your NEXT action
+  → Look for elements with [role="option"], li items, or similar that contain the desired text
+  → Use "click" action on the matching option — do NOT re-type or call "finish"
+- The field is ONLY properly set when it shows a "chip", "tag", or formatted value (e.g., "Aetna (60054) ×")
+- If after typing the field still shows raw text without a chip/tag, the selection may have FAILED
+- For combobox fields: NEVER call "finish" after just typing — verify the selection was confirmed
+- If no dropdown appeared after typing (comboboxNoDropdownAppeared), try:
+  1. Click the dropdown arrow/chevron button next to the field
+  2. Try a shorter search term (e.g., "Aet" instead of "Aetna")
+  3. Click the field first, wait, then type
 
 # FAILURE HANDLING (CRITICAL — prevents silent failure passthrough):
 - Each action in the history has an "actionSuccess" field (true/false).
@@ -323,6 +377,14 @@ CRITICAL: The "selector" field MUST contain a valid CSS selector. NEVER respond 
 - NEVER assume a field is filled if the screenshot shows it empty/placeholder
 - After each action, visually verify in the NEXT screenshot that the action actually took effect
 - If a field still shows its placeholder in the screenshot, the previous action FAILED — retry it
+
+# BATCH FILL (SPEED OPTIMIZATION — fill multiple form fields in ONE step):
+- When you see multiple empty text/date fields on the same form, use "batch_fill" action to fill them all at once
+- This is MUCH faster than filling one field per step (saves 1-2 seconds per field)
+- Format: {"action":"batch_fill","fields":[{"selector":"#field1","text":"value1"},{"selector":"#field2","text":"value2"}]}
+- Use batch_fill for regular text inputs, date inputs, and simple selects
+- Do NOT include combobox/searchable dropdown fields in batch_fill (they need individual handling)
+- Example: Fill name fields together: {"action":"batch_fill","fields":[{"selector":"#first_name","text":"John"},{"selector":"#last_name","text":"Doe"},{"selector":"#email","text":"john@example.com"}]}
 
 # FORM COMPLETION & SUBMISSION (DYNAMIC — driven by TASK PROGRESS above):
 - Check the "TASK PROGRESS" section above to understand your completion state

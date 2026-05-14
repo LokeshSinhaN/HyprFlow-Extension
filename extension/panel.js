@@ -18,6 +18,15 @@ document.addEventListener('DOMContentLoaded', () => {
     let isFirstLog = true;
     let isCodeBannerCollapsed = false;
 
+    // ─── WATCHDOG & ACTIVITY TRACKING ──────────────────────────
+    let agentRunning = false;
+    let lastLogTimestamp = 0;         // When we last received a log message
+    let agentStartTime = 0;          // When the agent started
+    let watchdogInterval = null;     // Interval ID for watchdog timer
+    let currentStep = 0;             // Current step number
+    const STALL_THRESHOLD_MS = 30000; // 30s without a log = stalled
+    const WARN_THRESHOLD_MS = 15000;  // 15s = show "still working..."
+
     function appendLog(message, type = 'info') {
         if (isFirstLog) {
             logsDiv.innerHTML = '';
@@ -28,17 +37,82 @@ document.addEventListener('DOMContentLoaded', () => {
         div.innerText = message;
         logsDiv.appendChild(div);
         logsDiv.scrollTop = logsDiv.scrollHeight;
+
+        // Track activity
+        lastLogTimestamp = Date.now();
+
+        // Track step number from step messages
+        const stepMatch = message.match(/^--- Step (\d+) ---$/);
+        if (stepMatch) {
+            currentStep = parseInt(stepMatch[1]);
+        }
     }
 
     function setRunning(running) {
+        agentRunning = running;
         runBtn.disabled = running;
         stopBtn.style.display = running ? 'block' : 'none';
         statusBar.classList.toggle('active', running);
         if (running) {
+            agentStartTime = Date.now();
+            lastLogTimestamp = Date.now();
+            currentStep = 0;
             statusText.textContent = 'Agent is running...';
-            // Disable generate while running
             generateBtn.disabled = true;
+            startWatchdog();
+        } else {
+            stopWatchdog();
+            // Show final elapsed time
+            if (agentStartTime > 0) {
+                const elapsed = ((Date.now() - agentStartTime) / 1000).toFixed(0);
+                statusText.textContent = `Completed in ${elapsed}s (${currentStep} steps)`;
+            } else {
+                statusText.textContent = 'Ready';
+            }
         }
+    }
+
+    // ─── WATCHDOG TIMER: detects silent hangs ───────────────────
+    function startWatchdog() {
+        stopWatchdog(); // Clear any existing
+        watchdogInterval = setInterval(() => {
+            if (!agentRunning) {
+                stopWatchdog();
+                return;
+            }
+
+            const sinceLastLog = Date.now() - lastLogTimestamp;
+            const totalElapsed = ((Date.now() - agentStartTime) / 1000).toFixed(0);
+
+            if (sinceLastLog > STALL_THRESHOLD_MS) {
+                // Agent has been silent for 30+ seconds — likely stuck
+                const stallSec = Math.round(sinceLastLog / 1000);
+                statusText.textContent = `⚠️ No response for ${stallSec}s — agent may be stuck (${totalElapsed}s total, step ${currentStep})`;
+                statusBar.style.backgroundColor = '#ff4444';
+
+                // Only append warning once every 30s
+                if (sinceLastLog < STALL_THRESHOLD_MS + 3000) {
+                    appendLog(`⚠️ Agent has been silent for ${stallSec}s. It may be waiting for AI response or stuck. Try "Stop" if it doesn't respond soon.`, 'error');
+                }
+            } else if (sinceLastLog > WARN_THRESHOLD_MS) {
+                // 15-30s: show "still working" indicator
+                const waitSec = Math.round(sinceLastLog / 1000);
+                statusText.textContent = `🧠 Working... (${waitSec}s since last update, ${totalElapsed}s total, step ${currentStep})`;
+                statusBar.style.backgroundColor = '#ff8800';
+            } else {
+                // Normal operation — show elapsed time
+                statusText.textContent = `Agent running — step ${currentStep} (${totalElapsed}s elapsed)`;
+                statusBar.style.backgroundColor = '';
+            }
+        }, 2000); // Check every 2 seconds
+    }
+
+    function stopWatchdog() {
+        if (watchdogInterval) {
+            clearInterval(watchdogInterval);
+            watchdogInterval = null;
+        }
+        statusBar.style.backgroundColor = '';
     }
 
     // ─── CODE BANNER: toggle collapse/expand ────────────────────
