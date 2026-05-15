@@ -260,10 +260,10 @@ class AiService
 
             $generativeModel = $geminiClient->generativeModel($model);
             if ($systemPrompt) {
-                $result = $generativeModel->generateContent([
-                    Content::part($systemPrompt),
-                    Content::part($prompt),
-                ]);
+                // Combine system prompt with user prompt as single content
+                // (this SDK version doesn't support separate system instructions)
+                $fullPrompt = $systemPrompt . "\n\n" . $prompt;
+                $result = $generativeModel->generateContent($fullPrompt);
             } else {
                 $result = $generativeModel->generateContent($prompt);
             }
@@ -312,10 +312,9 @@ class AiService
             $blob = new Blob(MimeType::IMAGE_JPEG, $b64Data);
 
             if ($systemPrompt) {
-                $result = $generativeModel->generateContent([
-                    Content::part($systemPrompt),
-                    Content::parse([$prompt, $blob]),
-                ]);
+                // Combine system prompt with user prompt for vision
+                $fullPrompt = $systemPrompt . "\n\n" . $prompt;
+                $result = $generativeModel->generateContent(Content::parse([$fullPrompt, $blob]));
             } else {
                 $result = $generativeModel->generateContent(Content::parse([$prompt, $blob]));
             }
