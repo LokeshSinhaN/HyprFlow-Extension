@@ -1,11 +1,308 @@
 // Hyprflow Extension Background Worker — the "Brain Coordinator".
-// ENHANCED: Plan-Aware Execution, Post-Action Verification, Multi-Action Chaining,
-// Scroll Verification, Site Knowledge Learning, Coordinate Click support.
+// ENHANCED: CDP Hardware Clicks, Network Listening, Plan-Aware Execution,
+// Post-Action Verification, Multi-Action Chaining, Scroll Verification,
+// Site Knowledge Learning, Coordinate Click support.
 
 const API_URL = "http://127.0.0.1:8001/api/extension/loop";
 const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
+
+// ─── CDP HARDWARE CLICK IMPLEMENTATION ─────────────────────────────
+// Uses Chrome DevTools Protocol to simulate real hardware mouse events.
+// This bypasses all JavaScript event listeners and synthetic event blockers
+// (Radix UI, HeadlessUI, etc.) by dispatching at the browser compositor level.
+
+/** @type {Set<number>} Tabs currently attached to debugger */
+const _debuggerAttachedTabs = new Set();
+
+/**
+ * Attaches chrome.debugger to a tab if not already attached.
+ * Handles the case where the debugger is already attached by another extension.
+ * @param {number} tabId
+ * @returns {Promise<boolean>} true if attached successfully
+ */
+async function attachDebugger(tabId) {
+    if (_debuggerAttachedTabs.has(tabId)) return true;
+
+    return new Promise((resolve) => {
+        chrome.debugger.attach({ tabId }, '1.3', () => {
+            if (chrome.runtime.lastError) {
+                const errMsg = chrome.runtime.lastError.message || '';
+                // Already attached is OK
+                if (errMsg.includes('Already attached')) {
+                    _debuggerAttachedTabs.add(tabId);
+                    resolve(true);
+                } else {
+                    console.error(`[CDP] Failed to attach debugger to tab ${tabId}: ${errMsg}`);
+                    resolve(false);
+                }
+            } else {
+                _debuggerAttachedTabs.add(tabId);
+                resolve(true);
+            }
+        });
+    });
+}
+
+/**
+ * Detaches chrome.debugger from a tab safely.
+ * @param {number} tabId
+ * @returns {Promise<void>}
+ */
+async function detachDebugger(tabId) {
+    if (!_debuggerAttachedTabs.has(tabId)) return;
+
+    return new Promise((resolve) => {
+        chrome.debugger.detach({ tabId }, () => {
+            _debuggerAttachedTabs.delete(tabId);
+            if (chrome.runtime.lastError) {
+                // Tab may have been closed — ignore
+                console.log(`[CDP] Detach warning for tab ${tabId}: ${chrome.runtime.lastError.message}`);
+            }
+            resolve();
+        });
+    });
+}
+
+/**
+ * Sends a CDP command to a tab via chrome.debugger.
+ * @param {number} tabId
+ * @param {string} method - CDP method (e.g., 'Input.dispatchMouseEvent')
+ * @param {object} params - CDP method parameters
+ * @returns {Promise<object|null>}
+ */
+async function sendCDPCommand(tabId, method, params = {}) {
+    return new Promise((resolve) => {
+        chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+            if (chrome.runtime.lastError) {
+                console.error(`[CDP] Command ${method} failed: ${chrome.runtime.lastError.message}`);
+                resolve(null);
+            } else {
+                resolve(result || {});
+            }
+        });
+    });
+}
+
+/**
+ * Executes a full hardware click lifecycle at the given X/Y viewport coordinates.
+ * Simulates: mouseMoved → mousePressed → mouseReleased
+ * This is the same event sequence a real user generates with a physical mouse.
+ *
+ * @param {number} tabId - Target tab ID
+ * @param {number} x - X coordinate (viewport-relative)
+ * @param {number} y - Y coordinate (viewport-relative)
+ * @param {object} [options] - Optional click configuration
+ * @param {number} [options.clickCount=1] - Number of clicks (2 for double-click)
+ * @param {string} [options.button='left'] - Mouse button ('left', 'right', 'middle')
+ * @param {number} [options.delay=50] - Delay between press and release in ms
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function executeHardwareClick(tabId, x, y, options = {}) {
+    const { clickCount = 1, button = 'left', delay = 50 } = options;
+
+    try {
+        // 1. Attach debugger
+        const attached = await attachDebugger(tabId);
+        if (!attached) {
+            return { success: false, error: 'Failed to attach debugger to tab' };
+        }
+
+        // 2. Move mouse to target position (generates mouseover/mouseenter events)
+        const moveResult = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved',
+            x: Math.round(x),
+            y: Math.round(y),
+            button: 'none',
+            clickCount: 0
+        });
+        if (moveResult === null) {
+            return { success: false, error: 'CDP mouseMoved failed' };
+        }
+
+        // Small delay to let hover effects register
+        await sleep(20);
+
+        // 3. Press mouse button
+        const pressResult = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mousePressed',
+            x: Math.round(x),
+            y: Math.round(y),
+            button: button,
+            clickCount: clickCount,
+            buttons: 1 // Left button bitmask
+        });
+        if (pressResult === null) {
+            return { success: false, error: 'CDP mousePressed failed' };
+        }
+
+        // Delay between press and release (simulates human finger speed)
+        await sleep(delay);
+
+        // 4. Release mouse button
+        const releaseResult = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased',
+            x: Math.round(x),
+            y: Math.round(y),
+            button: button,
+            clickCount: clickCount,
+            buttons: 0
+        });
+        if (releaseResult === null) {
+            return { success: false, error: 'CDP mouseReleased failed' };
+        }
+
+        return { success: true };
+    } catch (e) {
+        console.error(`[CDP] Hardware click error:`, e);
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Executes a CDP hardware click on an element identified by ref_id.
+ * Resolves the ref_id to viewport coordinates via the content script,
+ * then dispatches CDP mouse events at those coordinates.
+ *
+ * @param {number} tabId - Target tab ID
+ * @param {string} refId - Element reference ID from the accessibility tree
+ * @returns {Promise<{success: boolean, x?: number, y?: number, error?: string}>}
+ */
+async function executeRefClick(tabId, refId) {
+    // 1. Get coordinates from content script
+    const coordResult = await executeContentScript(tabId, 'GET_REF_COORDINATES', { ref_id: refId }, 3);
+
+    if (!coordResult || !coordResult.success) {
+        return {
+            success: false,
+            error: coordResult?.error || `Could not resolve coordinates for ${refId}`
+        };
+    }
+
+    const { x, y } = coordResult;
+
+    // 2. Execute CDP hardware click at those coordinates
+    const clickResult = await executeHardwareClick(tabId, x, y);
+
+    return {
+        ...clickResult,
+        x,
+        y,
+        ref_id: refId
+    };
+}
+
+// Clean up debugger on tab close/navigation
+chrome.tabs.onRemoved.addListener((tabId) => {
+    _debuggerAttachedTabs.delete(tabId);
+});
+
+// Handle debugger detach events (user closed DevTools, etc.)
+chrome.debugger.onDetach.addListener((source, reason) => {
+    if (source.tabId) {
+        _debuggerAttachedTabs.delete(source.tabId);
+        console.log(`[CDP] Debugger detached from tab ${source.tabId}: ${reason}`);
+    }
+});
+
+
+// ─── NETWORK LISTENING (HTTP Error Capture) ────────────────────────
+// Monitors medoraos.com/api requests for HTTP errors (status >= 400).
+// Stores the latest error so the AI can query it via read_network_status tool.
+
+/** @type {{ url: string, statusCode: number, method: string, timestamp: number, statusLine: string, type: string } | null} */
+let _latestNetworkError = null;
+
+/** @type {Array<{ url: string, statusCode: number, method: string, timestamp: number, statusLine: string }>} */
+let _networkErrorLog = [];
+const MAX_NETWORK_ERROR_LOG = 20;
+
+// Listen for completed requests with error status codes on medoraos.com API
+chrome.webRequest.onCompleted.addListener(
+    (details) => {
+        if (details.statusCode >= 400) {
+            const errorEntry = {
+                url: details.url,
+                statusCode: details.statusCode,
+                method: details.method,
+                timestamp: Date.now(),
+                statusLine: details.statusLine || `HTTP ${details.statusCode}`,
+                type: details.type || 'unknown',
+                tabId: details.tabId
+            };
+
+            _latestNetworkError = errorEntry;
+            _networkErrorLog.push(errorEntry);
+
+            // Keep log bounded
+            if (_networkErrorLog.length > MAX_NETWORK_ERROR_LOG) {
+                _networkErrorLog = _networkErrorLog.slice(-MAX_NETWORK_ERROR_LOG);
+            }
+
+            console.warn(`[Network] HTTP ${details.statusCode} on ${details.method} ${details.url}`);
+            sendLogToPanel(
+                `Network Error: ${details.method} ${details.url.split('?')[0]} → ${details.statusCode}`,
+                'warn'
+            );
+        }
+    },
+    { urls: ['*://*.medoraos.com/api/*', '*://*.medoraos.com/api*'] },
+    []
+);
+
+// Also listen for request errors (network failures, DNS errors, etc.)
+chrome.webRequest.onErrorOccurred.addListener(
+    (details) => {
+        const errorEntry = {
+            url: details.url,
+            statusCode: 0,
+            method: details.method,
+            timestamp: Date.now(),
+            statusLine: details.error || 'Network Error',
+            type: details.type || 'unknown',
+            tabId: details.tabId,
+            networkError: true
+        };
+
+        _latestNetworkError = errorEntry;
+        _networkErrorLog.push(errorEntry);
+
+        if (_networkErrorLog.length > MAX_NETWORK_ERROR_LOG) {
+            _networkErrorLog = _networkErrorLog.slice(-MAX_NETWORK_ERROR_LOG);
+        }
+
+        console.warn(`[Network] Request failed: ${details.method} ${details.url} — ${details.error}`);
+        sendLogToPanel(
+            `Network Failure: ${details.method} ${details.url.split('?')[0]} — ${details.error}`,
+            'error'
+        );
+    },
+    { urls: ['*://*.medoraos.com/api/*', '*://*.medoraos.com/api*'] },
+    []
+);
+
+/**
+ * Returns the current network error status for the AI's read_network_status tool.
+ * @returns {{ hasError: boolean, latestError: object|null, recentErrors: Array, errorCount: number }}
+ */
+function getNetworkStatus() {
+    return {
+        hasError: _latestNetworkError !== null,
+        latestError: _latestNetworkError,
+        recentErrors: _networkErrorLog.slice(-5),
+        errorCount: _networkErrorLog.length
+    };
+}
+
+/**
+ * Clears the network error state (called after AI acknowledges the error).
+ */
+function clearNetworkErrors() {
+    _latestNetworkError = null;
+    _networkErrorLog = [];
+}
+
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -107,6 +404,70 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'REJECT_PLAN') {
         const prompt = message.payload.prompt;
         generatePlan(prompt, true);
+        return true;
+    }
+
+    // ─── CDP HARDWARE CLICK (via ref_id from accessibility tree) ──
+    if (message.type === 'CDP_CLICK') {
+        const { ref_id, x, y, tabId: targetTabId } = message.payload || {};
+        const clickTabId = targetTabId || currentTabId;
+
+        (async () => {
+            try {
+                let result;
+                if (ref_id) {
+                    // Click by ref_id — resolve coordinates from content script
+                    result = await executeRefClick(clickTabId, ref_id);
+                } else if (x !== undefined && y !== undefined) {
+                    // Direct coordinate click via CDP
+                    result = await executeHardwareClick(clickTabId, x, y);
+                } else {
+                    result = { success: false, error: 'CDP_CLICK requires ref_id or x/y coordinates' };
+                }
+                sendResponse(result);
+            } catch (e) {
+                sendResponse({ success: false, error: e.message });
+            }
+        })();
+        return true;
+    }
+
+    // ─── CDP DETACH (cleanup debugger from tab) ──────────────────
+    if (message.type === 'CDP_DETACH') {
+        const targetTabId = message.payload?.tabId || currentTabId;
+        (async () => {
+            await detachDebugger(targetTabId);
+            sendResponse({ success: true });
+        })();
+        return true;
+    }
+
+    // ─── READ NETWORK STATUS (AI tool: read_network_status) ──────
+    if (message.type === 'READ_NETWORK_STATUS') {
+        const status = getNetworkStatus();
+        sendResponse(status);
+        return true;
+    }
+
+    // ─── CLEAR NETWORK ERRORS ────────────────────────────────────
+    if (message.type === 'CLEAR_NETWORK_ERRORS') {
+        clearNetworkErrors();
+        sendResponse({ success: true });
+        return true;
+    }
+
+    // ─── BUILD ACCESSIBILITY TREE (proxy to content script) ──────
+    if (message.type === 'GET_A11Y_TREE') {
+        const targetTabId = message.payload?.tabId || currentTabId;
+        (async () => {
+            try {
+                await injectContentScript(targetTabId);
+                const result = await executeContentScript(targetTabId, 'BUILD_A11Y_TREE', null, 3);
+                sendResponse(result || { success: false, error: 'No response from content script' });
+            } catch (e) {
+                sendResponse({ success: false, error: e.message });
+            }
+        })();
         return true;
     }
 });

@@ -1,6 +1,6 @@
 // Hyprflow Extension Content Script — runs in user's webpage context.
 // Acts as the "Hands" and "Eyes". Mirrors BrowserService.php intelligence.
-// Vision + SoM (Set-of-Mark) implementation for enhanced AI understanding
+// CDP-based Accessibility Tree + Vision + SoM implementation for enterprise-grade AI agent.
 
 if (typeof window.hyprflowListenerAdded === 'undefined') {
     window.hyprflowListenerAdded = true;
@@ -13,6 +13,180 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         maxElements: 60,
         somEnabled: true
     };
+
+    // ─── ACCESSIBILITY TREE ─────────────────────────────────────────
+    // Maps interactive DOM elements to stable ref IDs with absolute coordinates.
+    // Used by the AI agent to deterministically target elements via CDP clicks.
+    // Replaces flat CSS extraction with a semantic, coordinate-based approach.
+
+    /** @type {WeakMap<Element, string>} */
+    const _elementRefMap = new WeakMap();
+    /** @type {Map<string, Element>} */
+    const _refToElement = new Map();
+    let _refCounter = 0;
+
+    /**
+     * Builds a lightweight Accessibility Tree of all interactive elements on the page.
+     * Each element gets a stable ref_id (e.g., ref_1, ref_2) mapped to its semantic role,
+     * accessible name, and absolute X/Y center coordinates.
+     *
+     * Handles dynamic React/Radix UI elements that may unmount between calls by
+     * re-scanning the DOM each invocation and only reusing refs for elements still in DOM.
+     *
+     * @returns {{ tree: Array<{ref_id: string, role: string, name: string, x: number, y: number, tag: string, enabled: boolean, checked: boolean|null, value: string|null}>, elementCount: number }}
+     */
+    function buildAccessibilityTree() {
+        // Clear stale refs (elements that have been unmounted by React)
+        for (const [refId, el] of _refToElement.entries()) {
+            if (!document.contains(el)) {
+                _refToElement.delete(refId);
+                // WeakMap auto-cleans when element is GC'd
+            }
+        }
+
+        const INTERACTIVE_SELECTORS = [
+            'button', 'a[href]', 'input:not([type="hidden"])', 'textarea', 'select',
+            '[role="button"]', '[role="link"]', '[role="menuitem"]', '[role="menuitemcheckbox"]',
+            '[role="menuitemradio"]', '[role="option"]', '[role="switch"]', '[role="tab"]',
+            '[role="checkbox"]', '[role="radio"]', '[role="combobox"]', '[role="searchbox"]',
+            '[role="slider"]', '[role="spinbutton"]', '[role="textbox"]',
+            '[aria-haspopup]', '[contenteditable="true"]',
+            '[tabindex]:not([tabindex="-1"])',
+            '[data-radix-collection-item]', '[cmdk-item]'
+        ].join(', ');
+
+        const elements = document.querySelectorAll(INTERACTIVE_SELECTORS);
+        const tree = [];
+
+        for (const el of elements) {
+            try {
+                // Skip invisible/zero-size elements
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                if (parseFloat(style.opacity) === 0) continue;
+
+                // Get or assign a stable ref_id
+                let refId = _elementRefMap.get(el);
+                if (!refId) {
+                    _refCounter++;
+                    refId = `ref_${_refCounter}`;
+                    _elementRefMap.set(el, refId);
+                    _refToElement.set(refId, el);
+                }
+
+                // Compute absolute center coordinates (viewport + scroll offset)
+                const x = Math.round(rect.left + rect.width / 2 + window.scrollX);
+                const y = Math.round(rect.top + rect.height / 2 + window.scrollY);
+
+                // Determine semantic role
+                const tag = el.tagName.toLowerCase();
+                let role = el.getAttribute('role') || '';
+                if (!role) {
+                    if (tag === 'button' || el.type === 'submit' || el.type === 'button') role = 'button';
+                    else if (tag === 'a') role = 'link';
+                    else if (tag === 'input') {
+                        const inputType = (el.type || 'text').toLowerCase();
+                        if (inputType === 'checkbox') role = 'checkbox';
+                        else if (inputType === 'radio') role = 'radio';
+                        else if (inputType === 'range') role = 'slider';
+                        else role = 'textbox';
+                    }
+                    else if (tag === 'textarea') role = 'textbox';
+                    else if (tag === 'select') role = 'combobox';
+                    else role = 'generic';
+                }
+
+                // Determine accessible name (priority: aria-label > aria-labelledby > label[for] > text > placeholder > name)
+                let name = el.getAttribute('aria-label') || '';
+                if (!name) {
+                    const labelledBy = el.getAttribute('aria-labelledby');
+                    if (labelledBy) {
+                        const labelEl = document.getElementById(labelledBy);
+                        if (labelEl) name = (labelEl.textContent || '').trim();
+                    }
+                }
+                if (!name && el.id) {
+                    const labelEl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                    if (labelEl) name = (labelEl.textContent || '').trim();
+                }
+                if (!name) {
+                    name = (el.textContent || '').trim().slice(0, 80);
+                }
+                if (!name) {
+                    name = el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '';
+                }
+
+                // Element state
+                const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+                let isChecked = null;
+                if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+                    isChecked = el.checked ?? (el.getAttribute('aria-checked') === 'true');
+                }
+
+                // Current value for inputs
+                let value = null;
+                if (tag === 'input' || tag === 'textarea') {
+                    value = el.value || null;
+                } else if (tag === 'select' && el.selectedIndex >= 0) {
+                    value = el.options[el.selectedIndex]?.text || null;
+                }
+
+                tree.push({
+                    ref_id: refId,
+                    role: role,
+                    name: name.slice(0, 120),
+                    tag: tag,
+                    x: x,
+                    y: y,
+                    enabled: !isDisabled,
+                    checked: isChecked,
+                    value: value
+                });
+            } catch (e) {
+                // Skip elements that throw during inspection (e.g., cross-origin iframes)
+                continue;
+            }
+        }
+
+        return { tree, elementCount: tree.length };
+    }
+
+    /**
+     * Resolves a ref_id back to its DOM element for coordinate retrieval.
+     * Returns null if the element has been unmounted (React re-render).
+     * @param {string} refId
+     * @returns {Element|null}
+     */
+    function resolveRefElement(refId) {
+        const el = _refToElement.get(refId);
+        if (el && document.contains(el)) {
+            return el;
+        }
+        // Element was unmounted — clean up
+        _refToElement.delete(refId);
+        return null;
+    }
+
+    /**
+     * Gets the current absolute center coordinates for a ref_id.
+     * Handles elements that may have moved due to scroll or layout changes.
+     * @param {string} refId
+     * @returns {{ x: number, y: number } | null}
+     */
+    function getRefCoordinates(refId) {
+        const el = resolveRefElement(refId);
+        if (!el) return null;
+
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return null;
+
+        return {
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2)
+        };
+    }
 
     // --- Window.open Interception ---
     // Monkey-patch window.open to detect when clicks trigger new windows.
@@ -27,6 +201,46 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
     };
 
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+
+        // ─── BUILD ACCESSIBILITY TREE ────────────────────────────
+        if (message.type === 'BUILD_A11Y_TREE') {
+            try {
+                const result = buildAccessibilityTree();
+                sendResponse({
+                    success: true,
+                    url: window.location.href,
+                    title: document.title,
+                    tree: result.tree,
+                    elementCount: result.elementCount
+                });
+            } catch (e) {
+                sendResponse({ success: false, error: e.message, tree: [], elementCount: 0 });
+            }
+            return true;
+        }
+
+        // ─── GET REF COORDINATES (for CDP click targeting) ───────
+        if (message.type === 'GET_REF_COORDINATES') {
+            const refId = message.payload?.ref_id;
+            if (!refId) {
+                sendResponse({ success: false, error: 'No ref_id provided' });
+                return true;
+            }
+            const coords = getRefCoordinates(refId);
+            if (coords) {
+                sendResponse({ success: true, ...coords, ref_id: refId });
+            } else {
+                // Element may have been unmounted by React — rebuild tree and retry
+                buildAccessibilityTree();
+                const retryCoords = getRefCoordinates(refId);
+                if (retryCoords) {
+                    sendResponse({ success: true, ...retryCoords, ref_id: refId, rebuilt: true });
+                } else {
+                    sendResponse({ success: false, error: `Element ${refId} not found or unmounted`, ref_id: refId });
+                }
+            }
+            return true;
+        }
 
         // ─── OBSERVE ─────────────────────────────────────────────
         if (message.type === 'OBSERVE') {
@@ -200,9 +414,33 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         }
 
                         window.__hyprflow_popupOpened = false;
+
+                        // ─── UNIVERSAL EVENT DISPATCHER ───────────────────────
+                        // Sequences: focus → PointerEvents → MouseEvents → click
+                        // This bypasses Radix UI's synthetic event blockers which
+                        // require the full pointer lifecycle to register interactions.
+                        // Without this sequence, Radix buttons report success but
+                        // never actually open their popovers/menus.
+
+                        // 1. Focus is critical for Radix/HeadlessUI accessibility wrappers
+                        try { clickTarget.focus(); } catch(e) {}
+
+                        // 2. Compute center coordinates for realistic event positioning
+                        const clickRect = clickTarget.getBoundingClientRect();
+                        const clickX = clickRect.x + clickRect.width / 2;
+                        const clickY = clickRect.y + clickRect.height / 2;
+                        const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: clickX, clientY: clickY };
+
+                        // 3. Full pointer + mouse lifecycle (required by Radix UI)
+                        clickTarget.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+                        clickTarget.dispatchEvent(new PointerEvent('pointerenter', { ...eventOpts, bubbles: false }));
+                        clickTarget.dispatchEvent(new PointerEvent('pointerdown', { ...eventOpts, button: 0 }));
+                        clickTarget.dispatchEvent(new MouseEvent('mousedown', { ...eventOpts, button: 0 }));
+                        clickTarget.dispatchEvent(new MouseEvent('mouseup', { ...eventOpts, button: 0 }));
+                        clickTarget.dispatchEvent(new PointerEvent('pointerup', { ...eventOpts, button: 0 }));
+
+                        // 4. Standard click (some frameworks only listen to this)
                         clickTarget.click();
-                        clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                        clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
 
                         // --- POST-CLICK TREE AJAX WAIT ---
                         // Tree views often load content via AJAX after clicking a node.
@@ -695,27 +933,50 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         success = true;
                         extraData.keysDispatched = dispatched;
                     }
-                    // ── CLICK COORDINATE (Enhancement 3b: fallback visual click) ──
+                    // ── CLICK COORDINATE (Enhanced: fallback visual click with Universal Event Dispatcher) ──
                     else if (action.action === 'click_coordinate') {
-                        // Click by SoM bounding box center coordinates
+                        // Click by SoM bounding box center coordinates, direct x/y, or element center
                         let clickX, clickY, clickedEl;
                         if (action.somIndex && action.boundingBox) {
                             const bb = action.boundingBox;
                             clickX = bb.x + bb.width / 2;
                             clickY = bb.y + bb.height / 2;
+                        } else if (action.x !== undefined && action.y !== undefined) {
+                            // Direct coordinate click (AI provides x, y directly)
+                            clickX = action.x;
+                            clickY = action.y;
                         } else if (el) {
                             const rect = el.getBoundingClientRect();
                             clickX = rect.x + rect.width / 2;
                             clickY = rect.y + rect.height / 2;
                         } else {
-                            throw new Error('click_coordinate requires somIndex with boundingBox or a valid selector');
+                            throw new Error('click_coordinate requires somIndex with boundingBox, x/y coordinates, or a valid selector');
+                        }
+
+                        // Scroll element into view if coordinates are off-screen
+                        if (clickY < 0 || clickY > window.innerHeight || clickX < 0 || clickX > window.innerWidth) {
+                            window.scrollBy({ top: clickY - window.innerHeight / 2, behavior: 'smooth' });
+                            await new Promise(r => setTimeout(r, 400));
+                            // Recalculate if we had a bounding box (it's relative to viewport)
+                            if (el) {
+                                const newRect = el.getBoundingClientRect();
+                                clickX = newRect.x + newRect.width / 2;
+                                clickY = newRect.y + newRect.height / 2;
+                            }
                         }
 
                         clickedEl = document.elementFromPoint(clickX, clickY);
                         if (clickedEl) {
-                            clickedEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: clickX, clientY: clickY }));
-                            clickedEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: clickX, clientY: clickY }));
-                            clickedEl.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: clickX, clientY: clickY }));
+                            // Universal Event Dispatcher for coordinate clicks (same as regular click)
+                            try { clickedEl.focus(); } catch(e) {}
+                            const coordOpts = { bubbles: true, cancelable: true, view: window, clientX: clickX, clientY: clickY, button: 0 };
+                            clickedEl.dispatchEvent(new PointerEvent('pointerover', coordOpts));
+                            clickedEl.dispatchEvent(new PointerEvent('pointerenter', { ...coordOpts, bubbles: false }));
+                            clickedEl.dispatchEvent(new PointerEvent('pointerdown', coordOpts));
+                            clickedEl.dispatchEvent(new MouseEvent('mousedown', coordOpts));
+                            clickedEl.dispatchEvent(new MouseEvent('mouseup', coordOpts));
+                            clickedEl.dispatchEvent(new PointerEvent('pointerup', coordOpts));
+                            clickedEl.dispatchEvent(new MouseEvent('click', coordOpts));
                             clickedEl.click();
                             success = true;
                             extraData.clickedTag = clickedEl.tagName;
@@ -909,24 +1170,104 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         try { return CSS.escape(str); } catch (e) { return str.replace(/([\\x00-\\x1F\\x7F]|^[0-9])/g, '\\$1'); }
     }
 
+    // ─── HEURISTIC SELECTOR GENERATOR ───────────────────────────
+    // Prioritizes stable accessibility attributes and filters dynamic
+    // framework-generated IDs from Radix UI, MUI, and HeadlessUI.
+    // This prevents selectors like #radix-_r_6m_ that change on every render.
+
+    /**
+     * Detects whether an element ID is dynamically generated by a UI framework.
+     * Matches patterns: radix-:r1:, radix-_r_6m_, mui-2938, headlessui-dialog-1,
+     * react-select-*, random hex hashes, purely numeric IDs, etc.
+     */
+    function isDynamicId(id) {
+        if (!id) return true;
+        // Radix UI patterns: radix-:rXX:, radix-_r_XX_, :rXX:, contains colons with alphanumeric
+        if (/^:r[0-9a-z_]+:/i.test(id)) return true;
+        if (/radix-/i.test(id)) return true;
+        // MUI patterns: mui-XXXXX (digits)
+        if (/^mui-\d+/i.test(id)) return true;
+        // HeadlessUI patterns: headlessui-TYPE-NUMBER
+        if (/^headlessui-/i.test(id)) return true;
+        // React-Select patterns: react-select-*
+        if (/^react-select-/i.test(id)) return true;
+        // Purely numeric IDs (often auto-generated)
+        if (/^\d+$/.test(id)) return true;
+        // IDs that are mostly hex characters (webpack/vite hashes)
+        if (/^[0-9a-f]{6,}$/i.test(id)) return true;
+        // IDs with random-looking patterns (mix of letters/numbers/underscores with no semantic meaning)
+        if (/^[a-z]{1,3}[-_][0-9a-z_]{3,}$/i.test(id) && id.length > 8) return true;
+        return false;
+    }
+
     function generateCss(el) {
-        if (el.id) return '#' + escapeCss(el.id);
+        // 1. HIGHEST PRIORITY: Stable accessibility & testing attributes
+        // These survive UI re-renders and framework updates
+        const stableAttributes = ['data-testid', 'data-cy', 'data-test', 'aria-label', 'name'];
+        for (const attr of stableAttributes) {
+            const val = el.getAttribute(attr);
+            if (val && val.trim() !== '') {
+                const selector = `${el.tagName.toLowerCase()}[${attr}="${escapeCss(val)}"]`;
+                try {
+                    if (document.querySelectorAll(selector).length === 1) return selector;
+                } catch (e) { /* invalid selector, skip */ }
+            }
+        }
+
+        // 2. Role-based selectors (stable across renders for Radix/MUI/HeadlessUI)
+        const role = el.getAttribute('role');
+        if (role) {
+            const ariaLabel = el.getAttribute('aria-label');
+            if (ariaLabel) {
+                const selector = `[role="${role}"][aria-label="${escapeCss(ariaLabel)}"]`;
+                try {
+                    if (document.querySelectorAll(selector).length === 1) return selector;
+                } catch (e) { /* skip */ }
+            }
+        }
+
+        // 3. Stable IDs only (filter out framework-generated dynamic IDs)
+        if (el.id && !isDynamicId(el.id)) {
+            return '#' + escapeCss(el.id);
+        }
+
+        // 4. Name attribute (forms)
         if (el.name) {
             const nameSel = el.tagName.toLowerCase() + '[name="' + escapeCss(el.name) + '"]';
-            if (document.querySelectorAll(nameSel).length === 1) return nameSel;
+            try {
+                if (document.querySelectorAll(nameSel).length === 1) return nameSel;
+            } catch (e) { /* skip */ }
         }
+
+        // 5. Placeholder attribute (inputs)
         if (el.placeholder) {
             const phSel = el.tagName.toLowerCase() + '[placeholder="' + escapeCss(el.placeholder) + '"]';
-            if (document.querySelectorAll(phSel).length === 1) return phSel;
+            try {
+                if (document.querySelectorAll(phSel).length === 1) return phSel;
+            } catch (e) { /* skip */ }
         }
+
+        // 6. FALLBACK: Structural hierarchy (nth-of-type chain)
+        // Only uses stable IDs as anchor points in the chain
         const path = [];
         let current = el;
         while (current && current.nodeType === 1) {
             let selector = current.tagName.toLowerCase();
-            if (current.id) {
+            if (current.id && !isDynamicId(current.id)) {
                 selector = '#' + escapeCss(current.id);
                 path.unshift(selector);
                 break;
+            }
+            // Use stable attributes as anchor if available
+            const stableAttr = current.getAttribute('data-testid') || current.getAttribute('aria-label');
+            if (stableAttr && current !== el) {
+                const anchorSel = `[data-testid="${escapeCss(stableAttr)}"]`;
+                try {
+                    if (document.querySelectorAll(anchorSel).length === 1) {
+                        path.unshift(anchorSel);
+                        break;
+                    }
+                } catch (e) { /* skip */ }
             }
             let sibling = current;
             let nth = 1;
@@ -989,37 +1330,52 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
     }
 
     // ─── HELPER: Parse various date formats to ISO YYYY-MM-DD ───
+    // CMS-1500 forms use MM/DD/YYYY format. This parser handles all common formats
+    // and defaults to US format (MM/DD/YYYY) since that's the healthcare standard.
     function parseDateToISO(dateStr) {
         if (!dateStr) return null;
         const str = dateStr.trim();
 
-        // Already in YYYY-MM-DD format
+        // Already in YYYY-MM-DD format (ISO)
         if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
 
-        // DD-MM-YYYY or DD/MM/YYYY
-        let match = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
-        if (match) {
-            const [, day, month, year] = match;
-            return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-        }
-
-        // MM-DD-YYYY or MM/DD/YYYY (US format) — try if day > 12
-        match = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
-        if (match) {
-            const [, part1, part2, year] = match;
-            // If part1 > 12, it must be DD-MM-YYYY
-            if (parseInt(part1) > 12) {
-                return `${year}-${part2.padStart(2, '0')}-${part1.padStart(2, '0')}`;
-            }
-            // Default: assume DD-MM-YYYY (most common in non-US)
-            return `${year}-${part2.padStart(2, '0')}-${part1.padStart(2, '0')}`;
-        }
-
         // YYYY/MM/DD
-        match = str.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+        let match = str.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
         if (match) {
             const [, year, month, day] = match;
             return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        }
+
+        // Two-part date with 4-digit year at end: XX/XX/YYYY
+        match = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+        if (match) {
+            const [, part1, part2, year] = match;
+            const p1 = parseInt(part1);
+            const p2 = parseInt(part2);
+
+            // If part1 > 12, it MUST be day (DD/MM/YYYY format)
+            if (p1 > 12) {
+                return `${year}-${part2.padStart(2, '0')}-${part1.padStart(2, '0')}`;
+            }
+            // If part2 > 12, it MUST be day (MM/DD/YYYY format)
+            if (p2 > 12) {
+                return `${year}-${part1.padStart(2, '0')}-${part2.padStart(2, '0')}`;
+            }
+            // Both <= 12: Default to MM/DD/YYYY (US healthcare standard for CMS-1500)
+            return `${year}-${part1.padStart(2, '0')}-${part2.padStart(2, '0')}`;
+        }
+
+        // Two-part date with 2-digit year: XX/XX/YY
+        match = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2})$/);
+        if (match) {
+            const [, part1, part2, shortYear] = match;
+            const year = parseInt(shortYear) > 50 ? '19' + shortYear : '20' + shortYear;
+            const p1 = parseInt(part1);
+            const p2 = parseInt(part2);
+            if (p1 > 12) return `${year}-${part2.padStart(2, '0')}-${part1.padStart(2, '0')}`;
+            if (p2 > 12) return `${year}-${part1.padStart(2, '0')}-${part2.padStart(2, '0')}`;
+            // Default: MM/DD/YY (US format)
+            return `${year}-${part1.padStart(2, '0')}-${part2.padStart(2, '0')}`;
         }
 
         // Try native Date parsing as last resort

@@ -9,12 +9,15 @@
     "scripting",
     "storage",
     "sidePanel",
-    "windows"
+    "windows",
+    "debugger",
+    "webRequest"
   ],
   "host_permissions": [
     "http://localhost:8001/*",
     "http://127.0.0.1:8001/*",
-    "<all_urls>"
+    "<all_urls>",
+    "*://*.medoraos.com/*"
   ],
   "icons": {
     "16": "icons/icon-16.png",

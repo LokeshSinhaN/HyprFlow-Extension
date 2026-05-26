@@ -258,15 +258,17 @@ class AiService
                 ->withApiKey($apiKey)
                 ->make();
 
-            $generativeModel = $geminiClient->generativeModel($model);
-            if ($systemPrompt) {
-                // Combine system prompt with user prompt as single content
-                // (this SDK version doesn't support separate system instructions)
-                $fullPrompt = $systemPrompt . "\n\n" . $prompt;
-                $result = $generativeModel->generateContent($fullPrompt);
-            } else {
-                $result = $generativeModel->generateContent($prompt);
-            }
+            // FORCE STRICT JSON RESPONSE via generationConfig
+            // This prevents Gemini from wrapping JSON in Markdown code fences
+            // (```json ... ```) which causes downstream JSON parsing crashes
+            // in ReflexionService.php and ExtensionController.php
+            $generativeModel = $geminiClient->generativeModel($model)
+                ->withGenerationConfig([
+                    'responseMimeType' => 'application/json',
+                ]);
+
+            $fullPrompt = $systemPrompt ? $systemPrompt . "\n\n" . $prompt : $prompt;
+            $result = $generativeModel->generateContent($fullPrompt);
 
             $text = $result->text();
             Log::debug('Gemini API response received', ['response_length' => strlen($text)]);
@@ -351,10 +353,13 @@ class AiService
             }
             $messages[] = ['role' => 'user', 'content' => $prompt];
 
+            // FORCE STRICT JSON OBJECT response format for Mistral
+            // Prevents Markdown-wrapped JSON that crashes downstream parsing
             $response = $guzzleClient->post('https://api.mistral.ai/v1/chat/completions', [
                 'json' => [
                     'model' => $model,
                     'messages' => $messages,
+                    'response_format' => ['type' => 'json_object'],
                 ],
                 'headers' => [
                     'Authorization' => 'Bearer ' . $apiKey,
@@ -420,9 +425,14 @@ class AiService
             }
             $messages[] = ['role' => 'user', 'content' => $prompt];
 
+            // FORCE STRICT JSON OBJECT response format
+            // This prevents OpenAI from wrapping JSON in Markdown code fences
+            // (```json ... ```) which causes downstream JSON parsing crashes.
+            // OpenAI's json_object mode guarantees valid JSON output.
             $response = $client->chat()->create([
                 'model' => $model,
                 'messages' => $messages,
+                'response_format' => ['type' => 'json_object'],
             ]);
 
             $content = $response->choices[0]->message->content;
@@ -495,5 +505,156 @@ class AiService
             Log::error('OpenAI Vision API call failed', ['model' => $model, 'error' => $e->getMessage()]);
             throw $e;
         }
+    }
+
+    /**
+     * Compact conversation history to prevent token context explosion.
+     *
+     * When the message array exceeds a threshold (default: 6 turns), this method
+     * iterates through older messages (excluding the system prompt and the latest
+     * 2 interactions) and strips out heavy Base64 image payloads, retaining only
+     * the text/thought reasoning content.
+     *
+     * This ensures the payload sent to the AI provider remains within token limits
+     * and is strict application/json (no binary blobs inflating the request).
+     *
+     * @param  array  $messages       The full conversation message array.
+     * @param  int    $maxTurns       Threshold after which compaction triggers (default: 6).
+     * @param  int    $preserveRecent Number of recent interactions to preserve fully (default: 2).
+     * @return array  The compacted message array with Base64 payloads stripped from older turns.
+     */
+    public function compactHistory(array $messages, int $maxTurns = 6, int $preserveRecent = 2): array
+    {
+        // No compaction needed if under threshold
+        if (count($messages) <= $maxTurns) {
+            return $messages;
+        }
+
+        $compacted = [];
+        $totalMessages = count($messages);
+
+        // Determine boundaries:
+        // - Index 0 is typically the system prompt (always preserve fully)
+        // - Last $preserveRecent * 2 messages are the most recent interactions (preserve fully)
+        // - Everything in between gets compacted (images stripped)
+        $preserveFromEnd = $preserveRecent * 2; // Each "interaction" = user + assistant message
+        $compactionEndIndex = $totalMessages - $preserveFromEnd;
+
+        Log::debug('Compacting conversation history', [
+            'total_messages' => $totalMessages,
+            'compaction_threshold' => $maxTurns,
+            'preserve_recent' => $preserveRecent,
+            'compaction_range' => "1 to {$compactionEndIndex}",
+        ]);
+
+        $strippedCount = 0;
+
+        foreach ($messages as $index => $message) {
+            // Always preserve the system prompt (first message) and recent messages fully
+            if ($index === 0 || $index >= $compactionEndIndex) {
+                $compacted[] = $message;
+                continue;
+            }
+
+            // For older messages in the compaction range: strip Base64 image data
+            $compacted[] = $this->stripImagePayloads($message, $strippedCount);
+        }
+
+        if ($strippedCount > 0) {
+            Log::info('Context compaction complete', [
+                'stripped_images' => $strippedCount,
+                'original_count' => $totalMessages,
+                'compacted_count' => count($compacted),
+            ]);
+        }
+
+        return $compacted;
+    }
+
+    /**
+     * Strip Base64 image payloads from a single message while preserving text content.
+     *
+     * Handles multiple message content formats:
+     * - OpenAI multi-part content (array with type: 'image_url')
+     * - Inline base64 strings in content fields
+     * - Image data in nested tool/function results
+     *
+     * @param  array  $message       A single message from the conversation.
+     * @param  int    &$strippedCount Counter incremented for each stripped image.
+     * @return array  The message with image payloads replaced by placeholders.
+     */
+    private function stripImagePayloads(array $message, int &$strippedCount): array
+    {
+        // Handle OpenAI-style multi-part content arrays
+        if (isset($message['content']) && is_array($message['content'])) {
+            $filteredContent = [];
+            foreach ($message['content'] as $part) {
+                if (is_array($part)) {
+                    // Strip image_url parts entirely, keep text parts
+                    if (isset($part['type']) && $part['type'] === 'image_url') {
+                        $strippedCount++;
+                        $filteredContent[] = [
+                            'type' => 'text',
+                            'text' => '[IMAGE STRIPPED FOR CONTEXT COMPACTION]',
+                        ];
+                    } else {
+                        $filteredContent[] = $part;
+                    }
+                } else {
+                    $filteredContent[] = $part;
+                }
+            }
+            $message['content'] = $filteredContent;
+
+            // If only one text part remains, flatten to string for cleaner JSON
+            if (count($filteredContent) === 1 && isset($filteredContent[0]['type']) && $filteredContent[0]['type'] === 'text') {
+                $message['content'] = $filteredContent[0]['text'];
+            }
+        }
+
+        // Handle inline base64 strings in content (e.g., "data:image/jpeg;base64,...")
+        if (isset($message['content']) && is_string($message['content'])) {
+            $originalLength = strlen($message['content']);
+
+            // Strip data URI base64 images (data:image/...;base64,XXXX)
+            $stripped = preg_replace(
+                '/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+\/=]{100,}/',
+                '[BASE64_IMAGE_STRIPPED]',
+                $message['content']
+            );
+
+            if ($stripped !== $message['content']) {
+                $strippedCount++;
+                $message['content'] = $stripped;
+                Log::debug('Stripped inline base64 from message', [
+                    'original_length' => $originalLength,
+                    'new_length' => strlen($stripped),
+                ]);
+            }
+        }
+
+        // Handle image data in nested structures (e.g., tool results with screenshots)
+        if (isset($message['image']) && is_string($message['image'])) {
+            if (strlen($message['image']) > 200) {
+                $strippedCount++;
+                $message['image'] = '[IMAGE_STRIPPED_FOR_COMPACTION]';
+            }
+        }
+
+        // Handle Gemini-style blob content
+        if (isset($message['parts']) && is_array($message['parts'])) {
+            $filteredParts = [];
+            foreach ($message['parts'] as $part) {
+                if (is_array($part) && isset($part['inline_data'])) {
+                    $strippedCount++;
+                    $filteredParts[] = ['text' => '[IMAGE STRIPPED FOR CONTEXT COMPACTION]'];
+                } else {
+                    $filteredParts[] = $part;
+                }
+            }
+            $message['parts'] = $filteredParts;
+        }
+
+        return $message;
     }
 }
