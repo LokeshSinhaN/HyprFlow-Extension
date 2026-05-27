@@ -112,14 +112,10 @@ class ExtensionController extends Controller
                 $triedVision = true;
                 $visionPrompt = $systemPrompt ? ($systemPrompt . "\n\n" . $userPrompt) : $userPrompt;
                 try {
-                    if (!empty(config('openai.api_key'))) {
-                        $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'openai');
-                    }
-                    if (!$response && !empty(config('gemini.api_key'))) {
-                        $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'gemini');
-                    }
+                    // Gemini-only vision (with built-in retry)
+                    $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'gemini');
                 } catch (\Exception $e) {
-                    Log::warning('Vision failed', ['error' => $e->getMessage()]);
+                    Log::warning('Gemini Vision failed', ['error' => $e->getMessage()]);
                 }
                 if ($response && (str_contains($response, 'Cannot read') || str_contains($response, 'does not support image'))) {
                     $response = null;

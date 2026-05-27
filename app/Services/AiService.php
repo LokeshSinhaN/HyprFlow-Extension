@@ -4,7 +4,9 @@ namespace App\Services;
 
 use Gemini\Data\Blob;
 use Gemini\Data\Content;
+use Gemini\Data\GenerationConfig;
 use Gemini\Enums\MimeType;
+use Gemini\Enums\ResponseMimeType;
 use Gemini\Factory;
 use GuzzleHttp\Client as GuzzleClient;
 use Illuminate\Support\Facades\Log;
@@ -48,32 +50,31 @@ class AiService
     public function generate(string $prompt, ?string $provider = null, ?string $systemPrompt = null): ?string
     {
         $this->lastError = null;
-        $providers = $this->getProviderChain($provider);
+        $maxRetries = 3;
 
-        foreach ($providers as $index => $currentProvider) {
+        // Gemini-only with retry on failure (no OpenAI/Mistral fallback)
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
             try {
-                return $this->generateWithProvider($currentProvider, $prompt, $systemPrompt);
+                return $this->generateWithGemini($prompt, $systemPrompt);
             } catch (\Throwable $e) {
                 $this->lastError = $e->getMessage();
 
-                if ($index === 0) {
-                    Log::warning('Automation AI primary failed', [
-                        'provider' => $currentProvider,
-                        'error' => $this->lastError,
-                    ]);
-                } elseif ($index === 1) {
-                    Log::warning('Automation AI secondary fallback failed', [
-                        'provider' => $currentProvider,
-                        'error' => $this->lastError,
-                    ]);
-                } else {
-                    Log::error('Automation AI tertiary fallback failed', [
-                        'provider' => $currentProvider,
-                        'error' => $this->lastError,
-                    ]);
+                Log::warning("Gemini API attempt {$attempt}/{$maxRetries} failed", [
+                    'error' => $this->lastError,
+                    'attempt' => $attempt,
+                ]);
+
+                // Wait before retrying (exponential backoff: 1s, 2s, 4s)
+                if ($attempt < $maxRetries) {
+                    usleep((int) (pow(2, $attempt - 1) * 1000000));
                 }
             }
         }
+
+        Log::error('Gemini API failed after all retries', [
+            'attempts' => $maxRetries,
+            'last_error' => $this->lastError,
+        ]);
 
         return null;
     }
@@ -84,27 +85,30 @@ class AiService
     public function generateVision(string $prompt, string $imageBase64, ?string $provider = null, ?string $systemPrompt = null): ?string
     {
         $this->lastError = null;
-        $providers = $this->getProviderChain($provider);
+        $maxRetries = 3;
 
-        foreach ($providers as $index => $currentProvider) {
+        // Gemini-only vision with retry (no OpenAI/Mistral fallback)
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
             try {
-                return $this->generateVisionWithProvider($currentProvider, $prompt, $imageBase64, $systemPrompt);
+                return $this->generateVisionWithGemini($prompt, $imageBase64, $systemPrompt);
             } catch (\Throwable $e) {
                 $this->lastError = $e->getMessage();
 
-                if ($index === 0) {
-                    Log::warning('Automation AI Vision primary failed', [
-                        'provider' => $currentProvider,
-                        'error' => $this->lastError,
-                    ]);
-                } else {
-                    Log::error('Automation AI Vision fallback failed', [
-                        'provider' => $currentProvider,
-                        'error' => $this->lastError,
-                    ]);
+                Log::warning("Gemini Vision API attempt {$attempt}/{$maxRetries} failed", [
+                    'error' => $this->lastError,
+                    'attempt' => $attempt,
+                ]);
+
+                if ($attempt < $maxRetries) {
+                    usleep((int) (pow(2, $attempt - 1) * 1000000));
                 }
             }
         }
+
+        Log::error('Gemini Vision API failed after all retries', [
+            'attempts' => $maxRetries,
+            'last_error' => $this->lastError,
+        ]);
 
         return null;
     }
@@ -114,24 +118,8 @@ class AiService
      */
     private function getProviderChain(?string $provider = null): array
     {
-        $supported = ['gemini', 'mistral', 'openai'];
-        $selectedProvider = $provider ?? config('automation.primary_ai', 'gemini');
-
-        $ordered = array_filter([
-            $selectedProvider,
-            'openai',
-            'mistral',
-            'gemini',
-        ], fn ($value) => is_string($value) && $value !== '');
-
-        $providers = [];
-        foreach ($ordered as $candidate) {
-            if (in_array($candidate, $supported, true) && ! in_array($candidate, $providers, true)) {
-                $providers[] = $candidate;
-            }
-        }
-
-        return $providers;
+        // Only Gemini — no OpenAI/Mistral fallback. Gemini retries on failure.
+        return ['gemini'];
     }
 
     /**
@@ -263,9 +251,9 @@ class AiService
             // (```json ... ```) which causes downstream JSON parsing crashes
             // in ReflexionService.php and ExtensionController.php
             $generativeModel = $geminiClient->generativeModel($model)
-                ->withGenerationConfig([
-                    'responseMimeType' => 'application/json',
-                ]);
+                ->withGenerationConfig(new GenerationConfig(
+                    responseMimeType: ResponseMimeType::APPLICATION_JSON,
+                ));
 
             $fullPrompt = $systemPrompt ? $systemPrompt . "\n\n" . $prompt : $prompt;
             $result = $generativeModel->generateContent($fullPrompt);
