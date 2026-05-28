@@ -720,9 +720,10 @@ function checkForLoop(decision, actionRetryCount, lastActionKey) {
     let actionId = '';
 
     if (['click', 'type', 'hover'].includes(actionType)) {
-        actionId = decision.selector || '';
+        // Include text_match in action key so semantic-targeted actions are tracked
+        actionId = decision.text_match || decision.selector || '';
     } else if (actionType === 'select_option') {
-        actionId = decision.option || '';
+        actionId = decision.option || decision.text_match || '';
     } else if (actionType === 'navigate') {
         actionId = decision.url || '';
     } else if (actionType === 'scroll_down' || actionType === 'scroll_up') {
@@ -1292,15 +1293,38 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     sendLogToPanel(`Action sequence (${aiDecision.actions.length} actions)...`, 'info');
                     let seqSuccess = 0;
                     const seqResults = [];
+                    let seqAborted = false;
                     for (const subAction of aiDecision.actions.slice(0, 5)) {
+                        // Semantic target pre-flight: if sub-action uses text_match,
+                        // verify the target exists before executing. Abort on failure.
+                        if (subAction.text_match) {
+                            const resolveResult = await executeContentScript(
+                                currentTabId, 'RESOLVE_SEMANTIC_TARGET',
+                                { text_match: subAction.text_match, role_hint: subAction.role_hint || '', timeout: 1500 }, 2
+                            );
+                            if (!resolveResult || !resolveResult.found) {
+                                seqResults.push({
+                                    action: subAction.action,
+                                    text_match: subAction.text_match,
+                                    success: false,
+                                    error: `Semantic target not found: "${subAction.text_match}"`
+                                });
+                                sendLogToPanel(`Sequence aborted: text_match "${subAction.text_match}" not found`, 'warn');
+                                postPopupDirective = `Target with text_match '${subAction.text_match}' not found. `
+                                    + `The API request may be delayed, or the menu is closed. `
+                                    + `Re-evaluate the page state and retry as a single action.`;
+                                seqAborted = true;
+                                break;
+                            }
+                        }
                         const subResult = await executeContentScript(currentTabId, 'EXECUTE_ACTION', subAction);
                         if (subResult && subResult.success) {
                             seqSuccess++;
                             if (subAction.selector) clickedSelectors.push(subAction.selector);
-                            seqResults.push({ action: subAction.action, selector: subAction.selector, success: true });
+                            seqResults.push({ action: subAction.action, selector: subAction.selector, text_match: subAction.text_match, success: true });
                         } else {
-                            seqResults.push({ action: subAction.action, selector: subAction.selector, success: false, error: subResult?.error });
-                            sendLogToPanel(`Sequence step failed: ${subAction.action} on ${subAction.selector}`, 'warn');
+                            seqResults.push({ action: subAction.action, selector: subAction.selector, text_match: subAction.text_match, success: false, error: subResult?.error });
+                            sendLogToPanel(`Sequence step failed: ${subAction.action} on ${subAction.selector || subAction.text_match}`, 'warn');
                             break;
                         }
                         await sleep(200);

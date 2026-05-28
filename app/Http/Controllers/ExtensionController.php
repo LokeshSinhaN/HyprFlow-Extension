@@ -148,9 +148,9 @@ class ExtensionController extends Controller
                 }
             }
 
-            // Enhancement 4: CSS Selector Validator
+            // Enhancement 4: CSS Selector Validator (skip validation when text_match is the primary target)
             $action = $decision['action'] ?? '';
-            if (in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector'])) {
+            if (in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector']) && empty($decision['text_match'])) {
                 $validation = $this->validateCssSelector($decision['selector']);
                 if (!$validation['valid']) {
                     return response()->json([
@@ -161,12 +161,12 @@ class ExtensionController extends Controller
                 }
             }
 
-            // Validate selector presence
-            if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector'])) {
+            // Validate selector presence — text_match is an acceptable alternative to selector
+            if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector']) && empty($decision['text_match'])) {
                 if (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
                     $decision['selector'] = $somMap[(string)$decision['somIndex']];
                 } else {
-                    return response()->json(['error' => 'Empty selector for ' . $action, 'retry' => true], 500);
+                    return response()->json(['error' => 'Empty selector for ' . $action . '. Provide selector or text_match.', 'retry' => true], 500);
                 }
             }
 
@@ -285,11 +285,18 @@ You are an advanced autonomous browser agent in a Chrome Extension.
 You observe page state (DOM elements + optional screenshot) and decide the next action.
 
 # RESPONSE FORMAT — EXACTLY ONE JSON object, no markdown, no extra text:
-{"thought":"...","action":"click|type|hover|select_option|scroll_down|scroll_up|extract|navigate|batch_fill|keyboard_event|click_coordinate|action_sequence|finish|switch_tab|new_tab|list_tabs|close_tab","selector":"CSS selector","somIndex":"number","text":"","option":"","keys":[],"fields":[],"actions":[],"url":"","index":"","summary":"","planStepCompleted":false}
+{"thought":"...","action":"click|type|hover|select_option|scroll_down|scroll_up|extract|navigate|batch_fill|keyboard_event|click_coordinate|action_sequence|finish|switch_tab|new_tab|list_tabs|close_tab","selector":"CSS selector","text_match":"visible text to match","role_hint":"button|menuitem|option|link|switch|tab|checkbox","somIndex":"number","text":"","option":"","keys":[],"fields":[],"actions":[],"url":"","index":"","summary":"","planStepCompleted":false}
+
+# TARGETING ELEMENTS (CRITICAL RULES):
+- PREFER text_match: If an element has clear visible text (e.g., "Add to Cart", "Teal", "Edit"), use "text_match": "Edit" instead of guessing CSS selectors. You may combine it with "role_hint": "menuitem" for precision.
+- NEVER guess nth-child positions for dropdowns, menus, or lists. Always use text_match to click the exact option.
+- NEVER use :has-text() or Playwright syntax in CSS selectors. Use the native text_match JSON key instead.
+- NEVER use :contains() or :has() — NOT valid in querySelector.
+- When both text_match and selector are provided, text_match takes priority.
+- Use "selector" only when text_match is ambiguous (e.g., multiple "Edit" buttons) and you have a reliable CSS selector from the elements list.
 
 # RULES:
-- "selector" MUST be valid CSS. NEVER empty for click/type/hover/select_option.
-- NEVER use :contains() or :has() — NOT valid in querySelector.
+- "selector" OR "text_match" MUST be provided for click/type/hover/select_option. Both may be provided.
 - One action per response (unless action_sequence).
 - If goal complete: {"action":"finish","summary":"..."}
 
@@ -341,14 +348,16 @@ You observe page state (DOM elements + optional screenshot) and decide the next 
 # BATCH FILL: {"action":"batch_fill","fields":[{"selector":"#f","text":"v"},...]}
 - Fast multi-field fill. Don't include comboboxes.
 
-# ACTION SEQUENCE (Gap B): {"action":"action_sequence","actions":[{"action":"type","selector":"#a","text":"x"},{"action":"click","selector":"#b"}]}
+# ACTION SEQUENCE (Gap B): {"action":"action_sequence","actions":[{"action":"type","selector":"#a","text":"x"},{"action":"click","text_match":"Submit"}]}
 - Chain up to 5 confident actions. Use when multiple simple steps are obvious.
 - Each action in sequence must be independent (no conditional logic).
 
-# POST-ACTION VERIFICATION:
-- After "Add to Cart" → verify confirmation
-- After form submit → verify modal closed
-- Only "finish" when genuinely complete
+# POST-ACTION VERIFICATION (SELF-HEALING):
+- After clicking a menu item or button, you MUST observe the next DOM state to verify the expected modal, page, or dropdown opened.
+- If you clicked "Edit" but a "View Details" modal opened, your click failed. You MUST click "Cancel"/close the modal, and retry using a more specific text_match or ref_id.
+- DO NOT call "action": "finish" unless you have positively verified the final success state on the screen (e.g., "Added to Cart" confirmation, or modal disappeared after submit).
+- After "Add to Cart" → verify confirmation badge/popup
+- After form submit → verify modal closed or success message appeared
 
 # PLAN STEP TRACKING:
 - Set "planStepCompleted":true when current plan step is done
@@ -492,7 +501,10 @@ SYSTEM;
     {
         // Check for known invalid patterns
         if (str_contains($selector, ':contains(')) {
-            return ['valid' => false, 'reason' => ':contains() is NOT valid CSS. Use [aria-label], text matching, or data attributes.', 'suggestion' => 'Use attribute selectors like [aria-label="text"] or element IDs'];
+            return ['valid' => false, 'reason' => ':contains() is NOT valid CSS. Use text_match JSON key instead.', 'suggestion' => 'Use "text_match": "visible text" to target elements by their visible text'];
+        }
+        if (str_contains($selector, ':has-text(') || str_contains($selector, ':has-text (')) {
+            return ['valid' => false, 'reason' => ':has-text() is Playwright syntax, NOT valid CSS. Use text_match JSON key instead.', 'suggestion' => 'Use "text_match": "visible text" instead of :has-text() pseudo-class'];
         }
         if (str_contains($selector, ':has(') && !str_contains($selector, ':not(')) {
             return ['valid' => false, 'reason' => ':has() has limited browser support. Avoid it.', 'suggestion' => 'Target the element directly with ID, class, or attribute selector'];

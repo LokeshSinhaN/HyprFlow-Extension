@@ -188,6 +188,175 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         };
     }
 
+    // ─── SEMANTIC TARGET RESOLUTION ENGINE ────────────────────────
+    // Allows AI to target elements by visible text or accessible name,
+    // bypassing brittle CSS selectors entirely.
+
+    /**
+     * Dispatches the full Universal Event Dispatcher click sequence on an element.
+     * Extracted for reuse across CSS-based clicks, semantic clicks, and coordinate clicks.
+     * Sequences: focus → PointerEvents → MouseEvents → click
+     * This bypasses Radix UI's synthetic event blockers which require the full
+     * pointer lifecycle to register interactions.
+     *
+     * @param {Element} target - The DOM element to click
+     * @returns {void}
+     */
+    function dispatchUniversalClick(target) {
+        // 1. Focus is critical for Radix/HeadlessUI accessibility wrappers
+        try { target.focus(); } catch(e) {}
+
+        // 2. Compute center coordinates for realistic event positioning
+        const rect = target.getBoundingClientRect();
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+        const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+
+        // 3. Full pointer + mouse lifecycle (required by Radix UI)
+        target.dispatchEvent(new PointerEvent('pointerover', opts));
+        target.dispatchEvent(new PointerEvent('pointerenter', { ...opts, bubbles: false }));
+        target.dispatchEvent(new PointerEvent('pointerdown', { ...opts, button: 0 }));
+        target.dispatchEvent(new MouseEvent('mousedown', { ...opts, button: 0 }));
+        target.dispatchEvent(new MouseEvent('mouseup', { ...opts, button: 0 }));
+        target.dispatchEvent(new PointerEvent('pointerup', { ...opts, button: 0 }));
+
+        // 4. Standard click (some frameworks only listen to this)
+        target.click();
+    }
+
+    /**
+     * Resolves a DOM element by visible text content or accessible name.
+     * Iterates all interactive elements in the DOM and scores them based on
+     * textContent and aria-label matching against the given text_match.
+     *
+     * @param {{ text_match: string, role_hint?: string }} action
+     * @returns {Element|null} The best-matching DOM element or null
+     */
+    function resolveSemanticTarget(action) {
+        if (!action.text_match) return null;
+
+        const searchText = action.text_match.toLowerCase().trim();
+        const roleHint = (action.role_hint || '').toLowerCase().trim();
+        if (!searchText) return null;
+
+        const INTERACTIVE_SELECTORS = [
+            'button', 'a[href]', 'input:not([type="hidden"])', 'textarea', 'select',
+            '[role="button"]', '[role="link"]', '[role="menuitem"]', '[role="menuitemcheckbox"]',
+            '[role="menuitemradio"]', '[role="option"]', '[role="switch"]', '[role="tab"]',
+            '[role="checkbox"]', '[role="radio"]', '[role="combobox"]', '[role="searchbox"]',
+            '[role="textbox"]', '[aria-haspopup]', '[contenteditable="true"]',
+            '[tabindex]:not([tabindex="-1"])',
+            '[data-radix-collection-item]', '[cmdk-item]',
+            'li', 'span', 'div[role]', 'label'
+        ].join(', ');
+
+        const candidates = document.querySelectorAll(INTERACTIVE_SELECTORS);
+        let bestEl = null;
+        let bestScore = 0;
+
+        for (const el of candidates) {
+            try {
+                // Skip invisible/zero-size elements
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                if (parseFloat(style.opacity) === 0) continue;
+
+                // Compute text sources
+                const textContent = (el.textContent || '').trim().toLowerCase();
+                const firstLine = textContent.split('\n')[0].trim();
+                const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase().trim();
+                const elRole = (el.getAttribute('role') || '').toLowerCase();
+                const tag = el.tagName.toLowerCase();
+
+                // Derive implicit role for role_hint matching
+                let impliedRole = elRole;
+                if (!impliedRole) {
+                    if (tag === 'button') impliedRole = 'button';
+                    else if (tag === 'a') impliedRole = 'link';
+                    else if (tag === 'input') impliedRole = 'textbox';
+                    else if (tag === 'select') impliedRole = 'combobox';
+                }
+
+                // Score the element
+                let score = 0;
+
+                // Exact match on first line of text content (highest confidence)
+                if (firstLine === searchText) score = 100;
+                else if (ariaLabel === searchText) score = 95;
+                else if (textContent === searchText) score = 90;
+                // Starts-with match
+                else if (firstLine.startsWith(searchText)) score = 75;
+                else if (ariaLabel.startsWith(searchText)) score = 70;
+                // Contains match
+                else if (firstLine.includes(searchText)) score = 55;
+                else if (ariaLabel.includes(searchText)) score = 50;
+                else if (textContent.includes(searchText)) score = 30;
+
+                if (score === 0) continue;
+
+                // Penalize elements with very long text (likely containers, not targets)
+                if (textContent.length > 200 && firstLine.length > 80) {
+                    score -= 20;
+                }
+
+                // Bonus for shorter/more precise text (less container noise)
+                if (firstLine.length < 40) score += 5;
+
+                // Bonus for role_hint match
+                if (roleHint && impliedRole === roleHint) {
+                    score += 15;
+                } else if (roleHint && impliedRole !== roleHint && impliedRole) {
+                    score -= 10; // Mild penalty for role mismatch
+                }
+
+                // Bonus for interactive elements (buttons, links, menuitems)
+                if (['button', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'switch', 'tab', 'link'].includes(impliedRole)) {
+                    score += 5;
+                }
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestEl = el;
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+
+        // Require a minimum confidence score
+        return bestScore >= 25 ? bestEl : null;
+    }
+
+    /**
+     * Polling wrapper for resolveSemanticTarget that handles late-binding
+     * API-delayed content (e.g., waiting for "Aetna" to appear in a
+     * network-delayed combobox).
+     *
+     * @param {{ text_match: string, role_hint?: string }} action
+     * @param {number} [timeoutMs=1500] - Max time to wait
+     * @returns {Promise<Element|null>}
+     */
+    async function waitForSemanticTarget(action, timeoutMs = 1500) {
+        const POLL_INTERVAL = 150;
+        let elapsed = 0;
+
+        // First try immediately
+        const immediate = resolveSemanticTarget(action);
+        if (immediate) return immediate;
+
+        // Poll until timeout
+        while (elapsed < timeoutMs) {
+            await new Promise(r => setTimeout(r, POLL_INTERVAL));
+            elapsed += POLL_INTERVAL;
+            const found = resolveSemanticTarget(action);
+            if (found) return found;
+        }
+
+        return null;
+    }
+
     // --- Window.open Interception ---
     // Monkey-patch window.open to detect when clicks trigger new windows.
     // The background script reads this flag after click actions.
@@ -344,6 +513,37 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             return true;
         }
 
+        // ─── RESOLVE SEMANTIC TARGET (message handler for background.js) ──
+        if (message.type === 'RESOLVE_SEMANTIC_TARGET') {
+            const action = message.payload || {};
+            (async () => {
+                try {
+                    const el = await waitForSemanticTarget(action, action.timeout || 1500);
+                    if (el) {
+                        const rect = el.getBoundingClientRect();
+                        sendResponse({
+                            success: true,
+                            found: true,
+                            text_match: action.text_match,
+                            tag: el.tagName.toLowerCase(),
+                            text: (el.textContent || '').trim().slice(0, 100),
+                            x: Math.round(rect.left + rect.width / 2),
+                            y: Math.round(rect.top + rect.height / 2)
+                        });
+                    } else {
+                        sendResponse({
+                            success: true,
+                            found: false,
+                            text_match: action.text_match
+                        });
+                    }
+                } catch (e) {
+                    sendResponse({ success: false, error: e.message });
+                }
+            })();
+            return true;
+        }
+
         // ─── EXECUTE ACTION ──────────────────────────────────────
         if (message.type === 'EXECUTE_ACTION') {
             const action = message.payload;
@@ -352,8 +552,24 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 let success = false;
                 let extraData = {};
                 try {
+                    // ── SEMANTIC TARGET RESOLUTION ──
+                    // If the AI provides text_match, resolve by visible text/accessible name
+                    // BEFORE falling back to CSS selector lookup.
+                    let semanticEl = null;
+                    if (action.text_match) {
+                        semanticEl = await waitForSemanticTarget(action, 1500);
+                        if (semanticEl) {
+                            extraData.resolvedViaTextMatch = true;
+                            extraData.matchedText = (semanticEl.textContent || '').trim().slice(0, 80);
+                            extraData.matchedTag = semanticEl.tagName.toLowerCase();
+                        } else {
+                            extraData.textMatchFailed = true;
+                            extraData.searchedFor = action.text_match;
+                        }
+                    }
+
                     // Enhancement 4: Pre-flight CSS Selector Validation
-                    if (action.selector && !['navigate', 'extract', 'scroll_down', 'scroll_up'].includes(action.action)) {
+                    if (action.selector && !action.text_match && !['navigate', 'extract', 'scroll_down', 'scroll_up'].includes(action.action)) {
                         try { document.createDocumentFragment().querySelector(action.selector); }
                         catch (syntaxErr) {
                             extraData.error = `INVALID_SELECTOR_SYNTAX: "${action.selector}" — ${syntaxErr.message}. Use valid CSS only.`;
@@ -362,10 +578,14 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         }
                     }
 
-                    const el = action.selector ? document.querySelector(action.selector) : null;
+                    // Resolve element: semantic target takes priority over CSS selector
+                    const el = semanticEl || (action.selector ? document.querySelector(action.selector) : null);
                     // Actions that can work WITHOUT a selector
                     const selectorOptionalActions = ['navigate', 'extract', 'scroll_down', 'scroll_up', 'click_coordinate', 'keyboard_event'];
                     if (!el && !selectorOptionalActions.includes(action.action)) {
+                        if (action.text_match) {
+                            throw new Error(`Semantic target not found: text_match="${action.text_match}"${action.role_hint ? ' role_hint="' + action.role_hint + '"' : ''}`);
+                        }
                         throw new Error(`Selector not found: ${action.selector}`);
                     }
 
@@ -416,31 +636,9 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         window.__hyprflow_popupOpened = false;
 
                         // ─── UNIVERSAL EVENT DISPATCHER ───────────────────────
-                        // Sequences: focus → PointerEvents → MouseEvents → click
-                        // This bypasses Radix UI's synthetic event blockers which
-                        // require the full pointer lifecycle to register interactions.
-                        // Without this sequence, Radix buttons report success but
-                        // never actually open their popovers/menus.
-
-                        // 1. Focus is critical for Radix/HeadlessUI accessibility wrappers
-                        try { clickTarget.focus(); } catch(e) {}
-
-                        // 2. Compute center coordinates for realistic event positioning
-                        const clickRect = clickTarget.getBoundingClientRect();
-                        const clickX = clickRect.x + clickRect.width / 2;
-                        const clickY = clickRect.y + clickRect.height / 2;
-                        const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: clickX, clientY: clickY };
-
-                        // 3. Full pointer + mouse lifecycle (required by Radix UI)
-                        clickTarget.dispatchEvent(new PointerEvent('pointerover', eventOpts));
-                        clickTarget.dispatchEvent(new PointerEvent('pointerenter', { ...eventOpts, bubbles: false }));
-                        clickTarget.dispatchEvent(new PointerEvent('pointerdown', { ...eventOpts, button: 0 }));
-                        clickTarget.dispatchEvent(new MouseEvent('mousedown', { ...eventOpts, button: 0 }));
-                        clickTarget.dispatchEvent(new MouseEvent('mouseup', { ...eventOpts, button: 0 }));
-                        clickTarget.dispatchEvent(new PointerEvent('pointerup', { ...eventOpts, button: 0 }));
-
-                        // 4. Standard click (some frameworks only listen to this)
-                        clickTarget.click();
+                        // Full pointer + mouse lifecycle via reusable dispatchUniversalClick.
+                        // Bypasses Radix UI's synthetic event blockers.
+                        dispatchUniversalClick(clickTarget);
 
                         // --- POST-CLICK TREE AJAX WAIT ---
                         // Tree views often load content via AJAX after clicking a node.
@@ -967,17 +1165,8 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                         clickedEl = document.elementFromPoint(clickX, clickY);
                         if (clickedEl) {
-                            // Universal Event Dispatcher for coordinate clicks (same as regular click)
-                            try { clickedEl.focus(); } catch(e) {}
-                            const coordOpts = { bubbles: true, cancelable: true, view: window, clientX: clickX, clientY: clickY, button: 0 };
-                            clickedEl.dispatchEvent(new PointerEvent('pointerover', coordOpts));
-                            clickedEl.dispatchEvent(new PointerEvent('pointerenter', { ...coordOpts, bubbles: false }));
-                            clickedEl.dispatchEvent(new PointerEvent('pointerdown', coordOpts));
-                            clickedEl.dispatchEvent(new MouseEvent('mousedown', coordOpts));
-                            clickedEl.dispatchEvent(new MouseEvent('mouseup', coordOpts));
-                            clickedEl.dispatchEvent(new PointerEvent('pointerup', coordOpts));
-                            clickedEl.dispatchEvent(new MouseEvent('click', coordOpts));
-                            clickedEl.click();
+                            // Universal Event Dispatcher for coordinate clicks
+                            dispatchUniversalClick(clickedEl);
                             success = true;
                             extraData.clickedTag = clickedEl.tagName;
                             extraData.clickedText = (clickedEl.textContent || '').trim().slice(0, 50);
