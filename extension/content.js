@@ -229,7 +229,13 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
      * Iterates all interactive elements in the DOM and scores them based on
      * textContent and aria-label matching against the given text_match.
      *
-     * @param {{ text_match: string, role_hint?: string }} action
+     * SMART CONTEXT SCOPING: When action.scope_hint is provided, elements
+     * within the matching scope (modal, form, dropdown, etc.) receive a
+     * large score bonus, and elements at a higher z-index are prioritized.
+     * This prevents clicking background "Add Patient" when the modal's
+     * "Add Patient" submit button is the intended target.
+     *
+     * @param {{ text_match: string, role_hint?: string, scope_hint?: string }} action
      * @returns {Element|null} The best-matching DOM element or null
      */
     function resolveSemanticTarget(action) {
@@ -237,7 +243,31 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
         const searchText = action.text_match.toLowerCase().trim();
         const roleHint = (action.role_hint || '').toLowerCase().trim();
+        const scopeHint = (action.scope_hint || '').toLowerCase().trim();
         if (!searchText) return null;
+
+        // ── SCOPE RESOLUTION ──────────────────────────────────────
+        // Map scope_hint keywords to DOM container selectors.
+        // When a scope_hint is active, elements INSIDE the scope get
+        // a +40 bonus; elements OUTSIDE get a -30 penalty.
+        const SCOPE_MAP = {
+            'modal':    '[role="dialog"], [data-state="open"][class*="dialog"], [class*="modal"]:not([style*="display: none"]), [class*="Modal"]',
+            'dialog':   '[role="dialog"], [data-state="open"][class*="dialog"], [class*="dialog"]',
+            'form':     'form, [role="form"]',
+            'dropdown': '[role="listbox"], [role="menu"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [data-radix-select-content]',
+            'popover':  '[data-radix-popover-content], [data-radix-popper-content-wrapper], [data-popper-placement], [class*="popover"]',
+            'sidebar':  'aside, nav, [role="navigation"], [class*="sidebar"], [class*="drawer"]',
+            'header':   'header, [role="banner"], [class*="header"], [class*="navbar"]',
+            'main':     'main, [role="main"], [class*="content"]:not([role="dialog"])'
+        };
+
+        let scopeContainers = [];
+        if (scopeHint && SCOPE_MAP[scopeHint]) {
+            scopeContainers = Array.from(document.querySelectorAll(SCOPE_MAP[scopeHint])).filter(c => {
+                const s = window.getComputedStyle(c);
+                return s.display !== 'none' && s.visibility !== 'hidden';
+            });
+        }
 
         const INTERACTIVE_SELECTORS = [
             'button', 'a[href]', 'input:not([type="hidden"])', 'textarea', 'select',
@@ -314,6 +344,30 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 // Bonus for interactive elements (buttons, links, menuitems)
                 if (['button', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'switch', 'tab', 'link'].includes(impliedRole)) {
                     score += 5;
+                }
+
+                // ── SMART CONTEXT SCOPING ──────────────────────────
+                // When scope_hint is active, heavily boost elements inside
+                // the scoped container and penalize those outside.
+                if (scopeHint && scopeContainers.length > 0) {
+                    const isInScope = scopeContainers.some(c => c.contains(el));
+                    if (isInScope) {
+                        score += 40; // Strong boost for in-scope elements
+                    } else {
+                        score -= 30; // Heavy penalty for out-of-scope elements
+                    }
+                }
+
+                // Z-INDEX PRIORITIZATION: Even without scope_hint,
+                // elements in higher stacking contexts (modals, popovers)
+                // get a bonus. This naturally prefers modal buttons over
+                // background buttons when text matches are identical.
+                if (!scopeHint || scopeContainers.length === 0) {
+                    // Check if element is inside a dialog/modal/popover
+                    const inModal = el.closest('[role="dialog"], [data-state="open"][class*="dialog"], [class*="modal"]:not([style*="display: none"]), [data-radix-popper-content-wrapper]');
+                    if (inModal) {
+                        score += 20; // Modals/popovers get natural priority
+                    }
                 }
 
                 if (score > bestScore) {
@@ -1978,8 +2032,11 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
     }
 
     // ─── HELPER: Simulate keyboard typing character by character ───
-    // This is the most reliable way to fill React/Vue/Angular controlled inputs
-    // that reject programmatic value changes. It mimics real user typing.
+    // HUMAN-DELAY TYPING: Introduces realistic 50-100ms inter-keystroke delays
+    // to trigger React/Radix debounced onChange handlers and API-backed combobox
+    // search endpoints that ignore robotic-speed input.
+    // After the final character, waits 800ms for network requests to resolve
+    // (e.g., fetching "Aetna" insurance payer results from an API).
     async function simulateTyping(el, text) {
         el.focus();
 
@@ -1989,9 +2046,9 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', bubbles: true }));
         document.execCommand('delete', false, null);
         el.dispatchEvent(new Event('input', { bubbles: true }));
-        await new Promise(r => setTimeout(r, 50));
+        await new Promise(r => setTimeout(r, 80));
 
-        // Type each character using insertText (works with contentEditable and input fields)
+        // Type each character with realistic human-speed delays
         for (let i = 0; i < text.length; i++) {
             const char = text[i];
 
@@ -2011,11 +2068,24 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 charCode: char.charCodeAt(0), keyCode: char.charCodeAt(0),
                 bubbles: true, cancelable: true
             }));
+
+            // Human-speed delay: 50-100ms between keystrokes
+            // This ensures debounced React onChange and API search handlers fire correctly
+            const delay = 50 + Math.floor(Math.random() * 50);
+            await new Promise(r => setTimeout(r, delay));
         }
 
-        // Final events to ensure framework picks up the change
+        // Dispatch input event after each character is done to ensure frameworks see final value
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // POST-TYPING NETWORK SETTLE: Wait 800ms for API-backed comboboxes
+        // to fetch results and populate the dropdown DOM.
+        // This is critical for searchable fields like insurance payer lookups
+        // where the server needs time to return matching results.
+        await new Promise(r => setTimeout(r, 800));
+
+        // Final blur to close any transient UI states
         el.dispatchEvent(new Event('blur', { bubbles: true }));
     }
 
