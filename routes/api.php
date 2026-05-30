@@ -31,3 +31,7 @@ Route::post('/extension/plan', [ExtensionController::class, 'plan'])
 // Site-specific knowledge learning endpoint (Gap C)
 Route::post('/extension/learn', [ExtensionController::class, 'learn'])
     ->name('extension.learn');
+
+// Text-to-SQL database query tool (AI agent reads Supabase to resolve validation errors)
+Route::post('/extension/query-db', [ExtensionController::class, 'queryDb'])
+    ->name('extension.queryDb');

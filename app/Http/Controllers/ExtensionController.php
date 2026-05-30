@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Services\AiService;
+use App\Services\DatabaseService;
 use App\Services\ReflexionService;
 use App\Services\SeleniumService;
 use App\Services\SiteKnowledgeService;
@@ -16,7 +17,8 @@ class ExtensionController extends Controller
         private readonly AiService $ai,
         private readonly SeleniumService $selenium,
         private readonly ReflexionService $reflexion,
-        private readonly SiteKnowledgeService $siteKnowledge
+        private readonly SiteKnowledgeService $siteKnowledge,
+        private readonly DatabaseService $database
     ) {
     }
 
@@ -257,6 +259,23 @@ class ExtensionController extends Controller
     }
 
     /**
+     * POST /api/extension/query-db — Text-to-SQL tool for AI agent
+     * Executes read-only PostgreSQL queries against Supabase to fetch missing EHR data.
+     */
+    public function queryDb(Request $request): JsonResponse
+    {
+        $sql = $request->input('sql', '');
+
+        if (empty(trim($sql))) {
+            return response()->json(['success' => false, 'error' => 'No SQL query provided.'], 400);
+        }
+
+        $result = $this->database->executeQuery($sql);
+
+        return response()->json($result);
+    }
+
+    /**
      * POST /api/extension/learn — Site knowledge endpoint
      */
     public function learn(Request $request): JsonResponse
@@ -370,6 +389,22 @@ You observe page state (DOM elements + optional screenshot) and decide the next 
 # PLAN STEP TRACKING:
 - Set "planStepCompleted":true when current plan step is done
 - Focus on ONE plan step at a time
+
+# DATABASE SCHEMA (Supabase PostgreSQL):
+Table 'organizations' (id INT PK, name VARCHAR, address_line_1 TEXT, city VARCHAR, state VARCHAR, zip_code VARCHAR, npi VARCHAR, phone VARCHAR, country VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
+Table 'patients' (id INT PK, first_name VARCHAR, middle_name VARCHAR, last_name VARCHAR, suffix VARCHAR, date_of_birth DATE, gender VARCHAR, address_line_1 TEXT, address_line_2 VARCHAR, city VARCHAR, state VARCHAR, zip_code VARCHAR, phone VARCHAR, insurance_policy_number VARCHAR, organization_id INT FK→organizations.id, payer_id INT FK→payers.id, status VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
+Table 'payers' (id INT PK, name VARCHAR, primary_payer_id VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
+Table 'claims' (id INT PK, control_number VARCHAR, organization_id INT FK→organizations.id, patient_id INT FK→patients.id, payer_id INT FK→payers.id, service_date DATE, charge_amount NUMERIC, claim_status VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
+Relationships: patients.organization_id → organizations.id, patients.payer_id → payers.id, claims.patient_id → patients.id, claims.payer_id → payers.id, claims.organization_id → organizations.id
+
+# AUTONOMOUS ERROR RESOLUTION & TOOLS:
+- Tool `query_database`: When you see validation errors on the screen (e.g., missing state, missing zip code, missing demographics, invalid codes), you MUST write a PostgreSQL SELECT query to fetch the missing data from the database.
+- Output Format: {"action": "query_database", "thought": "Need to fetch patient state and zip...", "sql": "SELECT p.state, p.zip_code FROM patients p JOIN claims c ON p.id = c.patient_id WHERE c.control_number = 'XYZCLM-4-000510'"}
+- To find the right record, look at the screen for: Patient Name, MRN, Claim ID (e.g., #XYZCLM-...), or control_number visible in the URL or page content. Use that in your SQL WHERE clause.
+- The next turn will provide the query results as a DIRECTIVE. If you get an SQL error, rewrite the query and try again (Self-Healing).
+- Once you have the data, use `text_match` or `selector` to fill ONLY the missing fields mentioned in the validation errors. Do NOT alter fields that already have valid data.
+- Finally, click Save/Submit and VERIFY the validation errors have disappeared before calling "finish".
+- CRITICAL: Do NOT hardcode field mappings. Dynamically deduce which fields to fill based on the validation error messages and the database column names.
 SYSTEM;
     }
 

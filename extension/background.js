@@ -7,6 +7,7 @@ const API_URL = "http://127.0.0.1:8001/api/extension/loop";
 const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
+const QUERY_DB_URL = "http://127.0.0.1:8001/api/extension/query-db";
 
 // ─── CDP HARDWARE CLICK IMPLEMENTATION ─────────────────────────────
 // Uses Chrome DevTools Protocol to simulate real hardware mouse events.
@@ -1288,7 +1289,58 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     break;
                 }
 
-                // 7a. Handle ACTION_SEQUENCE (Gap B: Multi-Action Chaining)
+                // 7-DB. Handle QUERY_DATABASE — Text-to-SQL tool execution
+                if (aiDecision.action === 'query_database' && aiDecision.sql) {
+                    sendLogToPanel(`Executing SQL: ${aiDecision.sql.slice(0, 120)}...`, 'info');
+                    try {
+                        const dbResponse = await fetch(QUERY_DB_URL, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify({ sql: aiDecision.sql })
+                        });
+                        const dbData = await dbResponse.json();
+
+                        if (dbData.success) {
+                            sendLogToPanel(`DB query returned ${dbData.rowCount} row(s)`, 'success');
+                            historyEntry.actionSuccess = true;
+                            historyEntry.dbResult = dbData.data;
+                            historyEntry.dbRowCount = dbData.rowCount;
+                            // Inject results into AI's next turn context
+                            postPopupDirective = 'DATABASE QUERY RESULT:\n'
+                                + JSON.stringify(dbData.data, null, 2)
+                                + '\nAnalyze the validation errors on screen, cross-reference this data, '
+                                + 'and fill ONLY the missing fields using text_match or selector. '
+                                + 'Do NOT alter fields that already have valid data.';
+                            failedActionCount = 0;
+                            lastActionFailed = false;
+                            lastActionError = '';
+                        } else {
+                            sendLogToPanel(`DB query failed: ${dbData.error}`, 'error');
+                            historyEntry.actionSuccess = false;
+                            historyEntry.dbError = dbData.error;
+                            // Inject error so AI can self-heal the SQL
+                            postPopupDirective = 'DATABASE QUERY FAILED:\n'
+                                + dbData.error
+                                + '\nRewrite your SQL query to fix the syntax error and try again. '
+                                + 'Common issues: wrong table/column names, missing quotes, invalid JOINs.';
+                            // Don't increment failedActionCount — let AI retry the query
+                            failedActionCount = 0;
+                            lastActionFailed = true;
+                            lastActionError = dbData.error;
+                        }
+                    } catch (e) {
+                        sendLogToPanel(`DB query network error: ${e.message}`, 'error');
+                        historyEntry.actionSuccess = false;
+                        historyEntry.dbError = e.message;
+                        postPopupDirective = 'DATABASE QUERY NETWORK ERROR: ' + e.message
+                            + '\nThe backend server may be down. Try again or proceed with manual data entry.';
+                        failedActionCount = 0;
+                    }
+                    actionHistory.push(historyEntry);
+                    continue;
+                }
+
+                // 7a. Handle ACTION_SEQUENCE
                 if (aiDecision.action === 'action_sequence' && aiDecision.actions && aiDecision.actions.length > 0) {
                     sendLogToPanel(`Action sequence (${aiDecision.actions.length} actions)...`, 'info');
                     let seqSuccess = 0;

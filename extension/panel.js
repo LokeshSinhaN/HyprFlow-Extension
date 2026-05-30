@@ -364,6 +364,17 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // ── AGENT MODE TOGGLE ──
+    const agentModeToggle = document.getElementById('agentModeToggle');
+    const modeRecordLabel = document.getElementById('modeRecordLabel');
+    const modeAgentLabel = document.getElementById('modeAgentLabel');
+
+    agentModeToggle.addEventListener('change', () => {
+        const isAgent = agentModeToggle.checked;
+        modeRecordLabel.classList.toggle('active', !isAgent);
+        modeAgentLabel.classList.toggle('active', isAgent);
+    });
+
     // ── RUN AGENT ──
     runBtn.addEventListener('click', () => {
         const prompt = promptInput.value.trim();
@@ -376,11 +387,13 @@ document.addEventListener('DOMContentLoaded', () => {
         hideCodeBanner();
         generateBtn.disabled = true;
         setRunning(true);
-        appendLog('Starting agent...', 'info');
+
+        const isAgentMode = agentModeToggle.checked;
+        appendLog(`Starting ${isAgentMode ? 'Autonomous Agent' : 'Record'} mode...`, 'info');
 
         chrome.runtime.sendMessage({
             type: 'START_AGENT',
-            payload: { prompt }
+            payload: { prompt, agentMode: isAgentMode }
         }, (response) => {
             if (chrome.runtime.lastError) {
                 appendLog('Error: ' + chrome.runtime.lastError.message, 'error');
