@@ -718,15 +718,22 @@ async function detectNewTabAfterClick(tabCountBefore) {
 // threshold since scrolling multiple times in long forms is normal.
 function checkForLoop(decision, actionRetryCount, lastActionKey) {
     const actionType = decision.action || '';
-    let actionId = '';
 
-    if (['click', 'type', 'hover'].includes(actionType)) {
+    // Use a stable identifier for this action. For DB queries, the SQL string must be part of the key
+    // so different queries don't get treated as the same action.
+    let actionId = decision.selector || decision.ref_id || decision.url;
+
+    if (actionType === 'query_database') {
+        // Allow multiple different SQL queries in the same run.
+        // Use a short prefix to keep the key bounded.
+        actionId = decision.sql ? decision.sql.substring(0, 50) : 'empty_sql';
+    } else if (['click', 'type', 'hover'].includes(actionType)) {
         // Include text_match in action key so semantic-targeted actions are tracked
-        actionId = decision.text_match || decision.selector || '';
+        actionId = decision.text_match || decision.selector || actionId || '';
     } else if (actionType === 'select_option') {
-        actionId = decision.option || decision.text_match || '';
+        actionId = decision.option || decision.text_match || actionId || '';
     } else if (actionType === 'navigate') {
-        actionId = decision.url || '';
+        actionId = decision.url || actionId || '';
     } else if (actionType === 'scroll_down' || actionType === 'scroll_up') {
         // FIXED: Include selector so different scroll targets are tracked separately
         // scroll_down on form ≠ scroll_down on body ≠ scroll_down on modal
@@ -734,6 +741,7 @@ function checkForLoop(decision, actionRetryCount, lastActionKey) {
     }
 
     const actionKey = actionType + '_' + actionId;
+
 
     // Dynamic retry threshold: scroll actions get more retries since
     // long forms/modals legitimately need multiple scrolls to reach the bottom

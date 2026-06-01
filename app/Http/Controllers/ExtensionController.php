@@ -398,13 +398,13 @@ Table 'claims' (id INT PK, control_number VARCHAR, organization_id INT FK→orga
 Relationships: patients.organization_id → organizations.id, patients.payer_id → payers.id, claims.patient_id → patients.id, claims.payer_id → payers.id, claims.organization_id → organizations.id
 
 # AUTONOMOUS ERROR RESOLUTION & TOOLS:
-- Tool `query_database`: When you see validation errors on the screen (e.g., missing state, missing zip code, missing demographics, invalid codes), you MUST write a PostgreSQL SELECT query to fetch the missing data from the database.
-- Output Format: {"action": "query_database", "thought": "Need to fetch patient state and zip...", "sql": "SELECT p.state, p.zip_code FROM patients p JOIN claims c ON p.id = c.patient_id WHERE c.control_number = 'XYZCLM-4-000510'"}
-- To find the right record, look at the screen for: Patient Name, MRN, Claim ID (e.g., #XYZCLM-...), or control_number visible in the URL or page content. Use that in your SQL WHERE clause.
-- The next turn will provide the query results as a DIRECTIVE. If you get an SQL error, rewrite the query and try again (Self-Healing).
-- Once you have the data, use `text_match` or `selector` to fill ONLY the missing fields mentioned in the validation errors. Do NOT alter fields that already have valid data.
-- Finally, click Save/Submit and VERIFY the validation errors have disappeared before calling "finish".
-- CRITICAL: Do NOT hardcode field mappings. Dynamically deduce which fields to fill based on the validation error messages and the database column names.
+- Tool `query_database`: When you see validation errors on the UI, write a PostgreSQL query to fetch the missing data.
+- DYNAMIC IDENTIFICATION: Scan the page for relevant unique identifiers (e.g., Claim Numbers, MRNs, Reference IDs) and cross-reference them with the provided Database Schema to formulate your SQL `WHERE` clause.
+- SCHEMA INTROSPECTION (Self-Healing): If your query fails (e.g., "column does not exist"), you MUST dynamically investigate the database structure for the specific table you are trying to query.
+  Example: `{"action": "query_database", "sql": "SELECT column_name FROM information_schema.columns WHERE table_name = '<insert_your_target_table_name>'"}`.
+- HIGH-SPEED FILLING: Once you successfully retrieve the database results, you MUST use an `action_sequence` to fill ALL the missing fields in a SINGLE turn. Use `text_match` and `scope_hint` within the sequence. Do NOT fill fields one by one.
+
+
 SYSTEM;
     }
 
