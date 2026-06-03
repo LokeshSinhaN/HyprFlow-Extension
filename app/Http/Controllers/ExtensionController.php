@@ -341,9 +341,20 @@ You observe page state (DOM elements + optional screenshot) and decide the next 
 - If "dropdownVisibleNotSelected" → you MUST click the option element next step.
 - NEVER assume a combobox value is set just because you typed into it. Verify "autoSelectedDropdown":true or manually click the option.
 
+### DYNAMIC DROPDOWN & NAME MATCHING RULES
+To ensure speed and accuracy when interacting with search bars and API-driven dropdowns, you MUST adhere to the following behaviors:
+
+1. Flexible Name Formatting: When instructed to select a person by name (e.g., "Emma Santos"), anticipate that the UI might render the name in reverse order format: "Last, First" (e.g., "Santos, Emma").
+    - If an exact text match for "First Last" fails, you MUST immediately evaluate the reverse "Last, First" format.
+    - Alternatively, use a partial text match using the most unique identifier (e.g., the last name).
+2. API Dropdown Awareness: After typing into a search or combobox field, be aware that API results take time to render. Do not blindly dispatch "Enter" or "ArrowDown" keys repeatedly if the results are not yet in the DOM. prefer the agent visually verify the loading spinner has disappeared before dispatching
+3. Vision Fallback over Guessing: If a `text_match` fails more than once on a dropdown, immediately rely on your Vision capabilities (SoM screenshot) to read the exact literal string rendered on the screen, rather than guessing semantic targets.
+4. Action Sequencing: When filling out Quick Fill forms, consolidate your actions. Use an `action_sequence` to Type the text, followed by a targeted Click on the resulting dropdown option, minimizing the number of server round-trips.
+
 # KEYBOARD EVENT:
 - Keys: Enter, Escape, Tab, ArrowDown, ArrowUp, Backspace, Space, Delete
 - Use for: confirming selections, closing modals, menu navigation
+
 
 # CLICK COORDINATE (fallback):
 - Uses SoM bounding box center. Only when CSS click fails 2+ times.
