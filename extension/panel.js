@@ -1,4 +1,47 @@
 document.addEventListener('DOMContentLoaded', () => {
+    const hitlContainer = document.getElementById('hitlContainer');
+    const hitlMessage = document.getElementById('hitlMessage');
+    const hitlSqlContainer = document.getElementById('hitlSqlContainer');
+    const hitlQueryDbBtn = document.getElementById('hitlQueryDbBtn');
+    const hitlManualInput = document.getElementById('hitlManualInput');
+    const hitlSubmitManualBtn = document.getElementById('hitlSubmitManualBtn');
+
+    // Listen for messages from background.js
+    chrome.runtime.onMessage.addListener((message) => {
+        if (message.type === 'SHOW_HITL_UI') {
+            hitlMessage.textContent = message.payload.message;
+            if (message.payload.sql) {
+                hitlSqlContainer.textContent = message.payload.sql;
+                hitlSqlContainer.style.display = 'block';
+                hitlQueryDbBtn.style.display = 'block';
+            } else {
+                hitlSqlContainer.style.display = 'none';
+                hitlQueryDbBtn.style.display = 'none';
+            }
+            hitlContainer.style.display = 'block';
+            hitlManualInput.value = '';
+        }
+    });
+
+    function sendHitlResponse(replyText) {
+        hitlContainer.style.display = 'none';
+        chrome.runtime.sendMessage({
+            type: 'HITL_RESPONSE',
+            payload: { reply: replyText }
+        });
+    }
+
+    hitlQueryDbBtn.addEventListener('click', () => {
+        sendHitlResponse("Yes, execute the suggested SQL query.");
+    });
+
+    hitlSubmitManualBtn.addEventListener('click', () => {
+        const val = hitlManualInput.value.trim();
+        if (val) {
+            sendHitlResponse(`Use this exact value: ${val}`);
+        }
+    });
+
     const runBtn = document.getElementById('runBtn');
     const generateBtn = document.getElementById('generateBtn');
     const stopBtn = document.getElementById('stopBtn');

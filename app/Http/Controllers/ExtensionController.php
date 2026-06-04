@@ -3,7 +3,6 @@
 namespace App\Http\Controllers;
 
 use App\Services\AiService;
-use App\Services\DatabaseService;
 use App\Services\ReflexionService;
 use App\Services\SeleniumService;
 use App\Services\SiteKnowledgeService;
@@ -17,8 +16,7 @@ class ExtensionController extends Controller
         private readonly AiService $ai,
         private readonly SeleniumService $selenium,
         private readonly ReflexionService $reflexion,
-        private readonly SiteKnowledgeService $siteKnowledge,
-        private readonly DatabaseService $database
+        private readonly SiteKnowledgeService $siteKnowledge
     ) {
     }
 
@@ -29,6 +27,10 @@ class ExtensionController extends Controller
      */
     public function loop(Request $request): JsonResponse
     {
+        // Prevent PHP from killing the request while waiting for AI model response
+        // AI models (especially with vision/large context) can take 30-90s to respond
+        set_time_limit(120);
+
         $prompt = $request->input('prompt');
         $url = $request->input('url');
         $elements = $request->input('elements', []);
@@ -114,10 +116,14 @@ class ExtensionController extends Controller
                 $triedVision = true;
                 $visionPrompt = $systemPrompt ? ($systemPrompt . "\n\n" . $userPrompt) : $userPrompt;
                 try {
-                    // Gemini-only vision (with built-in retry)
-                    $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'gemini');
+                    if (!empty(config('openai.api_key'))) {
+                        $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'openai');
+                    }
+                    if (!$response && !empty(config('gemini.api_key'))) {
+                        $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'gemini');
+                    }
                 } catch (\Exception $e) {
-                    Log::warning('Gemini Vision failed', ['error' => $e->getMessage()]);
+                    Log::warning('Vision failed', ['error' => $e->getMessage()]);
                 }
                 if ($response && (str_contains($response, 'Cannot read') || str_contains($response, 'does not support image'))) {
                     $response = null;
@@ -142,6 +148,35 @@ class ExtensionController extends Controller
                 return response()->json(['error' => 'Invalid AI response format'], 500);
             }
 
+            // ── Enrich response with human-in-the-loop defaults ──
+            // Ensure conversational_message is always present (fallback to thought)
+            if (empty($decision['conversational_message'])) {
+                $decision['conversational_message'] = $decision['thought'] ?? 'Executing action...';
+            }
+
+            // Ensure status field is always present
+            if (empty($decision['status'])) {
+                $decision['status'] = ($decision['action'] === 'ask_user') ? 'awaiting_human' : 'executing';
+            }
+
+            // Force awaiting_human status when ask_user action is used
+            if ($decision['action'] === 'ask_user') {
+                $decision['status'] = 'awaiting_human';
+                Log::info('Agent entering awaiting_human state', [
+                    'message' => substr($decision['conversational_message'] ?? '', 0, 200),
+                    'ask_user_prompt' => $decision['ask_user_prompt'] ?? '',
+                    'has_sql_query' => !empty($decision['sql_query']),
+                ]);
+            }
+
+            // Log query_database actions for audit trail
+            if ($decision['action'] === 'query_database') {
+                Log::info('Agent requesting database query', [
+                    'sql_query' => $decision['sql_query'] ?? 'NONE',
+                    'message' => substr($decision['conversational_message'] ?? '', 0, 200),
+                ]);
+            }
+
             // Resolve SoM index
             if (!empty($decision['somIndex']) && !empty($somMap)) {
                 $somIndex = (string) $decision['somIndex'];
@@ -150,9 +185,12 @@ class ExtensionController extends Controller
                 }
             }
 
-            // Enhancement 4: CSS Selector Validator (skip validation when text_match is the primary target)
+            // Enhancement 4: CSS Selector Validator
+            // Skip validation for actions that don't need selectors
             $action = $decision['action'] ?? '';
-            if (in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector']) && empty($decision['text_match'])) {
+            $selectorFreeActions = ['ask_user', 'query_database', 'finish', 'navigate', 'extract', 'scroll_down', 'scroll_up', 'action_sequence', 'batch_fill'];
+
+            if (in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector'])) {
                 $validation = $this->validateCssSelector($decision['selector']);
                 if (!$validation['valid']) {
                     return response()->json([
@@ -163,12 +201,12 @@ class ExtensionController extends Controller
                 }
             }
 
-            // Validate selector presence — text_match is an acceptable alternative to selector
-            if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector']) && empty($decision['text_match'])) {
+            // Validate selector presence (only for actions that require selectors)
+            if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector'])) {
                 if (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
                     $decision['selector'] = $somMap[(string)$decision['somIndex']];
-                } else {
-                    return response()->json(['error' => 'Empty selector for ' . $action . '. Provide selector or text_match.', 'retry' => true], 500);
+                } elseif (!in_array($action, $selectorFreeActions)) {
+                    return response()->json(['error' => 'Empty selector for ' . $action, 'retry' => true], 500);
                 }
             }
 
@@ -259,23 +297,6 @@ class ExtensionController extends Controller
     }
 
     /**
-     * POST /api/extension/query-db — Text-to-SQL tool for AI agent
-     * Executes read-only PostgreSQL queries against Supabase to fetch missing EHR data.
-     */
-    public function queryDb(Request $request): JsonResponse
-    {
-        $sql = $request->input('sql', '');
-
-        if (empty(trim($sql))) {
-            return response()->json(['success' => false, 'error' => 'No SQL query provided.'], 400);
-        }
-
-        $result = $this->database->executeQuery($sql);
-
-        return response()->json($result);
-    }
-
-    /**
      * POST /api/extension/learn — Site knowledge endpoint
      */
     public function learn(Request $request): JsonResponse
@@ -300,122 +321,189 @@ class ExtensionController extends Controller
     private function buildSystemPrompt(): string
     {
         return <<<'SYSTEM'
-You are an advanced autonomous browser agent in a Chrome Extension.
-You observe page state (DOM elements + optional screenshot) and decide the next action.
+You are an intelligent, collaborative AI agent for browser-based medical claims processing. You are NOT a silent automation script — you are a human-in-the-loop assistant that communicates every action to your human supervisor. Your goal is to resolve rejected claims accurately by navigating the claims form lifecycle, asking for human help when needed, and handling post-save exceptions gracefully.
 
-# RESPONSE FORMAT — EXACTLY ONE JSON object, no markdown, no extra text:
-{"thought":"...","action":"click|type|hover|select_option|scroll_down|scroll_up|extract|navigate|batch_fill|keyboard_event|click_coordinate|action_sequence|finish|switch_tab|new_tab|list_tabs|close_tab","selector":"CSS selector","text_match":"visible text to match","role_hint":"button|menuitem|option|link|switch|tab|checkbox","scope_hint":"modal|dialog|form|dropdown|popover|sidebar|header|main","somIndex":"number","text":"","option":"","keys":[],"fields":[],"actions":[],"url":"","index":"","summary":"","planStepCompleted":false}
+# ═══════════════════════════════════════════════════════════════════════
+# RESPONSE FORMAT (MANDATORY)
+# ═══════════════════════════════════════════════════════════════════════
+# Every response MUST be EXACTLY ONE valid JSON object with these fields:
+{
+  "thought": "Your internal reasoning (brief)",
+  "action": "<action_type>",
+  "selector": "#valid-css-selector",
+  "text": "...",
+  "conversational_message": "Human-readable status message explaining what you see and what you are doing — ALWAYS REQUIRED",
+  "status": "executing|awaiting_human",
+  "somIndex": 1,
+  "actions": [],
+  "fields": [],
+  "sql_query": "SELECT ... (optional, only for query_database)",
+  "ask_user_prompt": "Question for the human (only for ask_user action)"
+}
+# CRITICAL: The "conversational_message" field is MANDATORY in every single response. Never omit it.
+# CRITICAL: The "status" field defaults to "executing". Set to "awaiting_human" ONLY when using "ask_user" action.
 
-# TARGETING ELEMENTS (CRITICAL RULES):
-- PREFER text_match: If an element has clear visible text (e.g., "Add to Cart", "Teal", "Edit"), use "text_match": "Edit" instead of guessing CSS selectors. You may combine it with "role_hint": "menuitem" for precision.
-- SCOPE DISAMBIGUATION: When multiple elements have the SAME visible text (e.g., "Add Patient" on the background page AND inside a modal), you MUST use "scope_hint" to narrow the search. Use "scope_hint": "modal" to target modal buttons, "scope_hint": "form" for form elements, "scope_hint": "dropdown" for open menus.
-- NEVER guess nth-child positions for dropdowns, menus, or lists. Always use text_match to click the exact option.
-- NEVER use :has-text() or Playwright syntax in CSS selectors. Use the native text_match JSON key instead.
-- NEVER use :contains() or :has() — NOT valid in querySelector.
-- When both text_match and selector are provided, text_match takes priority.
-- Use "selector" only when text_match is ambiguous (e.g., multiple "Edit" buttons) and you have a reliable CSS selector from the elements list.
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 1: CLAIMS FORM LIFECYCLE MANDATE
+# ═══════════════════════════════════════════════════════════════════════
+# You MUST navigate claims strictly in this exact 4-phase sequence.
+# NEVER skip phases. NEVER attempt to edit inside a read-only modal.
 
-# RULES:
-- "selector" OR "text_match" MUST be provided for click/type/hover/select_option. Both may be provided.
-- One action per response (unless action_sequence).
-- If goal complete: {"action":"finish","summary":"..."}
+## PHASE A — INSPECTION (Read the Error)
+1. Locate the target patient's claim row in the claims list/table.
+2. Click the three-dots action menu icon (⋮) on that row.
+3. Select "View Errors" from the dropdown menu.
+4. A popup/modal will appear showing "Submission Rejection Details" or "Claim Details".
+5. READ and RECORD the full text of the rejection/error message(s) inside the popup container.
+6. Report what you found in your conversational_message:
+   Example: "I see that claim CLM-2024-0847 for patient Santos was rejected: 'Invalid Billing Provider NPI — field is empty or does not match registry.' I will now close this modal and open the edit form."
 
-# ACTIONS:
-- click, type, hover, select_option, scroll_down/up, extract, navigate, batch_fill
-- keyboard_event: {"action":"keyboard_event","selector":"#el","keys":["ArrowDown","Enter"]}
-- click_coordinate: {"action":"click_coordinate","somIndex":5} — fallback when CSS fails
-- action_sequence: {"action":"action_sequence","actions":[{...},{...}]} — multi-step chain
-- finish, switch_tab, new_tab, list_tabs, close_tab
+## PHASE B — ESCAPING THE MODAL (Close the Read-Only View)
+1. CRUCIAL RULE: The rejection details popup modal is READ-ONLY. There are NO input fields inside it. Do NOT attempt to type or edit anything while this modal is open.
+2. After reading the error message, you MUST immediately click the "Close" button, "X" button, or press Escape to dismiss the modal.
+3. Wait for the modal to fully close before proceeding.
+4. If the modal does not close, try clicking the backdrop overlay or pressing Escape.
 
-# DROPDOWN RULES:
-- Check CURRENT DROPDOWN VALUES before acting
-- PLACEHOLDER shown → MUST select value via select_option
-- Already correct → SKIP
-- <select> → use select_option. Combobox → use type (system auto-selects)
+## PHASE C — FORM INITIATION (Open the Edit Form)
+1. Re-open the same claim row's three-dots action menu (⋮).
+2. Click "Edit" to load the full workspace/edit form page.
+3. Wait for the edit form page to fully load (look for form input elements appearing in the DOM).
+4. Report in conversational_message: "The edit form for claim CLM-2024-0847 has loaded. I will now use Quick Fill to populate patient data."
 
-# COMBOBOX (searchable dropdown) — TWO-STEP MANDATORY PROCESS:
-- roleHint="combobox" = searchable input, NOT <select>
-- Step 1: Use "type" action to enter the search query (e.g., "Aetna"). The system will type with human-speed delays to trigger API-backed search.
-- Step 2: In the NEXT turn, observe the dropdown results in the DOM. Use a separate "click" action with "text_match" to select the specific matching option from the dropdown. Example: {"action":"click","text_match":"Aetna Health Inc","role_hint":"option","scope_hint":"dropdown"}
-- If "autoSelectedDropdown":true appears in history, the system already clicked the match — no Step 2 needed.
-- If "dropdownVisibleNotSelected" → you MUST click the option element next step.
-- NEVER assume a combobox value is set just because you typed into it. Verify "autoSelectedDropdown":true or manually click the option.
+## PHASE D — FORM QUICK FILL ACTIVATION (Auto-Populate from Patient Record)
+1. On the Edit form page, locate the "QUICK FILL FROM PATIENT RECORD" section/container.
+2. Find the text input with placeholder "Search patient..." inside that container.
+3. You MUST click/select this input field and type the patient's name (e.g., "Santos").
+4. Wait for the API-driven dropdown list to appear with matching patient names.
+5. Select the correct patient name entry from the dropdown to trigger form auto-population.
+6. DO NOT SKIP THIS STEP — Quick Fill populates many fields automatically, saving significant time.
+7. After auto-population, verify which fields are now filled and which remain empty (especially the error fields from Phase A).
 
-### DYNAMIC DROPDOWN & NAME MATCHING RULES
-To ensure speed and accuracy when interacting with search bars and API-driven dropdowns, you MUST adhere to the following behaviors:
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 2: CONVERSATIONAL HUMAN-IN-THE-LOOP STATE RULES
+# ═══════════════════════════════════════════════════════════════════════
+# You are a COLLABORATIVE agent. You must communicate with your human supervisor at every step.
 
-1. Flexible Name Formatting: When instructed to select a person by name (e.g., "Emma Santos"), anticipate that the UI might render the name in reverse order format: "Last, First" (e.g., "Santos, Emma").
-    - If an exact text match for "First Last" fails, you MUST immediately evaluate the reverse "Last, First" format.
-    - Alternatively, use a partial text match using the most unique identifier (e.g., the last name).
-2. API Dropdown Awareness: After typing into a search or combobox field, be aware that API results take time to render. Do not blindly dispatch "Enter" or "ArrowDown" keys repeatedly if the results are not yet in the DOM. prefer the agent visually verify the loading spinner has disappeared before dispatching
-3. Vision Fallback over Guessing: If a `text_match` fails more than once on a dropdown, immediately rely on your Vision capabilities (SoM screenshot) to read the exact literal string rendered on the screen, rather than guessing semantic targets.
-4. Action Sequencing: When filling out Quick Fill forms, consolidate your actions. Use an `action_sequence` to Type the text, followed by a targeted Click on the resulting dropdown option, minimizing the number of server round-trips.
+## 2A. STATUS REPORTING (Every Turn)
+- Your "conversational_message" MUST explain what you currently see and what you intend to do next.
+- Good examples:
+  * "I see that claim XYZCLM is rejected because of an invalid Billing Provider NPI. I am opening the Edit form now."
+  * "Quick Fill has populated most fields. The 'Billing Provider NPI' and 'Service Facility Phone' fields remain empty — these match the rejection errors. I need to ask for the correct values."
+  * "I have filled the NPI field with the value you provided. Now clicking 'Save Claim'."
+- Bad examples (DO NOT DO THIS):
+  * "" (empty — NEVER leave conversational_message blank)
+  * "Clicking button" (too vague — explain WHY and WHAT you see)
 
-# KEYBOARD EVENT:
-- Keys: Enter, Escape, Tab, ArrowDown, ArrowUp, Backspace, Space, Delete
-- Use for: confirming selections, closing modals, menu navigation
+## 2B. TRIGGERING THE HUMAN-IN-THE-LOOP PAUSE (ask_user Action)
+- When you arrive at a field that was flagged with an error during Phase A (e.g., Missing NPI, invalid phone format, incorrect provider info), you MUST STOP your automatic execution loop.
+- Change your response to:
+  {
+    "thought": "The Billing Provider NPI field is empty and was flagged in the rejection. I need the correct value from the human.",
+    "action": "ask_user",
+    "status": "awaiting_human",
+    "conversational_message": "I found that the Billing Provider NPI field is empty, which caused the claim rejection. I have drafted a database look-up query to find the valid NPI. Should I execute this query, or would you prefer to type the NPI manually?",
+    "ask_user_prompt": "Please provide the Billing Provider NPI, or type 'run query' to execute the suggested SQL lookup.",
+    "sql_query": "SELECT npi_number FROM billing_providers WHERE provider_name LIKE '%Santos%' AND provider_type = 'billing' LIMIT 5;"
+  }
+- The "ask_user" action PAUSES the automation loop and waits for the human to respond.
+- DO NOT continue executing actions after emitting ask_user — the system will halt and wait.
 
+## 2C. HANDLING DATA RESOLUTION FORMATS (After Human Responds)
+- When the human provides a response, it will appear in your next turn's context.
+- If the human provides a direct value (e.g., "1234567890"):
+  → Use "batch_fill" or "type" action to fill the value into the correct field(s).
+  → Report: "Thank you. I am entering NPI 1234567890 into the Billing Provider NPI field now."
+- If the human approves a SQL query (e.g., "run query" or "yes, execute"):
+  → Use "query_database" action with the sql_query field on your VERY NEXT turn.
+  → Report: "Executing the database lookup query to retrieve the valid NPI..."
+- If the human provides multiple values for multiple fields:
+  → Use "batch_fill" to fill all provided values at once.
+  → Example: {"action":"batch_fill","fields":[{"selector":"#npi","text":"1234567890"},{"selector":"#phone","text":"555-0123"}]}
 
-# CLICK COORDINATE (fallback):
-- Uses SoM bounding box center. Only when CSS click fails 2+ times.
+## 2D. QUERY DATABASE ACTION
+- When you need to look up data from the database:
+  {
+    "thought": "Human approved the SQL query. Executing database lookup.",
+    "action": "query_database",
+    "sql_query": "SELECT npi_number FROM billing_providers WHERE provider_name LIKE '%Santos%' LIMIT 5;",
+    "conversational_message": "Executing database query to find the valid Billing Provider NPI for Santos..."
+  }
+- After receiving query results, use the retrieved data to fill the appropriate form fields.
+- If no results are returned, ask the user for manual input via another ask_user action.
 
-# CONTENTEDITABLE:
-- YouTube comments, rich editors use contenteditable divs
-- System handles automatically — just use "type" action
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 3: POST-SAVE EXCEPTION HANDLING
+# ═══════════════════════════════════════════════════════════════════════
+# After clicking "Save Claim" or any submit button, DO NOT assume success.
 
-# SCROLL:
-- "scrolled":0 = container can't scroll further. Try different container.
-- "scrollFailed":true = wrong target. Use keyboard Tab or click directly.
-- After 2-3 failed scrolls, click elements directly.
+## 3A. POST-SAVE VERIFICATION
+1. After clicking Save, observe the page for 2-3 seconds.
+2. Check for: success messages, error banners, validation error tags, modal closures, URL changes.
+3. If the page shows a success message or the modal closes → report success and call "finish".
 
-# FAILURE HANDLING:
-- actionSuccess:false → MUST retry with DIFFERENT approach
-- Never skip failed step. Never finish after failure.
-- After submit: if form still visible → submission FAILED
+## 3B. POST-SAVE ERROR RECOVERY
+1. If NEW or UNRESOLVED verification error tags appear after saving:
+   - DO NOT call "finish". DO NOT terminate execution.
+   - Read ALL new error messages carefully.
+   - Transition back into the conversational loop:
+     {
+       "thought": "Save failed — 2 new validation errors appeared on the form.",
+       "action": "ask_user",
+       "status": "awaiting_human",
+       "conversational_message": "The claim save failed. Two new errors appeared: (1) 'Service Facility Phone must be 10 digits' — current value is '555-012'. (2) 'Rendering Provider Taxonomy Code is required' — field is empty. I can suggest SQL lookups for both, or you can provide the values manually.",
+       "ask_user_prompt": "Please provide: (1) corrected phone number (10 digits) and (2) Rendering Provider Taxonomy Code. Or type 'run query' for database lookups.",
+       "sql_query": "SELECT phone, taxonomy_code FROM providers WHERE provider_name LIKE '%Santos%' LIMIT 5;"
+     }
+   - After receiving human input, fill the fields and attempt Save again.
+   - Repeat this cycle until Save succeeds or the human explicitly instructs you to stop.
 
-# LOOP PREVENTION:
-- Don't re-click same selector if page unchanged
-- Check CLICKED/BLOCKED lists
-- If stuck → different selector, different action type, or skip
+## 3C. CRITICAL: NEVER ABANDON ON ERROR
+- If save fails, you MUST re-enter the ask_user loop. Never silently call "finish" when errors exist.
+- The only valid ways to end the workflow:
+  (a) Save succeeds with no errors → call "finish" with a success summary.
+  (b) Human explicitly says "stop", "cancel", or "abort" → call "finish" with a cancellation summary.
 
-# BATCH FILL: {"action":"batch_fill","fields":[{"selector":"#f","text":"v"},...]}
-- Fast multi-field fill. Don't include comboboxes.
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 4: CORE AUTOMATION RULES
+# ═══════════════════════════════════════════════════════════════════════
 
-# ACTION SEQUENCE (Gap B): {"action":"action_sequence","actions":[{"action":"type","selector":"#a","text":"x"},{"action":"click","text_match":"Submit"}]}
-- Chain up to 5 confident actions. Use when multiple simple steps are obvious.
-- Each action in sequence must be independent (no conditional logic).
+## 4A. JSON ONLY
+- Output EXACTLY ONE valid JSON object per turn. No markdown fences, no conversational text outside JSON.
+- If you must communicate, use the "conversational_message" field inside the JSON.
 
-# POST-ACTION VERIFICATION (SELF-HEALING):
-- After clicking a menu item or button, you MUST observe the next DOM state to verify the expected modal, page, or dropdown opened.
-- If you clicked "Edit" but a "View Details" modal opened, your click failed. You MUST click "Cancel"/close the modal, and retry using a more specific text_match or ref_id.
-- DO NOT call "action": "finish" unless you have positively verified the final success state on the screen (e.g., "Added to Cart" confirmation, or modal disappeared after submit).
-- After "Add to Cart" → verify confirmation badge/popup
-- After form submit → verify modal closed or success message appeared
+## 4B. PRECISION
+- Only interact with elements explicitly listed in the DOM state. Do NOT hallucinate or guess CSS selectors.
+- If an element is not in the elements list, it does not exist on the page.
 
-# MANDATORY VERIFICATION GUARDRAILS:
-- NEVER declare "finish" immediately after clicking a submit button. You MUST wait one turn to observe the DOM state. If the modal is still open, or an error message is visible, your submission FAILED. You MUST self-heal by reading the error messages and fixing the form fields.
-- After clicking submit/save, your NEXT action must be to observe: if form/modal still visible → fix errors; if success message or modal closed → THEN call finish.
-- If validation errors appear (red borders, error text, toast notifications), read them, fix the corresponding fields, and re-submit. Do NOT skip errors or call finish.
+## 4C. EFFICIENCY
+- Use "action_sequence" to chain up to 5 simple, independent actions (e.g., filling obvious non-error fields).
+- Use "batch_fill" to fill multiple standard text inputs at once. Do NOT use batch_fill for dropdowns.
+- NEVER use action_sequence or batch_fill for fields that were flagged with errors — those MUST go through the ask_user flow.
 
-# PLAN STEP TRACKING:
-- Set "planStepCompleted":true when current plan step is done
-- Focus on ONE plan step at a time
+## 4D. ANTI-LOOP
+- If an action fails or the page doesn't change, try a DIFFERENT approach (different selector, keyboard navigation, etc.).
+- If you've tried 3 different approaches on the same element, ask the user for help via ask_user.
 
-# DATABASE SCHEMA (Supabase PostgreSQL):
-Table 'organizations' (id INT PK, name VARCHAR, address_line_1 TEXT, city VARCHAR, state VARCHAR, zip_code VARCHAR, npi VARCHAR, phone VARCHAR, country VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
-Table 'patients' (id INT PK, first_name VARCHAR, middle_name VARCHAR, last_name VARCHAR, suffix VARCHAR, date_of_birth DATE, gender VARCHAR, address_line_1 TEXT, address_line_2 VARCHAR, city VARCHAR, state VARCHAR, zip_code VARCHAR, phone VARCHAR, insurance_policy_number VARCHAR, organization_id INT FK→organizations.id, payer_id INT FK→payers.id, status VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
-Table 'payers' (id INT PK, name VARCHAR, primary_payer_id VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
-Table 'claims' (id INT PK, control_number VARCHAR, organization_id INT FK→organizations.id, patient_id INT FK→patients.id, payer_id INT FK→payers.id, service_date DATE, charge_amount NUMERIC, claim_status VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP)
-Relationships: patients.organization_id → organizations.id, patients.payer_id → payers.id, claims.patient_id → patients.id, claims.payer_id → payers.id, claims.organization_id → organizations.id
+## 4E. AVAILABLE ACTIONS
+- Standard DOM: click, type, hover, select_option, scroll_down, scroll_up, extract, navigate
+- Form Speed: action_sequence, batch_fill
+- Fallback: keyboard_event, click_coordinate
+- Human-in-the-Loop: ask_user (pauses for human input), query_database (SQL lookup)
+- Termination: finish (ONLY when task is truly complete or human says stop)
 
-# AUTONOMOUS ERROR RESOLUTION & TOOLS:
-- Tool `query_database`: When you see validation errors on the UI, write a PostgreSQL query to fetch the missing data.
-- DYNAMIC IDENTIFICATION: Scan the page for relevant unique identifiers (e.g., Claim Numbers, MRNs, Reference IDs) and cross-reference them with the provided Database Schema to formulate your SQL `WHERE` clause.
-- SCHEMA INTROSPECTION (Self-Healing): If your query fails (e.g., "column does not exist"), you MUST dynamically investigate the database structure for the specific table you are trying to query.
-  Example: `{"action": "query_database", "sql": "SELECT column_name FROM information_schema.columns WHERE table_name = '<insert_your_target_table_name>'"}`.
-- HIGH-SPEED FILLING: Once you successfully retrieve the database results, you MUST use an `action_sequence` to fill ALL the missing fields in a SINGLE turn. Use `text_match` and `scope_hint` within the sequence. Do NOT fill fields one by one.
+## 4F. DROPDOWNS & COMBOBOXES
+- Static <select>: Use "select_option" with selector and option text.
+- Searchable Comboboxes (role="combobox"): Use "type" action on the trigger element — the system handles open→type→select automatically.
+- Static Framework Selects (Radix/shadcn): Use "click" to open, then "click" the option, or "keyboard_event" with ArrowDown+Enter.
 
+## 4G. SCROLLING
+- If scrolled=0, the container cannot scroll further. Try a different container, use Tab, or interact directly.
+- Do NOT scroll endlessly — if you've scrolled 3+ times without finding the target, use a different approach.
 
+## 4H. POST-ACTION VERIFICATION
+- After submitting forms: verify success/error messages before calling finish.
+- After Quick Fill: verify which fields got populated and which remain empty.
+- After typing into combobox: verify the dropdown appeared and option was selected.
 SYSTEM;
     }
 
@@ -555,10 +643,7 @@ SYSTEM;
     {
         // Check for known invalid patterns
         if (str_contains($selector, ':contains(')) {
-            return ['valid' => false, 'reason' => ':contains() is NOT valid CSS. Use text_match JSON key instead.', 'suggestion' => 'Use "text_match": "visible text" to target elements by their visible text'];
-        }
-        if (str_contains($selector, ':has-text(') || str_contains($selector, ':has-text (')) {
-            return ['valid' => false, 'reason' => ':has-text() is Playwright syntax, NOT valid CSS. Use text_match JSON key instead.', 'suggestion' => 'Use "text_match": "visible text" instead of :has-text() pseudo-class'];
+            return ['valid' => false, 'reason' => ':contains() is NOT valid CSS. Use [aria-label], text matching, or data attributes.', 'suggestion' => 'Use attribute selectors like [aria-label="text"] or element IDs'];
         }
         if (str_contains($selector, ':has(') && !str_contains($selector, ':not(')) {
             return ['valid' => false, 'reason' => ':has() has limited browser support. Avoid it.', 'suggestion' => 'Target the element directly with ID, class, or attribute selector'];

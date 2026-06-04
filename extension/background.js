@@ -1,309 +1,11 @@
 // Hyprflow Extension Background Worker — the "Brain Coordinator".
-// ENHANCED: CDP Hardware Clicks, Network Listening, Plan-Aware Execution,
-// Post-Action Verification, Multi-Action Chaining, Scroll Verification,
-// Site Knowledge Learning, Coordinate Click support.
+// ENHANCED: Plan-Aware Execution, Post-Action Verification, Multi-Action Chaining,
+// Scroll Verification, Site Knowledge Learning, Coordinate Click support.
 
 const API_URL = "http://127.0.0.1:8001/api/extension/loop";
 const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
-const QUERY_DB_URL = "http://127.0.0.1:8001/api/extension/query-db";
-
-// ─── CDP HARDWARE CLICK IMPLEMENTATION ─────────────────────────────
-// Uses Chrome DevTools Protocol to simulate real hardware mouse events.
-// This bypasses all JavaScript event listeners and synthetic event blockers
-// (Radix UI, HeadlessUI, etc.) by dispatching at the browser compositor level.
-
-/** @type {Set<number>} Tabs currently attached to debugger */
-const _debuggerAttachedTabs = new Set();
-
-/**
- * Attaches chrome.debugger to a tab if not already attached.
- * Handles the case where the debugger is already attached by another extension.
- * @param {number} tabId
- * @returns {Promise<boolean>} true if attached successfully
- */
-async function attachDebugger(tabId) {
-    if (_debuggerAttachedTabs.has(tabId)) return true;
-
-    return new Promise((resolve) => {
-        chrome.debugger.attach({ tabId }, '1.3', () => {
-            if (chrome.runtime.lastError) {
-                const errMsg = chrome.runtime.lastError.message || '';
-                // Already attached is OK
-                if (errMsg.includes('Already attached')) {
-                    _debuggerAttachedTabs.add(tabId);
-                    resolve(true);
-                } else {
-                    console.error(`[CDP] Failed to attach debugger to tab ${tabId}: ${errMsg}`);
-                    resolve(false);
-                }
-            } else {
-                _debuggerAttachedTabs.add(tabId);
-                resolve(true);
-            }
-        });
-    });
-}
-
-/**
- * Detaches chrome.debugger from a tab safely.
- * @param {number} tabId
- * @returns {Promise<void>}
- */
-async function detachDebugger(tabId) {
-    if (!_debuggerAttachedTabs.has(tabId)) return;
-
-    return new Promise((resolve) => {
-        chrome.debugger.detach({ tabId }, () => {
-            _debuggerAttachedTabs.delete(tabId);
-            if (chrome.runtime.lastError) {
-                // Tab may have been closed — ignore
-                console.log(`[CDP] Detach warning for tab ${tabId}: ${chrome.runtime.lastError.message}`);
-            }
-            resolve();
-        });
-    });
-}
-
-/**
- * Sends a CDP command to a tab via chrome.debugger.
- * @param {number} tabId
- * @param {string} method - CDP method (e.g., 'Input.dispatchMouseEvent')
- * @param {object} params - CDP method parameters
- * @returns {Promise<object|null>}
- */
-async function sendCDPCommand(tabId, method, params = {}) {
-    return new Promise((resolve) => {
-        chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
-            if (chrome.runtime.lastError) {
-                console.error(`[CDP] Command ${method} failed: ${chrome.runtime.lastError.message}`);
-                resolve(null);
-            } else {
-                resolve(result || {});
-            }
-        });
-    });
-}
-
-/**
- * Executes a full hardware click lifecycle at the given X/Y viewport coordinates.
- * Simulates: mouseMoved → mousePressed → mouseReleased
- * This is the same event sequence a real user generates with a physical mouse.
- *
- * @param {number} tabId - Target tab ID
- * @param {number} x - X coordinate (viewport-relative)
- * @param {number} y - Y coordinate (viewport-relative)
- * @param {object} [options] - Optional click configuration
- * @param {number} [options.clickCount=1] - Number of clicks (2 for double-click)
- * @param {string} [options.button='left'] - Mouse button ('left', 'right', 'middle')
- * @param {number} [options.delay=50] - Delay between press and release in ms
- * @returns {Promise<{success: boolean, error?: string}>}
- */
-async function executeHardwareClick(tabId, x, y, options = {}) {
-    const { clickCount = 1, button = 'left', delay = 50 } = options;
-
-    try {
-        // 1. Attach debugger
-        const attached = await attachDebugger(tabId);
-        if (!attached) {
-            return { success: false, error: 'Failed to attach debugger to tab' };
-        }
-
-        // 2. Move mouse to target position (generates mouseover/mouseenter events)
-        const moveResult = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
-            type: 'mouseMoved',
-            x: Math.round(x),
-            y: Math.round(y),
-            button: 'none',
-            clickCount: 0
-        });
-        if (moveResult === null) {
-            return { success: false, error: 'CDP mouseMoved failed' };
-        }
-
-        // Small delay to let hover effects register
-        await sleep(20);
-
-        // 3. Press mouse button
-        const pressResult = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
-            type: 'mousePressed',
-            x: Math.round(x),
-            y: Math.round(y),
-            button: button,
-            clickCount: clickCount,
-            buttons: 1 // Left button bitmask
-        });
-        if (pressResult === null) {
-            return { success: false, error: 'CDP mousePressed failed' };
-        }
-
-        // Delay between press and release (simulates human finger speed)
-        await sleep(delay);
-
-        // 4. Release mouse button
-        const releaseResult = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
-            type: 'mouseReleased',
-            x: Math.round(x),
-            y: Math.round(y),
-            button: button,
-            clickCount: clickCount,
-            buttons: 0
-        });
-        if (releaseResult === null) {
-            return { success: false, error: 'CDP mouseReleased failed' };
-        }
-
-        return { success: true };
-    } catch (e) {
-        console.error(`[CDP] Hardware click error:`, e);
-        return { success: false, error: e.message };
-    }
-}
-
-/**
- * Executes a CDP hardware click on an element identified by ref_id.
- * Resolves the ref_id to viewport coordinates via the content script,
- * then dispatches CDP mouse events at those coordinates.
- *
- * @param {number} tabId - Target tab ID
- * @param {string} refId - Element reference ID from the accessibility tree
- * @returns {Promise<{success: boolean, x?: number, y?: number, error?: string}>}
- */
-async function executeRefClick(tabId, refId) {
-    // 1. Get coordinates from content script
-    const coordResult = await executeContentScript(tabId, 'GET_REF_COORDINATES', { ref_id: refId }, 3);
-
-    if (!coordResult || !coordResult.success) {
-        return {
-            success: false,
-            error: coordResult?.error || `Could not resolve coordinates for ${refId}`
-        };
-    }
-
-    const { x, y } = coordResult;
-
-    // 2. Execute CDP hardware click at those coordinates
-    const clickResult = await executeHardwareClick(tabId, x, y);
-
-    return {
-        ...clickResult,
-        x,
-        y,
-        ref_id: refId
-    };
-}
-
-// Clean up debugger on tab close/navigation
-chrome.tabs.onRemoved.addListener((tabId) => {
-    _debuggerAttachedTabs.delete(tabId);
-});
-
-// Handle debugger detach events (user closed DevTools, etc.)
-chrome.debugger.onDetach.addListener((source, reason) => {
-    if (source.tabId) {
-        _debuggerAttachedTabs.delete(source.tabId);
-        console.log(`[CDP] Debugger detached from tab ${source.tabId}: ${reason}`);
-    }
-});
-
-
-// ─── NETWORK LISTENING (HTTP Error Capture) ────────────────────────
-// Monitors medoraos.com/api requests for HTTP errors (status >= 400).
-// Stores the latest error so the AI can query it via read_network_status tool.
-
-/** @type {{ url: string, statusCode: number, method: string, timestamp: number, statusLine: string, type: string } | null} */
-let _latestNetworkError = null;
-
-/** @type {Array<{ url: string, statusCode: number, method: string, timestamp: number, statusLine: string }>} */
-let _networkErrorLog = [];
-const MAX_NETWORK_ERROR_LOG = 20;
-
-// Listen for completed requests with error status codes on medoraos.com API
-chrome.webRequest.onCompleted.addListener(
-    (details) => {
-        if (details.statusCode >= 400) {
-            const errorEntry = {
-                url: details.url,
-                statusCode: details.statusCode,
-                method: details.method,
-                timestamp: Date.now(),
-                statusLine: details.statusLine || `HTTP ${details.statusCode}`,
-                type: details.type || 'unknown',
-                tabId: details.tabId
-            };
-
-            _latestNetworkError = errorEntry;
-            _networkErrorLog.push(errorEntry);
-
-            // Keep log bounded
-            if (_networkErrorLog.length > MAX_NETWORK_ERROR_LOG) {
-                _networkErrorLog = _networkErrorLog.slice(-MAX_NETWORK_ERROR_LOG);
-            }
-
-            console.warn(`[Network] HTTP ${details.statusCode} on ${details.method} ${details.url}`);
-            sendLogToPanel(
-                `Network Error: ${details.method} ${details.url.split('?')[0]} → ${details.statusCode}`,
-                'warn'
-            );
-        }
-    },
-    { urls: ['*://*.medoraos.com/api/*', '*://*.medoraos.com/api*'] },
-    []
-);
-
-// Also listen for request errors (network failures, DNS errors, etc.)
-chrome.webRequest.onErrorOccurred.addListener(
-    (details) => {
-        const errorEntry = {
-            url: details.url,
-            statusCode: 0,
-            method: details.method,
-            timestamp: Date.now(),
-            statusLine: details.error || 'Network Error',
-            type: details.type || 'unknown',
-            tabId: details.tabId,
-            networkError: true
-        };
-
-        _latestNetworkError = errorEntry;
-        _networkErrorLog.push(errorEntry);
-
-        if (_networkErrorLog.length > MAX_NETWORK_ERROR_LOG) {
-            _networkErrorLog = _networkErrorLog.slice(-MAX_NETWORK_ERROR_LOG);
-        }
-
-        console.warn(`[Network] Request failed: ${details.method} ${details.url} — ${details.error}`);
-        sendLogToPanel(
-            `Network Failure: ${details.method} ${details.url.split('?')[0]} — ${details.error}`,
-            'error'
-        );
-    },
-    { urls: ['*://*.medoraos.com/api/*', '*://*.medoraos.com/api*'] },
-    []
-);
-
-/**
- * Returns the current network error status for the AI's read_network_status tool.
- * @returns {{ hasError: boolean, latestError: object|null, recentErrors: Array, errorCount: number }}
- */
-function getNetworkStatus() {
-    return {
-        hasError: _latestNetworkError !== null,
-        latestError: _latestNetworkError,
-        recentErrors: _networkErrorLog.slice(-5),
-        errorCount: _networkErrorLog.length
-    };
-}
-
-/**
- * Clears the network error state (called after AI acknowledges the error).
- */
-function clearNetworkErrors() {
-    _latestNetworkError = null;
-    _networkErrorLog = [];
-}
-
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -317,6 +19,11 @@ let lastAgentHistory = [];
 let lastAgentPrompt = '';
 let lastAgentStartUrl = '';
 let currentPlanSteps = []; // Enhancement 1: Plan steps for tracking
+
+// ─── HUMAN-IN-THE-LOOP STATE ───────────────────────────────────
+let humanResponseResolver = null;   // Promise resolver for awaiting human input
+let isAwaitingHuman = false;        // Whether the agent is paused waiting for human response
+let lastAskUserContext = null;      // Context of the last ask_user action (for resuming)
 
 // Load persisted state on startup (Manifest V3 service worker may have restarted)
 chrome.storage.local.get(['lastAgentHistory', 'lastAgentPrompt', 'lastAgentStartUrl'], (result) => {
@@ -370,6 +77,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'STOP_AGENT') {
         isRunning = false;
+        // If agent is awaiting human input, resolve the promise to unblock the loop
+        if (humanResponseResolver) {
+            humanResponseResolver('stop');
+            humanResponseResolver = null;
+        }
+        isAwaitingHuman = false;
+        lastAskUserContext = null;
         sendResponse({ status: 'stopped' });
         return true;
     }
@@ -408,67 +122,100 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
-    // ─── CDP HARDWARE CLICK (via ref_id from accessibility tree) ──
-    if (message.type === 'CDP_CLICK') {
-        const { ref_id, x, y, tabId: targetTabId } = message.payload || {};
-        const clickTabId = targetTabId || currentTabId;
+    // ─── HUMAN-IN-THE-LOOP RESPONSE ────────────────────────────────
+    // When the user provides a response to an ask_user prompt from the panel
+    if (message.type === 'HUMAN_RESPONSE') {
+        const responseText = message.payload?.response || '';
+        sendLogToPanel(`👤 Human response: ${responseText}`, 'success');
 
-        (async () => {
-            try {
-                let result;
-                if (ref_id) {
-                    // Click by ref_id — resolve coordinates from content script
-                    result = await executeRefClick(clickTabId, ref_id);
-                } else if (x !== undefined && y !== undefined) {
-                    // Direct coordinate click via CDP
-                    result = await executeHardwareClick(clickTabId, x, y);
-                } else {
-                    result = { success: false, error: 'CDP_CLICK requires ref_id or x/y coordinates' };
-                }
-                sendResponse(result);
-            } catch (e) {
-                sendResponse({ success: false, error: e.message });
-            }
-        })();
+        if (humanResponseResolver) {
+            // Resolve the pending promise in the agent loop
+            humanResponseResolver(responseText);
+            humanResponseResolver = null;
+            isAwaitingHuman = false;
+        } else {
+            sendLogToPanel('Warning: Received human response but agent was not waiting.', 'warn');
+        }
+        sendResponse({ status: 'received' });
         return true;
     }
 
-    // ─── CDP DETACH (cleanup debugger from tab) ──────────────────
-    if (message.type === 'CDP_DETACH') {
-        const targetTabId = message.payload?.tabId || currentTabId;
-        (async () => {
-            await detachDebugger(targetTabId);
-            sendResponse({ success: true });
-        })();
+    // ─── MAIN WORLD EVENT SIMULATION ───
+    // Content scripts run in an ISOLATED world where dispatched events have
+    // isTrusted:false. React/CMDK/Radix ignores these. This handler uses
+    // chrome.scripting.executeScript with world:'MAIN' to run code in the
+    // page's own JS context — CSP-proof and framework-compatible.
+    if (message.type === 'SIMULATE_KEY_MAIN_WORLD') {
+        const tabId = sender.tab?.id;
+        if (!tabId) { sendResponse({ success: false }); return true; }
+
+        const { selector, key, code, keyCode } = message.payload;
+        chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            func: (sel, k, c, kc) => {
+                try {
+                    const el = sel ? document.querySelector(sel) : document.activeElement;
+                    if (!el) return false;
+                    el.focus();
+                    el.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: k, code: c, keyCode: kc, which: kc,
+                        bubbles: true, cancelable: true, composed: true
+                    }));
+                    el.dispatchEvent(new KeyboardEvent('keypress', {
+                        key: k, code: c, keyCode: kc, which: kc,
+                        bubbles: true, cancelable: true, composed: true
+                    }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', {
+                        key: k, code: c, keyCode: kc, which: kc,
+                        bubbles: true, cancelable: true, composed: true
+                    }));
+                    return true;
+                } catch (e) { return false; }
+            },
+            args: [selector, key, code, keyCode]
+        }).then(results => {
+            sendResponse({ success: results?.[0]?.result === true });
+        }).catch(err => {
+            sendResponse({ success: false, error: err.message });
+        });
         return true;
     }
 
-    // ─── READ NETWORK STATUS (AI tool: read_network_status) ──────
-    if (message.type === 'READ_NETWORK_STATUS') {
-        const status = getNetworkStatus();
-        sendResponse(status);
-        return true;
-    }
+    if (message.type === 'SIMULATE_CLICK_MAIN_WORLD') {
+        const tabId = sender.tab?.id;
+        if (!tabId) { sendResponse({ success: false }); return true; }
 
-    // ─── CLEAR NETWORK ERRORS ────────────────────────────────────
-    if (message.type === 'CLEAR_NETWORK_ERRORS') {
-        clearNetworkErrors();
-        sendResponse({ success: true });
-        return true;
-    }
-
-    // ─── BUILD ACCESSIBILITY TREE (proxy to content script) ──────
-    if (message.type === 'GET_A11Y_TREE') {
-        const targetTabId = message.payload?.tabId || currentTabId;
-        (async () => {
-            try {
-                await injectContentScript(targetTabId);
-                const result = await executeContentScript(targetTabId, 'BUILD_A11Y_TREE', null, 3);
-                sendResponse(result || { success: false, error: 'No response from content script' });
-            } catch (e) {
-                sendResponse({ success: false, error: e.message });
-            }
-        })();
+        const { selector } = message.payload;
+        chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            func: (sel) => {
+                try {
+                    const el = sel ? document.querySelector(sel) : null;
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const x = rect.x + rect.width / 2;
+                    const y = rect.y + rect.height / 2;
+                    const opts = {
+                        bubbles: true, cancelable: true, composed: true, view: window,
+                        clientX: x, clientY: y, screenX: x, screenY: y,
+                        button: 0, buttons: 1
+                    };
+                    el.dispatchEvent(new PointerEvent('pointerdown', opts));
+                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                    el.dispatchEvent(new PointerEvent('pointerup', opts));
+                    el.dispatchEvent(new MouseEvent('mouseup', opts));
+                    el.dispatchEvent(new MouseEvent('click', opts));
+                    return true;
+                } catch (e) { return false; }
+            },
+            args: [selector]
+        }).then(results => {
+            sendResponse({ success: results?.[0]?.result === true });
+        }).catch(err => {
+            sendResponse({ success: false, error: err.message });
+        });
         return true;
     }
 });
@@ -718,22 +465,14 @@ async function detectNewTabAfterClick(tabCountBefore) {
 // threshold since scrolling multiple times in long forms is normal.
 function checkForLoop(decision, actionRetryCount, lastActionKey) {
     const actionType = decision.action || '';
+    let actionId = '';
 
-    // Use a stable identifier for this action. For DB queries, the SQL string must be part of the key
-    // so different queries don't get treated as the same action.
-    let actionId = decision.selector || decision.ref_id || decision.url;
-
-    if (actionType === 'query_database') {
-        // Allow multiple different SQL queries in the same run.
-        // Use a short prefix to keep the key bounded.
-        actionId = decision.sql ? decision.sql.substring(0, 50) : 'empty_sql';
-    } else if (['click', 'type', 'hover'].includes(actionType)) {
-        // Include text_match in action key so semantic-targeted actions are tracked
-        actionId = decision.text_match || decision.selector || actionId || '';
+    if (['click', 'type', 'hover'].includes(actionType)) {
+        actionId = decision.selector || '';
     } else if (actionType === 'select_option') {
-        actionId = decision.option || decision.text_match || actionId || '';
+        actionId = decision.option || '';
     } else if (actionType === 'navigate') {
-        actionId = decision.url || actionId || '';
+        actionId = decision.url || '';
     } else if (actionType === 'scroll_down' || actionType === 'scroll_up') {
         // FIXED: Include selector so different scroll targets are tracked separately
         // scroll_down on form ≠ scroll_down on body ≠ scroll_down on modal
@@ -741,7 +480,6 @@ function checkForLoop(decision, actionRetryCount, lastActionKey) {
     }
 
     const actionKey = actionType + '_' + actionId;
-
 
     // Dynamic retry threshold: scroll actions get more retries since
     // long forms/modals legitimately need multiple scrolls to reach the bottom
@@ -940,7 +678,9 @@ async function agentLoop(prompt, tabId, planSteps = []) {
     let lastActionKey = '';           // Last action key for loop detection
     let totalScrollAttempts = 0;     // Track ALL scroll attempts across targets
     let failedActionCount = 0;       // Consecutive failures
+    let apiTimeoutCount = 0;         // Separate counter for API timeouts (not agent logic failures)
     const maxFailedActions = 3;
+    const maxApiTimeouts = 5;        // Allow more retries for API timeouts (infrastructure issue)
     let lastObservedElements = [];    // Cache for element resolution
     let lastSomMap = {};              // SoM index to selector mapping
     let lastActionFailed = false;     // Did the previous action fail?
@@ -970,8 +710,9 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // 2. HYBRID MODE: DOM-primary with Vision-on-demand
                 // Vision is only triggered when the agent is confused/stuck
+                // IMPORTANT: After API timeouts, skip vision to reduce payload size
                 let observeResult = null;
-                let useVision = shouldUseVision(step, failedActionCount, lastActionFailed, actionHistory, lastPageUrl);
+                let useVision = apiTimeoutCount === 0 && shouldUseVision(step, failedActionCount, lastActionFailed, actionHistory, lastPageUrl);
 
                 // Get current tab URL
                 let currentTabUrl = '';
@@ -984,8 +725,8 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 const pageChanged = currentTabUrl !== lastPageUrl && lastPageUrl !== '';
                 if (currentTabUrl) lastPageUrl = currentTabUrl;
 
-                // Also trigger vision on page navigation
-                if (pageChanged) useVision = true;
+                // Also trigger vision on page navigation (but NOT if we're retrying after API timeout)
+                if (pageChanged && apiTimeoutCount === 0) useVision = true;
 
                 if (useVision) {
                     // VISION MODE: Capture screenshot + elements (slower but visual)
@@ -1083,7 +824,9 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 }
 
                 // 3. Build state payload for backend brain
-                const sliceCount = Math.min(Math.max(observeResult.elements.length, 60), observeResult.elements.length);
+                // Fix: Properly limit to a maximum of 60 elements to prevent API timeouts
+                const MAX_ELEMENTS = 60;
+                const sliceCount = Math.min(observeResult.elements.length, MAX_ELEMENTS);
 
                 // Build dropdown state info for the AI
                 // CRITICAL: Include ALL select elements, even those with placeholder/default values
@@ -1146,7 +889,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 try {
                     sendLogToPanel('Thinking... (waiting for AI response)', 'info');
                     const controller = new AbortController();
-                    const apiTimeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
+                    const apiTimeout = setTimeout(() => controller.abort(), 90000); // 90s timeout (complex pages need more AI processing time)
                     const response = await fetch(API_URL, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -1154,6 +897,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         signal: controller.signal
                     });
                     clearTimeout(apiTimeout);
+                    apiTimeoutCount = 0; // Reset timeout counter on successful response
 
                     if (!response.ok) {
                         const text = await response.text();
@@ -1189,9 +933,22 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     aiDecision = responseData;
                 } catch (error) {
                     if (error.name === 'AbortError') {
-                        sendLogToPanel('AI API timed out after 60s. Retrying...', 'error');
-                        failedActionCount++;
+                        apiTimeoutCount++;
+                        sendLogToPanel(`AI API timed out after 90s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
+                        // API timeouts are infrastructure issues — use separate counter
+                        // Only count toward main failure counter if we've exhausted timeout retries
+                        if (apiTimeoutCount >= maxApiTimeouts) {
+                            failedActionCount = maxFailedActions; // Force stop
+                            sendLogToPanel(`AI API timed out ${maxApiTimeouts} times. Stopping agent.`, 'error');
+                        }
                         actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
+
+                        // SMART RETRY: After first timeout, strip the image from the payload
+                        // to reduce processing time. The AI can still work with DOM elements alone.
+                        if (observeResult && observeResult.image && apiTimeoutCount >= 1) {
+                            observeResult.image = null;
+                            sendLogToPanel('Stripped image from payload for faster retry (DOM-only mode)', 'info');
+                        }
                         continue;
                     }
                     sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
@@ -1200,6 +957,19 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // Consume post-popup directive (one-shot)
                 postPopupDirective = '';
+
+                // ── CONVERSATIONAL MESSAGE DISPLAY ──
+                // Always surface the agent's conversational message to the user
+                if (aiDecision.conversational_message) {
+                    sendLogToPanel(`🗣️ ${aiDecision.conversational_message}`, 'info');
+                    // Also send as a dedicated conversational message to the panel
+                    chrome.runtime.sendMessage({
+                        type: 'CONVERSATIONAL_MESSAGE',
+                        conversational_message: aiDecision.conversational_message,
+                        action: aiDecision.action,
+                        status: aiDecision.status || 'executing'
+                    }).catch(() => { });
+                }
 
                 sendLogToPanel(`AI thought: ${aiDecision.thought}`, 'info');
                 sendLogToPanel(`AI decided: ${aiDecision.action} on ${aiDecision.selector || ''}`, 'decision');
@@ -1290,104 +1060,160 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
-                // 7. Handle FINISH
+                // 7. Handle ASK_USER — pause loop and wait for human input
+                if (aiDecision.action === 'ask_user') {
+                    sendLogToPanel('⏸️ Agent is waiting for your input...', 'decision');
+                    historyEntry.actionSuccess = true;
+                    historyEntry.awaitingHuman = true;
+                    actionHistory.push(historyEntry);
+
+                    // Send the awaiting_human signal to the panel UI
+                    chrome.runtime.sendMessage({
+                        type: 'AWAITING_HUMAN',
+                        conversational_message: aiDecision.conversational_message || 'The agent needs your input.',
+                        ask_user_prompt: aiDecision.ask_user_prompt || 'Please provide the requested information:',
+                        sql_query: aiDecision.sql_query || null
+                    }).catch(() => { });
+
+                    // Pause the loop by awaiting a Promise that resolves when the user responds
+                    isAwaitingHuman = true;
+                    lastAskUserContext = {
+                        step: step,
+                        message: aiDecision.conversational_message,
+                        sql_query: aiDecision.sql_query || null
+                    };
+
+                    const humanResponse = await new Promise((resolve) => {
+                        humanResponseResolver = resolve;
+                        // Safety timeout: if no response in 10 minutes, auto-resume with 'skip'
+                        setTimeout(() => {
+                            if (humanResponseResolver === resolve) {
+                                sendLogToPanel('Human response timeout (10 min). Auto-skipping...', 'warn');
+                                resolve('skip');
+                            }
+                        }, 600000);
+                    });
+
+                    isAwaitingHuman = false;
+                    lastAskUserContext = null;
+                    sendLogToPanel(`Received human response: "${humanResponse}". Resuming agent...`, 'success');
+
+                    // Inject the human's response as a directive for the next AI turn
+                    postPopupDirective = `HUMAN RESPONSE RECEIVED: The user replied: "${humanResponse}". `
+                        + `Use this information to proceed. If the user provided a direct value, `
+                        + `use batch_fill or type to enter it into the correct field(s). `
+                        + `If the user said "run query" or "yes", execute the query_database action `
+                        + `with the previously suggested SQL. If the user said "skip", move on to the next field or step.`;
+
+                    // Record the human response in history
+                    actionHistory.push({
+                        step: step + 1,
+                        action: 'human_response',
+                        thought: 'Human provided input',
+                        humanResponse: humanResponse,
+                        actionSuccess: true
+                    });
+
+                    // Reset failure counters since human interaction breaks the failure chain
+                    failedActionCount = 0;
+                    lastActionFailed = false;
+                    lastActionError = '';
+                    continue;
+                }
+
+                // 7a. Handle QUERY_DATABASE — display SQL query conversationally
+                if (aiDecision.action === 'query_database') {
+                    sendLogToPanel('🔍 Agent is requesting a database query...', 'decision');
+                    const sqlQuery = aiDecision.sql_query || 'No SQL query provided';
+                    sendLogToPanel(`SQL Query: ${sqlQuery}`, 'info');
+                    historyEntry.actionSuccess = true;
+                    historyEntry.sqlQuery = sqlQuery;
+                    actionHistory.push(historyEntry);
+
+                    // For now, surface the query to the user and ask them to provide results
+                    // In future, this could call a backend endpoint to execute the query
+                    chrome.runtime.sendMessage({
+                        type: 'AWAITING_HUMAN',
+                        conversational_message: aiDecision.conversational_message || 'Please run this database query and provide the results:',
+                        ask_user_prompt: `Please run this query and paste the results (or type the values directly):\n${sqlQuery}`,
+                        sql_query: sqlQuery
+                    }).catch(() => { });
+
+                    isAwaitingHuman = true;
+                    const queryResponse = await new Promise((resolve) => {
+                        humanResponseResolver = resolve;
+                        setTimeout(() => {
+                            if (humanResponseResolver === resolve) {
+                                sendLogToPanel('Query response timeout (10 min). Auto-skipping...', 'warn');
+                                resolve('skip');
+                            }
+                        }, 600000);
+                    });
+
+                    isAwaitingHuman = false;
+                    sendLogToPanel(`Received query response: "${queryResponse}". Resuming...`, 'success');
+
+                    postPopupDirective = `DATABASE QUERY RESPONSE: The user provided these results for the SQL query: "${queryResponse}". `
+                        + `Parse the response data and use batch_fill or type actions to fill the relevant form fields. `
+                        + `If the response says "no results" or "not found", ask the user for manual input via ask_user.`;
+
+                    actionHistory.push({
+                        step: step + 1,
+                        action: 'query_database_response',
+                        thought: 'User provided database query results',
+                        humanResponse: queryResponse,
+                        sqlQuery: sqlQuery,
+                        actionSuccess: true
+                    });
+
+                    failedActionCount = 0;
+                    lastActionFailed = false;
+                    lastActionError = '';
+                    continue;
+                }
+
+                // 7b. Handle FINISH
                 if (aiDecision.action === 'finish') {
                     sendLogToPanel(`Agent finished: ${aiDecision.summary}`, 'decision');
                     actionHistory.push(historyEntry);
                     break;
                 }
 
-                // 7-DB. Handle QUERY_DATABASE — Text-to-SQL tool execution
-                if (aiDecision.action === 'query_database' && aiDecision.sql) {
-                    sendLogToPanel(`Executing SQL: ${aiDecision.sql.slice(0, 120)}...`, 'info');
-                    try {
-                        const dbResponse = await fetch(QUERY_DB_URL, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                            body: JSON.stringify({ sql: aiDecision.sql })
-                        });
-                        const dbData = await dbResponse.json();
-
-                        if (dbData.success) {
-                            sendLogToPanel(`DB query returned ${dbData.rowCount} row(s)`, 'success');
-                            historyEntry.actionSuccess = true;
-                            historyEntry.dbResult = dbData.data;
-                            historyEntry.dbRowCount = dbData.rowCount;
-                            // Inject results into AI's next turn context
-                            postPopupDirective = 'DATABASE QUERY RESULT:\n'
-                                + JSON.stringify(dbData.data, null, 2)
-                                + '\nAnalyze the validation errors on screen, cross-reference this data, '
-                                + 'and fill ONLY the missing fields using text_match or selector. '
-                                + 'Do NOT alter fields that already have valid data.';
-                            failedActionCount = 0;
-                            lastActionFailed = false;
-                            lastActionError = '';
-                        } else {
-                            sendLogToPanel(`DB query failed: ${dbData.error}`, 'error');
-                            historyEntry.actionSuccess = false;
-                            historyEntry.dbError = dbData.error;
-                            // Inject error so AI can self-heal the SQL
-                            postPopupDirective = 'DATABASE QUERY FAILED:\n'
-                                + dbData.error
-                                + '\nRewrite your SQL query to fix the syntax error and try again. '
-                                + 'Common issues: wrong table/column names, missing quotes, invalid JOINs.';
-                            // Don't increment failedActionCount — let AI retry the query
-                            failedActionCount = 0;
-                            lastActionFailed = true;
-                            lastActionError = dbData.error;
-                        }
-                    } catch (e) {
-                        sendLogToPanel(`DB query network error: ${e.message}`, 'error');
-                        historyEntry.actionSuccess = false;
-                        historyEntry.dbError = e.message;
-                        postPopupDirective = 'DATABASE QUERY NETWORK ERROR: ' + e.message
-                            + '\nThe backend server may be down. Try again or proceed with manual data entry.';
-                        failedActionCount = 0;
-                    }
-                    actionHistory.push(historyEntry);
-                    continue;
-                }
-
-                // 7a. Handle ACTION_SEQUENCE
+                // 7c. Handle ACTION_SEQUENCE (Gap B: Multi-Action Chaining)
                 if (aiDecision.action === 'action_sequence' && aiDecision.actions && aiDecision.actions.length > 0) {
                     sendLogToPanel(`Action sequence (${aiDecision.actions.length} actions)...`, 'info');
                     let seqSuccess = 0;
                     const seqResults = [];
-                    let seqAborted = false;
                     for (const subAction of aiDecision.actions.slice(0, 5)) {
-                        // Semantic target pre-flight: if sub-action uses text_match,
-                        // verify the target exists before executing. Abort on failure.
-                        if (subAction.text_match) {
-                            const resolveResult = await executeContentScript(
-                                currentTabId, 'RESOLVE_SEMANTIC_TARGET',
-                                { text_match: subAction.text_match, role_hint: subAction.role_hint || '', timeout: 1500 }, 2
-                            );
-                            if (!resolveResult || !resolveResult.found) {
-                                seqResults.push({
-                                    action: subAction.action,
-                                    text_match: subAction.text_match,
-                                    success: false,
-                                    error: `Semantic target not found: "${subAction.text_match}"`
-                                });
-                                sendLogToPanel(`Sequence aborted: text_match "${subAction.text_match}" not found`, 'warn');
-                                postPopupDirective = `Target with text_match '${subAction.text_match}' not found. `
-                                    + `The API request may be delayed, or the menu is closed. `
-                                    + `Re-evaluate the page state and retry as a single action.`;
-                                seqAborted = true;
-                                break;
-                            }
+                        // Guard: skip sub-actions with missing selectors (except navigate/extract/scroll)
+                        const selectorOptional = ['navigate', 'extract', 'scroll_down', 'scroll_up', 'keyboard_event'];
+                        if (!subAction.selector && !selectorOptional.includes(subAction.action)) {
+                            seqResults.push({ action: subAction.action, selector: null, success: false, error: 'Missing selector' });
+                            sendLogToPanel(`Sequence step skipped: ${subAction.action} has no selector`, 'warn');
+                            break;
                         }
                         const subResult = await executeContentScript(currentTabId, 'EXECUTE_ACTION', subAction);
                         if (subResult && subResult.success) {
                             seqSuccess++;
                             if (subAction.selector) clickedSelectors.push(subAction.selector);
-                            seqResults.push({ action: subAction.action, selector: subAction.selector, text_match: subAction.text_match, success: true });
+                            seqResults.push({ action: subAction.action, selector: subAction.selector, success: true, extraData: subResult });
                         } else {
-                            seqResults.push({ action: subAction.action, selector: subAction.selector, text_match: subAction.text_match, success: false, error: subResult?.error });
-                            sendLogToPanel(`Sequence step failed: ${subAction.action} on ${subAction.selector || subAction.text_match}`, 'warn');
+                            seqResults.push({ action: subAction.action, selector: subAction.selector, success: false, error: subResult?.error });
+                            sendLogToPanel(`Sequence step failed: ${subAction.action} on ${subAction.selector}`, 'warn');
                             break;
                         }
-                        await sleep(200);
+                        // ═══ FIX: Dynamic wait between sequence actions ═══
+                        // Combobox/dropdown interactions need much more time because the content
+                        // script now performs the full cycle: open → type → wait → click option → wait for close.
+                        // Using a short 200ms wait caused cross-contamination between dropdowns.
+                        const isDropdownAction = ['type', 'select_option'].includes(subAction.action) &&
+                            (subResult?.isComboboxTrigger || subResult?.isCombobox || subResult?.autoSelectedDropdown);
+                        const interActionDelay = isDropdownAction ? 800 : 300;
+                        await sleep(interActionDelay);
+                        // Additionally wait for page stability after dropdown actions
+                        if (isDropdownAction) {
+                            await waitForStability(currentTabId, 1000);
+                        }
                     }
                     historyEntry.actionSuccess = seqSuccess > 0;
                     historyEntry.sequenceResults = seqResults;
@@ -1401,7 +1227,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
-                // 7b. Handle BATCH_FILL — fill multiple form fields in one step
+                // 7d. Handle BATCH_FILL — fill multiple form fields in one step
                 if (aiDecision.action === 'batch_fill' && aiDecision.fields && aiDecision.fields.length > 0) {
                     sendLogToPanel(`Batch filling ${aiDecision.fields.length} fields...`, 'info');
                     const batchResult = await executeContentScript(currentTabId, 'BATCH_FILL', { fields: aiDecision.fields }, 3);
@@ -1525,6 +1351,62 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                             if (clickedText.includes('add to cart') || clickedText.includes('add to bag') || clickedText.includes('buy now')) {
                                 historyEntry.isCartAction = true;
                                 postPopupDirective = 'VERIFY: You clicked "Add to Cart". Next step: check if cart confirmation appeared (popup, badge, redirect). If cart empty or no confirmation, the action FAILED — retry differently.';
+                            }
+
+                            // ── POST-SAVE EXCEPTION HANDLING ──
+                            // Detect clicks on Save/Submit buttons and check for new validation errors
+                            const isSaveClick = clickedText.includes('save') || clickedText.includes('submit')
+                                || clickedText.includes('update') || clickedText.includes('confirm');
+                            if (isSaveClick) {
+                                historyEntry.isSaveAction = true;
+                                sendLogToPanel('Save/Submit button clicked — checking for post-save errors...', 'info');
+
+                                // Wait for potential error messages to render
+                                await waitForStability(currentTabId, 3000);
+
+                                // Re-observe the page to check for new error elements
+                                const postSaveObserve = await executeContentScript(currentTabId, 'OBSERVE');
+                                if (postSaveObserve && postSaveObserve.elements) {
+                                    // Look for error indicators in the DOM
+                                    const errorElements = postSaveObserve.elements.filter(el => {
+                                        const text = (el.text || '').toLowerCase();
+                                        const cls = (el.className || '').toLowerCase();
+                                        const role = (el.role || '').toLowerCase();
+                                        return (
+                                            text.includes('error') || text.includes('invalid') ||
+                                            text.includes('required') || text.includes('must be') ||
+                                            text.includes('cannot be') || text.includes('is not valid') ||
+                                            cls.includes('error') || cls.includes('invalid') ||
+                                            cls.includes('validation') || cls.includes('alert-danger') ||
+                                            role === 'alert'
+                                        );
+                                    });
+
+                                    if (errorElements.length > 0) {
+                                        const errorTexts = errorElements
+                                            .map(el => el.text || el.ariaLabel || '')
+                                            .filter(t => t.length > 0)
+                                            .slice(0, 10)
+                                            .join('; ');
+
+                                        historyEntry.postSaveErrors = errorTexts;
+                                        sendLogToPanel(`⚠️ Post-save errors detected (${errorElements.length}): ${errorTexts.slice(0, 200)}`, 'error');
+
+                                        postPopupDirective = `POST-SAVE ERROR DETECTED: After clicking Save/Submit, ${errorElements.length} error(s) appeared on the page: `
+                                            + `"${errorTexts.slice(0, 500)}". `
+                                            + `DO NOT call finish. DO NOT ignore these errors. `
+                                            + `You MUST re-enter the conversational loop: summarize these new errors to the user `
+                                            + `using an ask_user action, suggest SQL query lookups or manual data entry, `
+                                            + `and wait for the human to provide corrected values before attempting to save again.`;
+                                    } else {
+                                        // No errors detected — check if page changed (success indicator)
+                                        const pageUrlNow = postSaveObserve.url || '';
+                                        sendLogToPanel('No post-save errors detected. Save may have succeeded.', 'success');
+                                        postPopupDirective = `SAVE CLICKED SUCCESSFULLY: No visible error messages after saving. `
+                                            + `Verify: (1) Did a success toast/message appear? (2) Did the modal close? (3) Did the URL change? `
+                                            + `If confirmed successful, call finish with a summary. If unsure, observe one more turn.`;
+                                    }
+                                }
                             }
                         }
 
@@ -1695,6 +1577,13 @@ async function agentLoop(prompt, tabId, planSteps = []) {
     } finally {
         // ── GUARANTEE: AGENT_DONE always fires, even on crash ──
         isRunning = false;
+        // Reset human-in-the-loop state
+        if (humanResponseResolver) {
+            humanResponseResolver('stop');
+            humanResponseResolver = null;
+        }
+        isAwaitingHuman = false;
+        lastAskUserContext = null;
         lastAgentHistory = actionHistory;
         chrome.storage.local.set({
             lastAgentHistory: actionHistory,

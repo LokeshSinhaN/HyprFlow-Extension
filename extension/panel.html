@@ -630,6 +630,20 @@
      <button id="rejectPlanBtn" style="background: #1a1a1a; color: #ef4444; border: 1px solid #262626;">Reject & Retry</button>
   </div>
 
+  <div id="hitlContainer" style="display: none; margin-top: 10px; padding: 12px; background: #1e1e1e; border: 1px solid #3b82f6; border-radius: 8px;">
+    <div style="font-size: 12px; color: #60a5fa; margin-bottom: 8px; font-weight: bold;">Agent Question:</div>
+    <div id="hitlMessage" style="font-size: 13px; margin-bottom: 12px; color: #e5e5e5; line-height: 1.4;"></div>
+    <div id="hitlSqlContainer" style="display:none; margin-bottom: 12px; padding: 8px; background: #000; border-radius: 4px; font-family: monospace; font-size: 11px; color: #a3a3a3;"></div>
+    
+    <div class="btn-row" style="margin-bottom: 8px;">
+        <button id="hitlQueryDbBtn" style="background: #059669;">Query Database</button>
+    </div>
+    <div style="display: flex; gap: 8px;">
+        <input type="text" id="hitlManualInput" placeholder="Or type value manually..." style="flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #262626; background: #0a0a0a; color: white;">
+        <button id="hitlSubmitManualBtn" style="padding: 8px 12px; background: #2563eb; border: none; border-radius: 6px; color: white; cursor:pointer;">Submit</button>
+    </div>
+</div>
+
   <div class="status-bar" id="statusBar">
     <div class="status-dot"></div>
     <span id="statusText">Agent is running...</span>
