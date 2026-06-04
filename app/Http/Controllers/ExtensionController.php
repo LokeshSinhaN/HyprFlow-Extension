@@ -70,6 +70,9 @@ class ExtensionController extends Controller
             $siteKnowledgeBlock = $this->siteKnowledge->buildKnowledgeBlock($url);
         }
 
+        // Database Schema Intelligence
+        $dbSchemaBlock = $this->getDatabaseSchema();
+
         // Enhancement 2: Reflexion
         $reflexionBlock = '';
         if (config('automation.reflexion_enabled', true)) {
@@ -104,6 +107,9 @@ class ExtensionController extends Controller
 
         // Gap A: System prompt (static, cacheable)
         $systemPrompt = config('automation.system_prompt_separation', true) ? $this->buildSystemPrompt() : null;
+        if ($systemPrompt) {
+            $systemPrompt = str_replace('{{DATABASE_SCHEMA_PLACEHOLDER}}', $dbSchemaBlock, $systemPrompt);
+        }
 
         // Dynamic user prompt
         $userPrompt = "{$modeIndicator}\n{$somDescription}\nGoal: {$prompt}\n{$planContext}\n{$popupDirectiveBlock}\n{$reflexionBlock}\n{$siteKnowledgeBlock}\n{$dropdownStatesBlock}\n{$comboboxStatesBlock}\n{$formFieldStatus}\n{$sopProgressBlock}\n{$multiActionBlock}\n\n# CURRENT STATE\nURL: {$url}\nElements:\n{$pageInfo}\n\n# ACTION HISTORY\n{$historyJson}\n\n# CLICKED ELEMENTS:\n{$clickedList}\n\n# BLOCKED SELECTORS:\n{$blockedList}\n\n# TOGGLE STATE:\n{$toggleStateInfo}";
@@ -598,6 +604,61 @@ SYSTEM;
         if ($stag) $block .= "⚠️ STAGNATING: No new progress. SUBMIT NOW or call finish.\n";
         elseif ($rate == 0 && $step > 5) $block .= "⚠️ No new fields recently. Consider submitting.\n";
         return $block;
+    }
+
+    private function getDatabaseSchema(): string
+    {
+        return <<<SCHEMA
+# ═══════════════════════════════════════════════════════════════════════
+# DATABASE SCHEMA INTELLIGENCE (PostgreSQL)
+# ═══════════════════════════════════════════════════════════════════════
+Use this schema to construct your `sql_query` when using the `query_database` action.
+Do NOT invent columns. Strictly use the following tables and columns:
+
+**Table: `patients`**
+- `id` (int8)
+- `first_name` (varchar)
+- `last_name` (varchar)
+- `middle_name` (varchar)
+- `suffix` (varchar)
+- `gender` (varchar)
+- `date_of_birth` (date)
+- `phone` (varchar)
+- `address_line_2` (varchar)
+- `city` (varchar)
+- `state` (varchar)
+- `zip_code` (varchar)
+- `country` (varchar)
+
+**Table: `organizations`**
+- `id` (int8)
+- `name` (varchar)
+- `npi` (varchar)
+- `addr` (varchar)
+- `phone` (varchar)
+
+**Table: `payers`**
+- `id` (int8)
+- `name` (varchar)
+- `insurance_policy_number` (varchar)
+
+**Table: `claims`**
+- `id` (int8)
+- `patient_id` (int8)
+- `organization_id` (int8)
+- `payer_id` (int8)
+- `primary_payer_id` (int8)
+- `claim_status` (varchar)
+- `service_date` (date)
+- `charge_amount` (numeric)
+- `c.procedure_code` (varchar)
+- `control_number` (varchar)
+
+**QUERY USAGE RULES:**
+- When querying for an organization's NPI, use: `SELECT npi FROM organizations WHERE name LIKE '%...%'`
+- When querying for a patient's details, join with organizations if needed: `SELECT p.first_name, p.last_name, o.npi FROM patients p JOIN organizations o ON p.organization_id = o.id WHERE p.last_name = '...'`
+- You may only execute `SELECT` queries. NEVER execute `INSERT`, `UPDATE`, or `DELETE`.
+SCHEMA;
     }
 
     /**

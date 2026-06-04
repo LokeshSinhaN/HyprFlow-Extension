@@ -1122,51 +1122,64 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
-                // 7a. Handle QUERY_DATABASE — Execute Text-to-SQL against Laravel Backend
+                // 7a. Handle QUERY_DATABASE — Execute Text-to-SQL with 3x Auto-Retry
                 if (aiDecision.action === 'query_database') {
                     sendLogToPanel('🔍 Executing automated database query...', 'decision');
                     const sqlQuery = aiDecision.sql_query || aiDecision.sql || '';
                     sendLogToPanel(`SQL Query: ${sqlQuery.slice(0, 120)}`, 'info');
                     
-                    try {
-                        const dbResponse = await fetch(QUERY_DB_URL, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                            body: JSON.stringify({ sql: sqlQuery })
-                        });
-                        const dbData = await dbResponse.json();
+                    let dbSuccess = false;
+                    let dbData = null;
+                    let lastError = '';
 
-                        if (dbData.success) {
-                            sendLogToPanel(`DB query returned ${dbData.rowCount} row(s)`, 'success');
-                            historyEntry.actionSuccess = true;
-                            historyEntry.dbResult = dbData.data;
-                            historyEntry.sqlQuery = sqlQuery;
-                            
-                            postPopupDirective = 'DATABASE QUERY RESULT:\n'
-                                + JSON.stringify(dbData.data, null, 2)
-                                + '\nParse this data immediately. '
-                                + 'If targeting a text box, use batch_fill or type. '
-                                + 'If targeting a searchable dropdown/combobox, use type to search, then click the option in the next turn.';
-                                
-                            failedActionCount = 0;
-                            lastActionFailed = false;
-                            lastActionError = '';
-                        } else {
-                            sendLogToPanel(`DB query failed: ${dbData.error}`, 'error');
-                            historyEntry.actionSuccess = false;
-                            historyEntry.sqlQuery = sqlQuery;
-                            
-                            postPopupDirective = 'DATABASE QUERY FAILED:\n'
-                                + dbData.error
-                                + '\nRewrite your SQL query to fix the syntax error, or use ask_user to request manual input from the human.';
-                            
-                            lastActionFailed = true;
-                            lastActionError = dbData.error;
+                    // Try to fetch data up to 3 times
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        if (attempt > 1) sendLogToPanel(`Database retry attempt ${attempt}/3...`, 'warn');
+                        try {
+                            const dbResponse = await fetch(QUERY_DB_URL, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                                body: JSON.stringify({ sql: sqlQuery })
+                            });
+                            const tempDbData = await dbResponse.json();
+
+                            if (tempDbData.success && tempDbData.rowCount > 0) {
+                                dbSuccess = true;
+                                dbData = tempDbData;
+                                break;
+                            } else {
+                                lastError = tempDbData.error || 'Query executed but returned 0 rows';
+                            }
+                        } catch (e) {
+                            lastError = e.message;
                         }
-                    } catch (e) {
-                        sendLogToPanel(`DB query network error: ${e.message}`, 'error');
+                        if (!dbSuccess && attempt < 3) await sleep(1500); // wait before retry
+                    }
+
+                    if (dbSuccess) {
+                        sendLogToPanel(`DB query returned ${dbData.rowCount} row(s)`, 'success');
+                        historyEntry.actionSuccess = true;
+                        historyEntry.dbResult = dbData.data;
+                        historyEntry.sqlQuery = sqlQuery;
+                        
+                        postPopupDirective = 'DATABASE QUERY SUCCESS:\n'
+                            + JSON.stringify(dbData.data, null, 2)
+                            + '\nAnalyze the data and apply it to the form. Ensure you target the correct field type (combobox vs text).';
+                            
+                        failedActionCount = 0;
+                        lastActionFailed = false;
+                        lastActionError = '';
+                    } else {
+                        sendLogToPanel(`DB query failed after 3 attempts: ${lastError}`, 'error');
                         historyEntry.actionSuccess = false;
-                        postPopupDirective = 'DATABASE QUERY NETWORK ERROR: ' + e.message + '. Ask the human to enter the data manually.';
+                        historyEntry.sqlQuery = sqlQuery;
+                        
+                        postPopupDirective = 'DATABASE QUERY FAILED AFTER 3 ATTEMPTS:\n'
+                            + lastError
+                            + '\nCRITICAL: Do NOT attempt to query the database again for these fields. You MUST use the `ask_user` action IMMEDIATELY to request the human to enter these missing values manually.';
+                        
+                        lastActionFailed = true;
+                        lastActionError = lastError;
                     }
                     
                     actionHistory.push(historyEntry);
