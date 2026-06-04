@@ -6,6 +6,7 @@ const API_URL = "http://127.0.0.1:8001/api/extension/loop";
 const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
+const QUERY_DB_URL = "http://127.0.0.1:8001/api/extension/query-database";
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -1121,54 +1122,54 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
-                // 7a. Handle QUERY_DATABASE — display SQL query conversationally
+                // 7a. Handle QUERY_DATABASE — Execute Text-to-SQL against Laravel Backend
                 if (aiDecision.action === 'query_database') {
-                    sendLogToPanel('🔍 Agent is requesting a database query...', 'decision');
-                    const sqlQuery = aiDecision.sql_query || 'No SQL query provided';
-                    sendLogToPanel(`SQL Query: ${sqlQuery}`, 'info');
-                    historyEntry.actionSuccess = true;
-                    historyEntry.sqlQuery = sqlQuery;
+                    sendLogToPanel('🔍 Executing automated database query...', 'decision');
+                    const sqlQuery = aiDecision.sql_query || aiDecision.sql || '';
+                    sendLogToPanel(`SQL Query: ${sqlQuery.slice(0, 120)}`, 'info');
+                    
+                    try {
+                        const dbResponse = await fetch(QUERY_DB_URL, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify({ sql: sqlQuery })
+                        });
+                        const dbData = await dbResponse.json();
+
+                        if (dbData.success) {
+                            sendLogToPanel(`DB query returned ${dbData.rowCount} row(s)`, 'success');
+                            historyEntry.actionSuccess = true;
+                            historyEntry.dbResult = dbData.data;
+                            historyEntry.sqlQuery = sqlQuery;
+                            
+                            postPopupDirective = 'DATABASE QUERY RESULT:\n'
+                                + JSON.stringify(dbData.data, null, 2)
+                                + '\nParse this data immediately. '
+                                + 'If targeting a text box, use batch_fill or type. '
+                                + 'If targeting a searchable dropdown/combobox, use type to search, then click the option in the next turn.';
+                                
+                            failedActionCount = 0;
+                            lastActionFailed = false;
+                            lastActionError = '';
+                        } else {
+                            sendLogToPanel(`DB query failed: ${dbData.error}`, 'error');
+                            historyEntry.actionSuccess = false;
+                            historyEntry.sqlQuery = sqlQuery;
+                            
+                            postPopupDirective = 'DATABASE QUERY FAILED:\n'
+                                + dbData.error
+                                + '\nRewrite your SQL query to fix the syntax error, or use ask_user to request manual input from the human.';
+                            
+                            lastActionFailed = true;
+                            lastActionError = dbData.error;
+                        }
+                    } catch (e) {
+                        sendLogToPanel(`DB query network error: ${e.message}`, 'error');
+                        historyEntry.actionSuccess = false;
+                        postPopupDirective = 'DATABASE QUERY NETWORK ERROR: ' + e.message + '. Ask the human to enter the data manually.';
+                    }
+                    
                     actionHistory.push(historyEntry);
-
-                    // For now, surface the query to the user and ask them to provide results
-                    // In future, this could call a backend endpoint to execute the query
-                    chrome.runtime.sendMessage({
-                        type: 'AWAITING_HUMAN',
-                        conversational_message: aiDecision.conversational_message || 'Please run this database query and provide the results:',
-                        ask_user_prompt: `Please run this query and paste the results (or type the values directly):\n${sqlQuery}`,
-                        sql_query: sqlQuery
-                    }).catch(() => { });
-
-                    isAwaitingHuman = true;
-                    const queryResponse = await new Promise((resolve) => {
-                        humanResponseResolver = resolve;
-                        setTimeout(() => {
-                            if (humanResponseResolver === resolve) {
-                                sendLogToPanel('Query response timeout (10 min). Auto-skipping...', 'warn');
-                                resolve('skip');
-                            }
-                        }, 600000);
-                    });
-
-                    isAwaitingHuman = false;
-                    sendLogToPanel(`Received query response: "${queryResponse}". Resuming...`, 'success');
-
-                    postPopupDirective = `DATABASE QUERY RESPONSE: The user provided these results for the SQL query: "${queryResponse}". `
-                        + `Parse the response data and use batch_fill or type actions to fill the relevant form fields. `
-                        + `If the response says "no results" or "not found", ask the user for manual input via ask_user.`;
-
-                    actionHistory.push({
-                        step: step + 1,
-                        action: 'query_database_response',
-                        thought: 'User provided database query results',
-                        humanResponse: queryResponse,
-                        sqlQuery: sqlQuery,
-                        actionSuccess: true
-                    });
-
-                    failedActionCount = 0;
-                    lastActionFailed = false;
-                    lastActionError = '';
                     continue;
                 }
 

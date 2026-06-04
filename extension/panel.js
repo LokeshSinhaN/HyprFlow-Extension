@@ -8,16 +8,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Listen for messages from background.js
     chrome.runtime.onMessage.addListener((message) => {
-        if (message.type === 'SHOW_HITL_UI') {
-            hitlMessage.textContent = message.payload.message;
-            if (message.payload.sql) {
-                hitlSqlContainer.textContent = message.payload.sql;
+        // Fix: Listen for AWAITING_HUMAN instead of SHOW_HITL_UI
+        if (message.type === 'AWAITING_HUMAN') {
+            
+            // Format the message using the new payload structure from background.js
+            let displayMsg = message.conversational_message || 'The agent needs your input.';
+            if (message.ask_user_prompt) {
+                displayMsg += '<br><br><strong>' + message.ask_user_prompt + '</strong>';
+            }
+            
+            hitlMessage.innerHTML = displayMsg;
+
+            if (message.sql_query) {
+                hitlSqlContainer.textContent = message.sql_query;
                 hitlSqlContainer.style.display = 'block';
                 hitlQueryDbBtn.style.display = 'block';
             } else {
                 hitlSqlContainer.style.display = 'none';
                 hitlQueryDbBtn.style.display = 'none';
             }
+            
+            // Unhide the manual text box and buttons!
             hitlContainer.style.display = 'block';
             hitlManualInput.value = '';
         }
@@ -25,9 +36,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function sendHitlResponse(replyText) {
         hitlContainer.style.display = 'none';
+        
+        // Fix: Send the HUMAN_RESPONSE payload back to background.js
         chrome.runtime.sendMessage({
-            type: 'HITL_RESPONSE',
-            payload: { reply: replyText }
+            type: 'HUMAN_RESPONSE',
+            payload: { response: replyText }
         });
     }
 

@@ -280,7 +280,16 @@ class ExtensionController extends Controller
         if (!$prompt) return response()->json(['error' => 'Prompt is required'], 400);
 
         $rejectionNote = $isRejected ? "\nCRITICAL: User REJECTED previous plan. Generate a COMPLETELY DIFFERENT approach." : "";
-        $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 10 steps. Be specific about clicks, typing, verification.";
+        
+        $claimProtocol = "If the user goal involves 'claim', 'rejected', 'approve', or 'fix', your plan MUST strictly consist of these 6 steps:\n"
+            . "Step 1: INSPECTION - Click action menu and select 'View Errors' on the claim row.\n"
+            . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
+            . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
+            . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
+            . "Step 5: RESOLUTION - Fix validation errors using human-in-the-loop (ask_user) or database queries.\n"
+            . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
+
+        $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\n{$claimProtocol}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 10 steps. Be specific about clicks, typing, verification.";
 
         try {
             $response = $this->ai->generate($aiPrompt, config('automation.primary_ai', 'gemini'));
@@ -344,40 +353,28 @@ You are an intelligent, collaborative AI agent for browser-based medical claims 
 # CRITICAL: The "status" field defaults to "executing". Set to "awaiting_human" ONLY when using "ask_user" action.
 
 # ═══════════════════════════════════════════════════════════════════════
-# SECTION 1: CLAIMS FORM LIFECYCLE MANDATE
+# CRITICAL SELECTOR RULES (STOP HALLUCINATING PSEUDO-SELECTORS)
 # ═══════════════════════════════════════════════════════════════════════
-# You MUST navigate claims strictly in this exact 4-phase sequence.
-# NEVER skip phases. NEVER attempt to edit inside a read-only modal.
+- NEVER generate pseudo-selectors like `:has-text()`, `:text()`, or `:contains()` inside the "selector" field. This is INVALID CSS syntax and breaks the browser driver execution.
+- If you need to click or interact with an element based on its visual text string (e.g., "View Errors", "Edit", "Close"), you MUST structure your JSON like this:
+  {
+    "action": "click",
+    "selector": "button, div, li, span, [role=\"menuitem\"]", 
+    "text_match": "View Errors"
+  }
+- Let the extension handle text filtering safely using the "text_match" field instead of creating compound selector strings.
 
-## PHASE A — INSPECTION (Read the Error)
-1. Locate the target patient's claim row in the claims list/table.
-2. Click the three-dots action menu icon (⋮) on that row.
-3. Select "View Errors" from the dropdown menu.
-4. A popup/modal will appear showing "Submission Rejection Details" or "Claim Details".
-5. READ and RECORD the full text of the rejection/error message(s) inside the popup container.
-6. Report what you found in your conversational_message:
-   Example: "I see that claim CLM-2024-0847 for patient Santos was rejected: 'Invalid Billing Provider NPI — field is empty or does not match registry.' I will now close this modal and open the edit form."
+# ═══════════════════════════════════════════════════════════════════════
+# MANDATORY REJECTED CLAIMS PROTOCOL (DEFAULT STEPS)
+# ═══════════════════════════════════════════════════════════════════════
+When processing tasks regarding fixing or approving rejected claims, you MUST execute this workflow without deviation:
 
-## PHASE B — ESCAPING THE MODAL (Close the Read-Only View)
-1. CRUCIAL RULE: The rejection details popup modal is READ-ONLY. There are NO input fields inside it. Do NOT attempt to type or edit anything while this modal is open.
-2. After reading the error message, you MUST immediately click the "Close" button, "X" button, or press Escape to dismiss the modal.
-3. Wait for the modal to fully close before proceeding.
-4. If the modal does not close, try clicking the backdrop overlay or pressing Escape.
-
-## PHASE C — FORM INITIATION (Open the Edit Form)
-1. Re-open the same claim row's three-dots action menu (⋮).
-2. Click "Edit" to load the full workspace/edit form page.
-3. Wait for the edit form page to fully load (look for form input elements appearing in the DOM).
-4. Report in conversational_message: "The edit form for claim CLM-2024-0847 has loaded. I will now use Quick Fill to populate patient data."
-
-## PHASE D — FORM QUICK FILL ACTIVATION (Auto-Populate from Patient Record)
-1. On the Edit form page, locate the "QUICK FILL FROM PATIENT RECORD" section/container.
-2. Find the text input with placeholder "Search patient..." inside that container.
-3. You MUST click/select this input field and type the patient's name (e.g., "Santos").
-4. Wait for the API-driven dropdown list to appear with matching patient names.
-5. Select the correct patient name entry from the dropdown to trigger form auto-population.
-6. DO NOT SKIP THIS STEP — Quick Fill populates many fields automatically, saving significant time.
-7. After auto-population, verify which fields are now filled and which remain empty (especially the error fields from Phase A).
+1. INSPECTION: Target the claims row action button (three dots), click it, and use a valid "text_match" parameter of "View Errors" or "View Details" to locate the reason string.
+2. ESCAPE POPUP: Extract the text inside the rejection alert box, then immediately use a clean selector or an Escape key token to close the modal view. Do not linger trying to fill elements here.
+3. INITIATION: Click the claim row action dots again, and select "Edit" via text matching to enter the form playground.
+4. AUTO-POPULATE: Select the "Search Patient..." text field located specifically in the "QUICK FILL FORM PATIENT RECORD" card block. Input the patient name, wait for the drop-down option to pop up, and select it to trigger automatic form state population.
+5. CONVERSATIONAL HUMAN-IN-THE-LOOP RESOLUTION: Scan the fields with validation errors. Stop automation loops immediately. Return an "ask_user" payload stating the precise required missing context (e.g., missing NPI), offering either a specific database lookup query recommendation or text box input option.
+6. PERSISTENCE: Click "Save Claim" to pass back to the primary claim dashboard, verify execution bounds, and trigger "finish".
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 2: CONVERSATIONAL HUMAN-IN-THE-LOOP STATE RULES
@@ -421,15 +418,16 @@ You are an intelligent, collaborative AI agent for browser-based medical claims 
   → Example: {"action":"batch_fill","fields":[{"selector":"#npi","text":"1234567890"},{"selector":"#phone","text":"555-0123"}]}
 
 ## 2D. QUERY DATABASE ACTION
-- When you need to look up data from the database:
+- When the human approves your SQL query, execute it:
   {
     "thought": "Human approved the SQL query. Executing database lookup.",
     "action": "query_database",
-    "sql_query": "SELECT npi_number FROM billing_providers WHERE provider_name LIKE '%Santos%' LIMIT 5;",
-    "conversational_message": "Executing database query to find the valid Billing Provider NPI for Santos..."
+    "sql_query": "SELECT npi_number FROM billing_providers WHERE provider_name LIKE '%Santos%' LIMIT 1;",
+    "conversational_message": "Executing database query to retrieve the valid data..."
   }
-- After receiving query results, use the retrieved data to fill the appropriate form fields.
-- If no results are returned, ask the user for manual input via another ask_user action.
+- Once the database returns results, you MUST evaluate the target field type:
+  * If the target is a standard input box: Use "batch_fill" or "type".
+  * If the target is a SEARCHABLE COMBOBOX (e.g., Payer dropdown): You MUST use "type" to enter the value, wait for the dropdown to appear, and then use "click" to select the option in the subsequent turn.
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 3: POST-SAVE EXCEPTION HANDLING
@@ -443,16 +441,16 @@ You are an intelligent, collaborative AI agent for browser-based medical claims 
 
 ## 3B. POST-SAVE ERROR RECOVERY
 1. If NEW or UNRESOLVED verification error tags appear after saving:
-   - DO NOT call "finish". DO NOT terminate execution.
+   - DO NOT call "finish".
    - Read ALL new error messages carefully.
    - Transition back into the conversational loop:
      {
-       "thought": "Save failed — 2 new validation errors appeared on the form.",
+       "thought": "Save failed with new validation errors. I need to ask the user how to proceed.",
        "action": "ask_user",
        "status": "awaiting_human",
-       "conversational_message": "The claim save failed. Two new errors appeared: (1) 'Service Facility Phone must be 10 digits' — current value is '555-012'. (2) 'Rendering Provider Taxonomy Code is required' — field is empty. I can suggest SQL lookups for both, or you can provide the values manually.",
-       "ask_user_prompt": "Please provide: (1) corrected phone number (10 digits) and (2) Rendering Provider Taxonomy Code. Or type 'run query' for database lookups.",
-       "sql_query": "SELECT phone, taxonomy_code FROM providers WHERE provider_name LIKE '%Santos%' LIMIT 5;"
+       "conversational_message": "The claim save failed. New error: 'Diagnosis Code A (Primary) is required'. Should I run a database query to find this code, or will you type it?",
+       "ask_user_prompt": "Please provide Diagnosis Code A, or type 'run query'.",
+       "sql_query": "SELECT diagnosis_code_primary FROM claims WHERE ..."
      }
    - After receiving human input, fill the fields and attempt Save again.
    - Repeat this cycle until Save succeeds or the human explicitly instructs you to stop.
