@@ -32,6 +32,6 @@ Route::post('/extension/plan', [ExtensionController::class, 'plan'])
 Route::post('/extension/learn', [ExtensionController::class, 'learn'])
     ->name('extension.learn');
 
-// Text-to-SQL database query tool (AI agent reads Supabase to resolve validation errors)
-Route::post('/extension/query-db', [ExtensionController::class, 'queryDb'])
-    ->name('extension.queryDb');
+// Back-office API call tool (AI agent calls approved REST endpoints)
+Route::post('/extension/call-api', [ExtensionController::class, 'handleApiCall'])
+    ->name('extension.handleApiCall');

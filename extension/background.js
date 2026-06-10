@@ -6,7 +6,7 @@ const API_URL = "http://127.0.0.1:8001/api/extension/loop";
 const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
-const QUERY_DB_URL = "http://127.0.0.1:8001/api/extension/query-database";
+const CALL_API_URL = "http://127.0.0.1:8001/api/extension/call-api";
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -1061,6 +1061,109 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
+                // 6-HITL. Handle CALL_API — Back-office API with Human Approval
+                if (aiDecision.action === 'call_api') {
+                    sendLogToPanel('🔍 Executing approved back-office API call...', 'decision');
+                    const apiEndpoint = aiDecision.api_endpoint || aiDecision.endpoint || '';
+                    const apiMethod = (aiDecision.api_method || aiDecision.method || 'GET').toUpperCase();
+                    const apiParams = aiDecision.api_params || aiDecision.params || {};
+
+                    if (!apiEndpoint) {
+                        sendLogToPanel('CALL_API failed: endpoint is required.', 'error');
+                        historyEntry.actionSuccess = false;
+                        historyEntry.apiEndpoint = apiEndpoint;
+                        historyEntry.error = 'Missing API endpoint';
+                        postPopupDirective = 'CALL_API FAILED: The AI requested a back-office API call without an endpoint. Retry with a valid catalog endpoint.';
+                        failedActionCount++;
+                        lastActionFailed = true;
+                        lastActionError = 'Missing API endpoint';
+                        actionHistory.push(historyEntry);
+                        continue;
+                    }
+
+                    sendLogToPanel(`API Endpoint: ${apiEndpoint}`, 'info');
+                    sendLogToPanel(`API Params: ${JSON.stringify(apiParams)}`, 'info');
+
+                    const apiApproval = await new Promise(resolve => {
+                        const listener = (msg) => {
+                            if (msg.type === 'HITL_RESPONSE') {
+                                chrome.runtime.onMessage.removeListener(listener);
+                                resolve(msg.payload);
+                            }
+                        };
+                        chrome.runtime.onMessage.addListener(listener);
+
+                        chrome.runtime.sendMessage({
+                            type: 'SHOW_HITL_UI',
+                            payload: {
+                                message: aiDecision.conversational_message || 'The agent needs approval to execute a back-office API call.',
+                                api_endpoint: apiEndpoint,
+                                api_method: apiMethod,
+                                api_params: apiParams,
+                                ask_user_prompt: aiDecision.ask_user_prompt
+                            }
+                        }).catch(() => { });
+                    });
+
+                    if (apiApproval?.reply && /^(no|cancel|stop)$/i.test(apiApproval.reply.trim())) {
+                        sendLogToPanel('Human cancelled the back-office API call.', 'warn');
+                        historyEntry.actionSuccess = false;
+                        historyEntry.apiEndpoint = apiEndpoint;
+                        historyEntry.apiParams = apiParams;
+                        postPopupDirective = `HUMAN CANCELLED API CALL: "${apiApproval.reply}". Do not retry this endpoint unless the human approves it.`;
+                        failedActionCount++;
+                        lastActionFailed = true;
+                        lastActionError = 'Human cancelled API call';
+                        actionHistory.push(historyEntry);
+                        continue;
+                    }
+
+                    let apiResult = null;
+                    try {
+                        const apiResponse = await fetch(CALL_API_URL, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify({ method: apiMethod, endpoint: apiEndpoint, params: apiParams })
+                        });
+                        apiResult = await apiResponse.json();
+                    } catch (e) {
+                        apiResult = { success: false, error: e.message };
+                    }
+
+                    if (apiResult?.success) {
+                        historyEntry.actionSuccess = true;
+                        historyEntry.apiResult = apiResult.data || apiResult;
+                        historyEntry.apiEndpoint = apiEndpoint;
+                        historyEntry.apiParams = apiParams;
+                        historyEntry.apiRowCount = apiResult.rowCount || 0;
+
+                        postPopupDirective = 'BACK-OFFICE API SUCCESS:\n'
+                            + JSON.stringify(apiResult.data || apiResult, null, 2)
+                            + '\nAnalyze the API response and apply it to the form. Ensure you target the correct field type (combobox vs text).';
+
+                        failedActionCount = 0;
+                        lastActionFailed = false;
+                        lastActionError = '';
+                    } else {
+                        const apiError = apiResult?.error || 'API call failed';
+                        sendLogToPanel(`Back-office API failed: ${apiError}`, 'error');
+                        historyEntry.actionSuccess = false;
+                        historyEntry.apiEndpoint = apiEndpoint;
+                        historyEntry.apiParams = apiParams;
+                        historyEntry.error = apiError;
+
+                        postPopupDirective = 'BACK-OFFICE API FAILED:\n'
+                            + apiError
+                            + '\nCRITICAL: Do NOT retry this endpoint automatically. Use `ask_user` immediately if the missing values still need resolution.';
+
+                        lastActionFailed = true;
+                        lastActionError = apiError;
+                    }
+
+                    actionHistory.push(historyEntry);
+                    continue;
+                }
+
                 // 6-HITL. Handle ASK_USER — Human-in-the-Loop Pause
                 if (aiDecision.action === 'ask_user') {
                     sendLogToPanel(`AI asks: ${aiDecision.conversational_message}`, 'warn');
@@ -1082,7 +1185,6 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                             type: 'SHOW_HITL_UI', // FIX: Must match the exact string expected by panel.js
                             payload: {
                                 message: aiDecision.conversational_message,
-                                sql_query: aiDecision.sql_query,
                                 ask_user_prompt: aiDecision.ask_user_prompt
                             }
                         }).catch(() => { });
@@ -1094,73 +1196,21 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     sendLogToPanel(`👤 Human replied: ${userChoice.reply}`, 'success');
 
                     postPopupDirective = `HUMAN RESPONSE TO YOUR QUESTION: "${userChoice.reply}". `
-                        + `If they approved your SQL, use the 'query_database' action now. `
-                        + `If they provided data manually, use 'batch_fill' or 'type' to enter it into the form.`;
+                        + `If the human provided data manually, use 'batch_fill' or 'type' to enter it into the form.`;
 
                     actionHistory.push(historyEntry);
                     continue;
                 }
 
-                // 7a. Handle QUERY_DATABASE — Execute Text-to-SQL with 3x Auto-Retry
+                // 7a. Reject legacy SQL action — back-office API is the supported data source
                 if (aiDecision.action === 'query_database') {
-                    sendLogToPanel('🔍 Executing automated database query...', 'decision');
-                    const sqlQuery = aiDecision.sql_query || aiDecision.sql || '';
-                    sendLogToPanel(`SQL Query: ${sqlQuery.slice(0, 120)}`, 'info');
-                    
-                    let dbSuccess = false;
-                    let dbData = null;
-                    let lastError = '';
-
-                    // Try to fetch data up to 3 times
-                    for (let attempt = 1; attempt <= 3; attempt++) {
-                        if (attempt > 1) sendLogToPanel(`Database retry attempt ${attempt}/3...`, 'warn');
-                        try {
-                            const dbResponse = await fetch(QUERY_DB_URL, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                                body: JSON.stringify({ sql: sqlQuery })
-                            });
-                            const tempDbData = await dbResponse.json();
-
-                            if (tempDbData.success && tempDbData.rowCount > 0) {
-                                dbSuccess = true;
-                                dbData = tempDbData;
-                                break;
-                            } else {
-                                lastError = tempDbData.error || 'Query executed but returned 0 rows';
-                            }
-                        } catch (e) {
-                            lastError = e.message;
-                        }
-                        if (!dbSuccess && attempt < 3) await sleep(1500); // wait before retry
-                    }
-
-                    if (dbSuccess) {
-                        sendLogToPanel(`DB query returned ${dbData.rowCount} row(s)`, 'success');
-                        historyEntry.actionSuccess = true;
-                        historyEntry.dbResult = dbData.data;
-                        historyEntry.sqlQuery = sqlQuery;
-                        
-                        postPopupDirective = 'DATABASE QUERY SUCCESS:\n'
-                            + JSON.stringify(dbData.data, null, 2)
-                            + '\nAnalyze the data and apply it to the form. Ensure you target the correct field type (combobox vs text).';
-                            
-                        failedActionCount = 0;
-                        lastActionFailed = false;
-                        lastActionError = '';
-                    } else {
-                        sendLogToPanel(`DB query failed after 3 attempts: ${lastError}`, 'error');
-                        historyEntry.actionSuccess = false;
-                        historyEntry.sqlQuery = sqlQuery;
-                        
-                        postPopupDirective = 'DATABASE QUERY FAILED AFTER 3 ATTEMPTS:\n'
-                            + lastError
-                            + '\nCRITICAL: Do NOT attempt to query the database again for these fields. You MUST use the `ask_user` action IMMEDIATELY to request the human to enter these missing values manually.';
-                        
-                        lastActionFailed = true;
-                        lastActionError = lastError;
-                    }
-                    
+                    sendLogToPanel('Legacy SQL action rejected; use call_api with the back-office API catalog.', 'error');
+                    historyEntry.actionSuccess = false;
+                    historyEntry.error = 'Legacy SQL action rejected';
+                    postPopupDirective = 'LEGACY SQL ACTION REJECTED: This workflow now uses the back-office REST API. Retry with `call_api` using an endpoint from the catalog.';
+                    failedActionCount++;
+                    lastActionFailed = true;
+                    lastActionError = 'Legacy SQL action rejected';
                     actionHistory.push(historyEntry);
                     continue;
                 }

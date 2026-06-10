@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Services\AiService;
+use App\Services\ApiService;
 use App\Services\ReflexionService;
 use App\Services\SeleniumService;
 use App\Services\SiteKnowledgeService;
@@ -16,7 +17,8 @@ class ExtensionController extends Controller
         private readonly AiService $ai,
         private readonly SeleniumService $selenium,
         private readonly ReflexionService $reflexion,
-        private readonly SiteKnowledgeService $siteKnowledge
+        private readonly SiteKnowledgeService $siteKnowledge,
+        private readonly ApiService $apiService
     ) {
     }
 
@@ -70,8 +72,8 @@ class ExtensionController extends Controller
             $siteKnowledgeBlock = $this->siteKnowledge->buildKnowledgeBlock($url);
         }
 
-        // Database Schema Intelligence
-        $dbSchemaBlock = $this->getDatabaseSchema();
+        // API Catalog Intelligence
+        $apiCatalogBlock = $this->getApiCatalog();
 
         // Enhancement 2: Reflexion
         $reflexionBlock = '';
@@ -108,7 +110,7 @@ class ExtensionController extends Controller
         // Gap A: System prompt (static, cacheable)
         $systemPrompt = config('automation.system_prompt_separation', true) ? $this->buildSystemPrompt() : null;
         if ($systemPrompt) {
-            $systemPrompt = str_replace('{{DATABASE_SCHEMA_PLACEHOLDER}}', $dbSchemaBlock, $systemPrompt);
+            $systemPrompt = str_replace('{{API_CATALOG_PLACEHOLDER}}', $apiCatalogBlock, $systemPrompt);
         }
 
         // Dynamic user prompt
@@ -171,14 +173,15 @@ class ExtensionController extends Controller
                 Log::info('Agent entering awaiting_human state', [
                     'message' => substr($decision['conversational_message'] ?? '', 0, 200),
                     'ask_user_prompt' => $decision['ask_user_prompt'] ?? '',
-                    'has_sql_query' => !empty($decision['sql_query']),
+                    'has_api_payload' => !empty($decision['api_endpoint']),
                 ]);
             }
 
-            // Log query_database actions for audit trail
-            if ($decision['action'] === 'query_database') {
-                Log::info('Agent requesting database query', [
-                    'sql_query' => $decision['sql_query'] ?? 'NONE',
+            if ($decision['action'] === 'call_api') {
+                Log::info('Agent requesting back-office API call', [
+                    'api_endpoint' => $decision['api_endpoint'] ?? 'NONE',
+                    'api_method' => $decision['api_method'] ?? 'GET',
+                    'api_params' => $decision['api_params'] ?? [],
                     'message' => substr($decision['conversational_message'] ?? '', 0, 200),
                 ]);
             }
@@ -194,7 +197,7 @@ class ExtensionController extends Controller
             // Enhancement 4: CSS Selector Validator
             // Skip validation for actions that don't need selectors
             $action = $decision['action'] ?? '';
-            $selectorFreeActions = ['ask_user', 'query_database', 'finish', 'navigate', 'extract', 'scroll_down', 'scroll_up', 'action_sequence', 'batch_fill'];
+            $selectorFreeActions = ['ask_user', 'call_api', 'finish', 'navigate', 'extract', 'scroll_down', 'scroll_up', 'action_sequence', 'batch_fill'];
 
             if (in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector'])) {
                 $validation = $this->validateCssSelector($decision['selector']);
@@ -222,6 +225,24 @@ class ExtensionController extends Controller
             Log::error('Extension Loop Error: ' . $e->getMessage());
             return response()->json(['error' => $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * POST /api/extension/call-api
+     * Executes the back-office REST API call approved by the human supervisor.
+     */
+    public function handleApiCall(Request $request): JsonResponse
+    {
+        $method = $request->input('method', 'GET');
+        $endpoint = $request->input('endpoint', '');
+        $params = $request->input('params', []);
+
+        if (empty($endpoint)) {
+            return response()->json(['success' => false, 'error' => 'Endpoint path is required.'], 400);
+        }
+
+        $result = $this->apiService->executeCall($method, $endpoint, $params);
+        return response()->json($result);
     }
 
     /**
@@ -292,7 +313,7 @@ class ExtensionController extends Controller
             . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
             . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
             . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
-            . "Step 5: RESOLUTION - Fix validation errors using human-in-the-loop (ask_user) or database queries.\n"
+            . "Step 5: RESOLUTION - Fix validation errors using back-office API lookups and human-in-the-loop (ask_user).\n"
             . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
 
         $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\n{$claimProtocol}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 10 steps. Be specific about clicks, typing, verification.";
@@ -352,11 +373,19 @@ You are an intelligent, collaborative AI agent for browser-based medical claims 
   "somIndex": 1,
   "actions": [],
   "fields": [],
-  "sql_query": "SELECT ... (optional, only for query_database)",
+  "api_endpoint": "/api/v1/...",
+  "api_method": "GET|POST",
+  "api_params": {},
   "ask_user_prompt": "Question for the human (only for ask_user action)"
 }
 # CRITICAL: The "conversational_message" field is MANDATORY in every single response. Never omit it.
 # CRITICAL: The "status" field defaults to "executing". Set to "awaiting_human" ONLY when using "ask_user" action.
+# CRITICAL: For "call_api" actions, always provide "api_endpoint", "api_method", and "api_params".
+
+# ═══════════════════════════════════════════════════════════════════════
+# BACK-OFFICE API CATALOG
+# ═══════════════════════════════════════════════════════════════════════
+{{API_CATALOG_PLACEHOLDER}}
 
 # ═══════════════════════════════════════════════════════════════════════
 # CRITICAL SELECTOR RULES (STOP HALLUCINATING PSEUDO-SELECTORS)
@@ -365,7 +394,7 @@ You are an intelligent, collaborative AI agent for browser-based medical claims 
 - If you need to click or interact with an element based on its visual text string (e.g., "View Errors", "Edit", "Close"), you MUST structure your JSON like this:
   {
     "action": "click",
-    "selector": "button, div, li, span, [role=\"menuitem\"]", 
+    "selector": "button, div, li, span, [role=\"menuitem\"]",
     "text_match": "View Errors"
   }
 - Let the extension handle text filtering safely using the "text_match" field instead of creating compound selector strings.
@@ -383,42 +412,45 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
    - Step B: Take the Patient Name you remembered in Step 1 and extract ONLY the Last Name (e.g., if the patient is "Abigail Santos", extract exactly "Santos").
    - Step C: Identify the real input field box with the placeholder "Search name, MRN, or ID...". Execute your "type" action on this box using ONLY the Last Name string. DO NOT type the first name or a comma.
    - Step D: Look at the filtered selection dropdown menu list. Now, execute a targeted click action matching the exact "Lastname, Firstname" string (e.g., "Santos, Abigail") to trigger full form state auto-population.
-5. RESOLUTION (AUTONOMOUS DB FIRST): Scan the form for ALL validation errors. 
-   - DO NOT ask the human for permission first. 
-   - Autonomously draft and execute a `query_database` action to find the missing values for ALL flagged fields at once.
-   - If the database query returns data, autonomously fill the fields. 
-   - ONLY if the database query fails, returns empty, or if you exhaust your search options, should you halt and use `ask_user` to request the missing data from the human.
+5. RESOLUTION (AUTONOMOUS API FIRST): Scan the form for ALL validation errors.
+   - DO NOT ask the human for permission first.
+   - Autonomously use `call_api` to retrieve missing values for ALL flagged fields at once using the catalog endpoints.
+   - If the API response returns data, autonomously fill the fields.
+   - ONLY if the API retrieval fails, returns empty, or if you exhaust your search options, should you halt and use `ask_user` to request the missing data from the human.
 6. PERSISTENCE: Click "Save Claim" to pass back to the primary claim dashboard, verify execution bounds, and trigger "finish".
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 2: AUTONOMOUS ERROR RESOLUTION & HUMAN-IN-THE-LOOP
 # ═══════════════════════════════════════════════════════════════════════
 
-## 2A. AUTONOMOUS DATABASE-FIRST PROTOCOL
-- When you detect missing data or validation errors, you are empowered to act autonomously.
-- IMMEDIATELY use the `query_database` action to look up the missing information using the patient or organization context.
-- Example:
+## 2A. AUTONOMOUS API-FIRST DATA RESOLUTION PROTOCOL
+- When you detect missing form validation data (e.g. missing Patient metadata, Organization NPI, or Claims History mappings), do NOT guess.
+- IMMEDIATELY initiate an internal data retrieval process via the back-office API using the "action": "call_api" mechanism.
+- Draft your payload targeting the specific endpoint string documented in the catalog block.
+- Example for checking missing validation details for a patient named Abigail Santos:
   {
-    "thought": "The NPI and Procedure codes are missing. I will query the database for them before bothering the human.",
-    "action": "query_database",
-    "sql_query": "SELECT npi_number, default_procedure FROM billing_providers WHERE ..."
+    "thought": "The Patient demographic record contains incomplete metadata. I will invoke the back-office lookups to pull correct values.",
+    "action": "call_api",
+    "api_endpoint": "/api/v1/patients",
+    "api_method": "GET",
+    "api_params": { "last_name": "Santos" }
   }
 
 ## 2B. CONSOLIDATED HUMAN-IN-THE-LOOP (ask_user)
-- You must ONLY use the `ask_user` action if your `query_database` attempts return 0 rows, fail, or if the data simply doesn't exist in the schema.
+- You must ONLY use the `ask_user` action if your `call_api` data retrieval sequences fail, return no matching indices, or if the parameter is completely absent from back-office records.
 - BULK GATHERING: If multiple fields are failing (e.g., NPI, Phone, and Procedure Code), DO NOT ask for them one by one. You MUST consolidate them into a single `ask_user` request.
 - Example:
   {
-    "thought": "My database queries failed to find the NPI and Procedure code. I will ask the human for both.",
+    "thought": "My API lookups failed to find the NPI and Procedure code. I will ask the human for both.",
     "action": "ask_user",
     "status": "awaiting_human",
-    "conversational_message": "I could not find the missing data in the database. Please provide the following: 1) Billing Provider NPI, 2) Procedure Code (CPT).",
+    "conversational_message": "I could not find the missing data through the back-office API. Please provide the following: 1) Billing Provider NPI, 2) Procedure Code (CPT).",
     "ask_user_prompt": "Please type the values for NPI and Procedure Code."
   }
 
 ## 2C. PRECISION TARGETING (ANTI-CONFUSION)
 - When fixing errors in complex forms, adjacent dropdowns look similar in the DOM (e.g., "Procedure" vs "Diagnosis Pointer").
-- DO NOT guess CSS selectors based on visual proximity. 
+- DO NOT guess CSS selectors based on visual proximity.
 - You MUST use strict `text_match` targeting based on the exact label of the failing field.
 - If the error is "Procedure code is missing", your action MUST target `text_match: "CPT/HCPCS"` or `text_match: "PROCEDURE"`. Do not click random nearby comboboxes.
 
@@ -430,8 +462,8 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 1. After clicking "Save Claim", observe the page for new or unresolved verification error tags.
 2. If errors exist, DO NOT call "finish".
 3. Read ALL new error messages simultaneously.
-4. Execute `query_database` autonomously to try and resolve all new errors at once.
-5. If the database lacks the answers, emit a single, consolidated `ask_user` action listing every remaining error that requires human input.
+4. Execute `call_api` autonomously to try and resolve all new errors at once.
+5. If the back-office API lacks the answers, emit a single, consolidated `ask_user` action listing every remaining error that requires human input.
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 4: CORE AUTOMATION RULES
@@ -446,7 +478,7 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 - If an element is not in the elements list, it does not exist on the page.
 
 ## 4C. EFFICIENCY
-- Use "action_sequence" to chain up to 5 simple, independent actions (e.g., filling obvious non-error fields).
+- Use "action_sequence" to chain up to 5 simple, independent actions (e.g., filling obvious fields).
 - Use "batch_fill" to fill multiple standard text inputs at once. Do NOT use batch_fill for dropdowns.
 - NEVER use action_sequence or batch_fill for fields that were flagged with errors — those MUST go through the ask_user flow.
 
@@ -458,12 +490,12 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 - Standard DOM: click, type, hover, select_option, scroll_down, scroll_up, extract, navigate
 - Form Speed: action_sequence, batch_fill
 - Fallback: keyboard_event, click_coordinate
-- Human-in-the-Loop: ask_user (pauses for human input), query_database (SQL lookup)
+- Human-in-the-Loop: ask_user (pauses for human input), call_api (back-office REST lookup)
 - Termination: finish (ONLY when task is truly complete or human says stop)
 
 ## 4F. DROPDOWNS, COMBOBOXES & DROPDOWN SELECTIONS
 - Modern framework comboboxes (like Radix/Shadcn) use a `<button>` tag displaying "Search patient..." as an anchor. You CANNOT use the "type" action on a `<button>` tag — this causes an "Illegal invocation" error. Always click it first to reveal the search container.
-- **Strict Query Format Rule:** When typing into any patient or provider lookup search box on this EHR platform, you MUST type ONLY the Last Name. Typing a comma or the first name (e.g., "Santos, Abigail" or "Abigail Santos") will return zero results. 
+- **Strict Query Format Rule:** When typing into any patient or provider lookup search box on this EHR platform, you MUST type ONLY the Last Name. Typing a comma or the first name (e.g., "Santos, Abigail" or "Abigail Santos") will return zero results.
 - **Selection Rule:** After typing ONLY the Last Name, the dropdown options will render. You MUST target your subsequent click directly onto the element matching the full `"Lastname, Firstname"` record text string. Do not assume typing text auto-selects the row.
 
 ## 4G. SCROLLING
@@ -606,59 +638,38 @@ SYSTEM;
         return $block;
     }
 
-    private function getDatabaseSchema(): string
+    private function getApiCatalog(): string
     {
-        return <<<SCHEMA
+        return <<<'CATALOG'
 # ═══════════════════════════════════════════════════════════════════════
-# DATABASE SCHEMA INTELLIGENCE (PostgreSQL)
+# BACK-OFFICE BACKEND API SPECIFICATIONS (RESTful JSON)
 # ═══════════════════════════════════════════════════════════════════════
-Use this schema to construct your `sql_query` when using the `query_database` action.
-Do NOT invent columns. Strictly use the following tables and columns:
+Use this catalog to construct your "action": "call_api" parameters.
+Do NOT invent endpoints or parameters. Explicitly follow these routes:
 
-**Table: `patients`**
-- `id` (int8)
-- `first_name` (varchar)
-- `last_name` (varchar)
-- `middle_name` (varchar)
-- `suffix` (varchar)
-- `gender` (varchar)
-- `date_of_birth` (date)
-- `phone` (varchar)
-- `address_line_2` (varchar)
-- `city` (varchar)
-- `state` (varchar)
-- `zip_code` (varchar)
-- `country` (varchar)
+**1. Patients Module (Ability: patients:read)**
+- GET /api/v1/patients  -> List patients for the active organization. Optional query filters: ?last_name=STRING
+- GET /api/v1/patients/{id} -> Retrieve a single patient profile by their unique ID.
 
-**Table: `organizations`**
-- `id` (int8)
-- `name` (varchar)
-- `npi` (varchar)
-- `addr` (varchar)
-- `phone` (varchar)
+**2. Claims Module (Ability: claims:read)**
+- GET /api/v1/claims    -> List claims for the active organization.
+- GET /api/v1/claims/{id} -> Retrieve a single detailed claim record.
 
-**Table: `payers`**
-- `id` (int8)
-- `name` (varchar)
-- `insurance_policy_number` (varchar)
+**3. Eligibility Verification (EV) Requests & Results**
+- POST /api/v1/eligibility/requests -> Submit a realtime eligibility verification request.
+- GET /api/v1/eligibility/requests/{id} -> Retrieve a single EV request configuration.
+- GET /api/v1/eligibility/results/by-dos/{dos} -> List EV results on a date of service (YYYY-MM-DD).
+- GET /api/v1/eligibility/results/{id} -> Retrieve a single verification record details by ID.
 
-**Table: `claims`**
-- `id` (int8)
-- `patient_id` (int8)
-- `organization_id` (int8)
-- `payer_id` (int8)
-- `primary_payer_id` (int8)
-- `claim_status` (varchar)
-- `service_date` (date)
-- `charge_amount` (numeric)
-- `c.procedure_code` (varchar)
-- `control_number` (varchar)
+**4. Organizations & Infrastructure**
+- GET /api/v1/organizations -> List organizations the authenticated user belongs to.
+- GET /api/v1/organizations/{id} -> Retrieve a single organization metadata profile.
+- GET /api/v1/auth/me -> Return the active user profile identity context and organizational assignment mapping.
 
-**QUERY USAGE RULES:**
-- When querying for an organization's NPI, use: `SELECT npi FROM organizations WHERE name LIKE '%...%'`
-- When querying for a patient's details, join with organizations if needed: `SELECT p.first_name, p.last_name, o.npi FROM patients p JOIN organizations o ON p.organization_id = o.id WHERE p.last_name = '...'`
-- You may only execute `SELECT` queries. NEVER execute `INSERT`, `UPDATE`, or `DELETE`.
-SCHEMA;
+**USAGE PARAMS RULES:**
+- Paths containing `{id}` or `{dos}` placeholders MUST be passed dynamically as path variables. Your parameter block should separate path mapping keys cleanly.
+- Example: For `/api/v1/patients/45`, pass: "api_endpoint": "/api/v1/patients/{id}" and "api_params": {"id": 45}
+CATALOG;
     }
 
     /**

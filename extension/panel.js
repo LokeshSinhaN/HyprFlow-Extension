@@ -24,6 +24,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 hitlSqlContainer.textContent = message.payload.sql_query;
                 hitlSqlContainer.style.display = 'block';
                 hitlQueryDbBtn.style.display = 'block';
+            } else if (message.payload.api_endpoint) {
+                hitlSqlContainer.textContent = JSON.stringify({
+                    endpoint: message.payload.api_endpoint,
+                    method: message.payload.api_method || 'GET',
+                    params: message.payload.api_params || {}
+                }, null, 2);
+                hitlSqlContainer.style.display = 'block';
+                hitlQueryDbBtn.style.display = 'block';
             } else {
                 hitlSqlContainer.style.display = 'none';
                 hitlQueryDbBtn.style.display = 'none';
@@ -48,7 +56,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     hitlQueryDbBtn.addEventListener('click', () => {
-        sendHitlResponse("Yes, execute the suggested SQL query.");
+        sendHitlResponse("Yes, execute the suggested API call.");
     });
 
     hitlSubmitManualBtn.addEventListener('click', () => {
