@@ -8,19 +8,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Listen for messages from background.js
     chrome.runtime.onMessage.addListener((message) => {
-        if (message.type === 'AWAITING_HUMAN') {
-            stopWatchdog(); // Fix: Pause the timeout timer
+        // FIX: Match the event name sent by background.js
+        if (message.type === 'SHOW_HITL_UI') { 
+            stopWatchdog(); // Pause the timeout timer indefinitely
             statusText.textContent = "Agent paused — waiting for your input...";
             statusBar.style.backgroundColor = '#3b82f6';
             
-            let displayMsg = message.conversational_message || 'The agent needs your input.';
-            if (message.ask_user_prompt) {
-                displayMsg += '<br><br><strong>' + message.ask_user_prompt + '</strong>';
+            let displayMsg = message.payload.message || 'The agent needs your input.';
+            if (message.payload.ask_user_prompt) {
+                displayMsg += '<br><br><strong>' + message.payload.ask_user_prompt + '</strong>';
             }
             hitlMessage.innerHTML = displayMsg;
 
-            if (message.sql_query) {
-                hitlSqlContainer.textContent = message.sql_query;
+            if (message.payload.sql_query) {
+                hitlSqlContainer.textContent = message.payload.sql_query;
                 hitlSqlContainer.style.display = 'block';
                 hitlQueryDbBtn.style.display = 'block';
             } else {
@@ -35,13 +36,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function sendHitlResponse(replyText) {
         hitlContainer.style.display = 'none';
-        startWatchdog(); // Fix: Resume the timeout timer
+        startWatchdog(); // Resume the timeout timer ONLY after human responds
         statusText.textContent = "Agent running...";
         statusBar.style.backgroundColor = '';
         
+        // FIX: Match the event name and payload structure expected by background.js
         chrome.runtime.sendMessage({
-            type: 'HUMAN_RESPONSE',
-            payload: { response: replyText }
+            type: 'HITL_RESPONSE',
+            payload: { reply: replyText } 
         });
     }
 

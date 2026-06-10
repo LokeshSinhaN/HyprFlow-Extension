@@ -1061,64 +1061,43 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
-                // 7. Handle ASK_USER — pause loop and wait for human input
+                // 6-HITL. Handle ASK_USER — Human-in-the-Loop Pause
                 if (aiDecision.action === 'ask_user') {
-                    sendLogToPanel('⏸️ Agent is waiting for your input...', 'decision');
-                    historyEntry.actionSuccess = true;
-                    historyEntry.awaitingHuman = true;
-                    actionHistory.push(historyEntry);
+                    sendLogToPanel(`AI asks: ${aiDecision.conversational_message}`, 'warn');
+                    sendLogToPanel(`⏸️ Agent paused — waiting indefinitely for human input...`, 'warn');
 
-                    // Send the awaiting_human signal to the panel UI
-                    chrome.runtime.sendMessage({
-                        type: 'AWAITING_HUMAN',
-                        conversational_message: aiDecision.conversational_message || 'The agent needs your input.',
-                        ask_user_prompt: aiDecision.ask_user_prompt || 'Please provide the requested information:',
-                        sql_query: aiDecision.sql_query || null
-                    }).catch(() => { });
-
-                    // Pause the loop by awaiting a Promise that resolves when the user responds
-                    isAwaitingHuman = true;
-                    lastAskUserContext = {
-                        step: step,
-                        message: aiDecision.conversational_message,
-                        sql_query: aiDecision.sql_query || null
-                    };
-
-                    const humanResponse = await new Promise((resolve) => {
-                        humanResponseResolver = resolve;
-                        // Safety timeout: if no response in 10 minutes, auto-resume with 'skip'
-                        setTimeout(() => {
-                            if (humanResponseResolver === resolve) {
-                                sendLogToPanel('Human response timeout (10 min). Auto-skipping...', 'warn');
-                                resolve('skip');
+                    // Pause the loop indefinitely and wait for user response from the UI panel
+                    const userChoice = await new Promise(resolve => {
+                        const listener = (msg) => {
+                            // FIX: Must match the exact string sent by panel.js
+                            if (msg.type === 'HITL_RESPONSE') {
+                                chrome.runtime.onMessage.removeListener(listener);
+                                resolve(msg.payload);
                             }
-                        }, 600000);
+                        };
+                        chrome.runtime.onMessage.addListener(listener);
+
+                        // Command panel to display the chat UI and buttons
+                        chrome.runtime.sendMessage({
+                            type: 'SHOW_HITL_UI', // FIX: Must match the exact string expected by panel.js
+                            payload: {
+                                message: aiDecision.conversational_message,
+                                sql_query: aiDecision.sql_query,
+                                ask_user_prompt: aiDecision.ask_user_prompt
+                            }
+                        }).catch(() => { });
                     });
 
-                    isAwaitingHuman = false;
-                    lastAskUserContext = null;
-                    sendLogToPanel(`Received human response: "${humanResponse}". Resuming agent...`, 'success');
+                    // Resume loop with the human's response
+                    historyEntry.actionSuccess = true;
+                    historyEntry.userReply = userChoice.reply;
+                    sendLogToPanel(`👤 Human replied: ${userChoice.reply}`, 'success');
 
-                    // Inject the human's response as a directive for the next AI turn
-                    postPopupDirective = `HUMAN RESPONSE RECEIVED: The user replied: "${humanResponse}". `
-                        + `Use this information to proceed. If the user provided a direct value, `
-                        + `use batch_fill or type to enter it into the correct field(s). `
-                        + `If the user said "run query" or "yes", execute the query_database action `
-                        + `with the previously suggested SQL. If the user said "skip", move on to the next field or step.`;
+                    postPopupDirective = `HUMAN RESPONSE TO YOUR QUESTION: "${userChoice.reply}". `
+                        + `If they approved your SQL, use the 'query_database' action now. `
+                        + `If they provided data manually, use 'batch_fill' or 'type' to enter it into the form.`;
 
-                    // Record the human response in history
-                    actionHistory.push({
-                        step: step + 1,
-                        action: 'human_response',
-                        thought: 'Human provided input',
-                        humanResponse: humanResponse,
-                        actionSuccess: true
-                    });
-
-                    // Reset failure counters since human interaction breaks the failure chain
-                    failedActionCount = 0;
-                    lastActionFailed = false;
-                    lastActionError = '';
+                    actionHistory.push(historyEntry);
                     continue;
                 }
 
