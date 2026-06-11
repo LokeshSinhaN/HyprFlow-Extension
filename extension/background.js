@@ -14,6 +14,7 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 // ─── STATE ─────────────────────────────────────────────────────
 let isRunning = false;
 let currentTabId = null;
+let isAgentMode = false;
 
 // Persisted after each agent run so "Generate Code" can use them
 let lastAgentHistory = [];
@@ -62,6 +63,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         isRunning = true;
         const prompt = message.payload.prompt;
+        isAgentMode = message.payload.agentMode;
 
         chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
             if (tabs.length === 0) return;
@@ -882,7 +884,8 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     },
                     // Enhancement 1: Plan-aware execution
                     planSteps: planSteps,
-                    currentPlanStepIndex: currentPlanStepIndex
+                    currentPlanStepIndex: currentPlanStepIndex,
+                    agentMode: isAgentMode
                 };
 
                 // 4. Ask the backend brain (AI) for the next action
@@ -1084,6 +1087,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     sendLogToPanel(`API Endpoint: ${apiEndpoint}`, 'info');
                     sendLogToPanel(`API Params: ${JSON.stringify(apiParams)}`, 'info');
 
+                    const keepAliveInterval = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
                     const apiApproval = await new Promise(resolve => {
                         const listener = (msg) => {
                             if (msg.type === 'HITL_RESPONSE') {
@@ -1104,6 +1108,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                             }
                         }).catch(() => { });
                     });
+                    clearInterval(keepAliveInterval);
 
                     if (apiApproval?.reply && /^(no|cancel|stop)$/i.test(apiApproval.reply.trim())) {
                         sendLogToPanel('Human cancelled the back-office API call.', 'warn');
@@ -1170,6 +1175,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     sendLogToPanel(`⏸️ Agent paused — waiting indefinitely for human input...`, 'warn');
 
                     // Pause the loop indefinitely and wait for user response from the UI panel
+                    const keepAliveInterval = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
                     const userChoice = await new Promise(resolve => {
                         const listener = (msg) => {
                             // FIX: Must match the exact string sent by panel.js
@@ -1189,6 +1195,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                             }
                         }).catch(() => { });
                     });
+                    clearInterval(keepAliveInterval);
 
                     // Resume loop with the human's response
                     historyEntry.actionSuccess = true;

@@ -34,6 +34,7 @@ class ExtensionController extends Controller
         set_time_limit(120);
 
         $prompt = $request->input('prompt');
+        $agentMode = (bool) $request->input('agentMode', false);
         $url = $request->input('url');
         $elements = $request->input('elements', []);
         $imageBase64 = $request->input('image');
@@ -111,6 +112,9 @@ class ExtensionController extends Controller
         $systemPrompt = config('automation.system_prompt_separation', true) ? $this->buildSystemPrompt() : null;
         if ($systemPrompt) {
             $systemPrompt = str_replace('{{API_CATALOG_PLACEHOLDER}}', $apiCatalogBlock, $systemPrompt);
+            if ($agentMode) {
+                $systemPrompt .= "\n\n# AGENT MODE ACTIVE: Do NOT generate strict CSS selectors. Rely EXCLUSIVELY on plain-text instructions using the `text_match`, `role_hint`, and `conversational_message` fields to target elements semantically based on their visible text.";
+            }
         }
 
         // Dynamic user prompt
@@ -199,7 +203,7 @@ class ExtensionController extends Controller
             $action = $decision['action'] ?? '';
             $selectorFreeActions = ['ask_user', 'call_api', 'finish', 'navigate', 'extract', 'scroll_down', 'scroll_up', 'action_sequence', 'batch_fill'];
 
-            if (in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector'])) {
+            if (!$agentMode && in_array($action, ['click', 'type', 'hover', 'select_option', 'keyboard_event']) && !empty($decision['selector'])) {
                 $validation = $this->validateCssSelector($decision['selector']);
                 if (!$validation['valid']) {
                     return response()->json([

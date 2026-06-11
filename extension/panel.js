@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const hitlQueryDbBtn = document.getElementById('hitlQueryDbBtn');
     const hitlManualInput = document.getElementById('hitlManualInput');
     const hitlSubmitManualBtn = document.getElementById('hitlSubmitManualBtn');
+    const conversationalText = document.getElementById('conversationalText');
 
     // Listen for messages from background.js
     chrome.runtime.onMessage.addListener((message) => {
@@ -409,6 +410,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (message.payload?.plan) lastGeneratedPlan = message.payload.plan;
         }
 
+        if (message.type === 'CONVERSATIONAL_MESSAGE') {
+            if (conversationalText) {
+                conversationalText.innerHTML = `<strong>Agent:</strong> ${escapeHtml(message.conversational_message || '')}`;
+            }
+        }
+
         if (message.type === 'AGENT_DONE') {
             setRunning(false);
 
@@ -452,6 +459,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         clearLogs();
         hideCodeBanner();
+        if (conversationalText) conversationalText.innerHTML = '';
         generateBtn.disabled = true;
         setRunning(true);
 
