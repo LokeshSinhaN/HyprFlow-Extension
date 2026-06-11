@@ -1445,9 +1445,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                         postPopupDirective = `POST-SAVE ERROR DETECTED: After clicking Save/Submit, ${errorElements.length} error(s) appeared on the page: `
                                             + `"${errorTexts.slice(0, 500)}". `
                                             + `DO NOT call finish. DO NOT ignore these errors. `
-                                            + `You MUST re-enter the conversational loop: summarize these new errors to the user `
-                                            + `using an ask_user action, suggest SQL query lookups or manual data entry, `
-                                            + `and wait for the human to provide corrected values before attempting to save again.`;
+                                            + `You MUST re-enter the conversational loop, summarize these new errors to the user, call the back-office API for missing values, fill the exact failing fields, and save again.`;
                                     } else {
                                         // No errors detected — check if page changed (success indicator)
                                         const pageUrlNow = postSaveObserve.url || '';

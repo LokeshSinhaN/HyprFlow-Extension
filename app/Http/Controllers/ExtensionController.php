@@ -66,6 +66,7 @@ class ExtensionController extends Controller
         $formFieldStatus = $this->buildFormFieldStatus($elements);
         $sopProgressBlock = $this->buildSopProgressBlock($sopProgress, $history);
         $planContext = $this->buildPlanContext($planSteps, $currentPlanStepIndex);
+        $workflowProtocolBlock = $this->buildWorkflowProtocolBlock($prompt);
 
         // Gap C: Site Knowledge
         $siteKnowledgeBlock = '';
@@ -118,7 +119,7 @@ class ExtensionController extends Controller
         }
 
         // Dynamic user prompt
-        $userPrompt = "{$modeIndicator}\n{$somDescription}\nGoal: {$prompt}\n{$planContext}\n{$popupDirectiveBlock}\n{$reflexionBlock}\n{$siteKnowledgeBlock}\n{$dropdownStatesBlock}\n{$comboboxStatesBlock}\n{$formFieldStatus}\n{$sopProgressBlock}\n{$multiActionBlock}\n\n# CURRENT STATE\nURL: {$url}\nElements:\n{$pageInfo}\n\n# ACTION HISTORY\n{$historyJson}\n\n# CLICKED ELEMENTS:\n{$clickedList}\n\n# BLOCKED SELECTORS:\n{$blockedList}\n\n# TOGGLE STATE:\n{$toggleStateInfo}";
+        $userPrompt = "{$modeIndicator}\n{$somDescription}\nGoal: {$prompt}\n{$planContext}\n{$workflowProtocolBlock}\n{$popupDirectiveBlock}\n{$reflexionBlock}\n{$siteKnowledgeBlock}\n{$dropdownStatesBlock}\n{$comboboxStatesBlock}\n{$formFieldStatus}\n{$sopProgressBlock}\n{$multiActionBlock}\n\n# CURRENT STATE\nURL: {$url}\nElements:\n{$pageInfo}\n\n# ACTION HISTORY\n{$historyJson}\n\n# CLICKED ELEMENTS:\n{$clickedList}\n\n# BLOCKED SELECTORS:\n{$blockedList}\n\n# TOGGLE STATE:\n{$toggleStateInfo}";
 
         try {
             $response = null;
@@ -312,15 +313,36 @@ class ExtensionController extends Controller
 
         $rejectionNote = $isRejected ? "\nCRITICAL: User REJECTED previous plan. Generate a COMPLETELY DIFFERENT approach." : "";
         
-        $claimProtocol = "If the user goal involves 'claim', 'rejected', 'approve', or 'fix', your plan MUST strictly consist of these 6 steps:\n"
-            . "Step 1: INSPECTION - Click action menu and select 'View Errors' on the claim row.\n"
-            . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
-            . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
-            . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
-            . "Step 5: RESOLUTION - Fix validation errors using back-office API lookups and human-in-the-loop (ask_user).\n"
-            . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
+        $isNewProfessionalClaim = $this->isNewProfessionalClaimPrompt($prompt);
+        $patientName = $this->extractPatientNameFromCreateClaimPrompt($prompt);
+        $patientFirstName = $this->extractFirstName($patientName);
+        $patientLastName = $this->extractLastName($patientName);
 
-        $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\n{$claimProtocol}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 10 steps. Be specific about clicks, typing, verification.";
+        if ($isNewProfessionalClaim) {
+            $claimProtocol = "If the user goal is to create, open, or start a New Professional Claim, your plan MUST strictly consist of these 8 steps:\n"
+                . "Step 1: NAVIGATION - On the Claims page, click the 'New Professional Claim' option.\n"
+                . "Step 2: QUICK FILL - Open the claim form and locate 'Quick Fill from patient record'.\n"
+                . "Step 3: PATIENT SEARCH - Search using ONLY the patient first name from the prompt (e.g., 'Dev' for 'Dev Aica'), then select the matching patient result.\n"
+                . "Step 4: VERIFY AUTO-POPULATION - Confirm whether patient details populated the claim form.\n"
+                . "Step 5: API-DRIVEN COMPLETION - If details are missing, call the back-office API and fill required columns one-by-one.\n"
+                . "Step 6: FIRST SAVE - Click 'Save Claim' and wait for validation errors or redirect.\n"
+                . "Step 7: ERROR RESOLUTION - If validation errors remain, call the back-office API and fill the exact failing fields, including dropdowns, DOBs, and searchable dropdowns.\n"
+                . "Step 8: FINAL SAVE AND REPORT - Click 'Save Claim' again; only finish after redirect to /claims, then report the displayed success or error message to the user.\n";
+        } else {
+            $claimProtocol = "If the user goal involves 'claim', 'rejected', 'approve', or 'fix', your plan MUST strictly consist of these 6 steps:\n"
+                . "Step 1: INSPECTION - Click action menu and select 'View Errors' on the claim row.\n"
+                . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
+                . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
+                . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
+                . "Step 5: RESOLUTION - Fix validation errors using back-office API lookups and human-in-the-loop (ask_user).\n"
+                . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
+        }
+
+        $patientContext = $isNewProfessionalClaim && $patientName
+            ? "\nPatient context extracted from the prompt: full name='{$patientName}', first_name='{$patientFirstName}', last_name='{$patientLastName}'. Use '{$patientFirstName}' as the Quick Fill search term.\n"
+            : '';
+
+        $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$patientContext}{$rejectionNote}\n\n{$claimProtocol}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 10 steps. Be specific about clicks, typing, verification.";
 
         try {
             $response = $this->ai->generate($aiPrompt, config('automation.primary_ai', 'gemini'));
@@ -402,6 +424,23 @@ You are an intelligent, collaborative AI agent for browser-based medical claims 
     "text_match": "View Errors"
   }
 - Let the extension handle text filtering safely using the "text_match" field instead of creating compound selector strings.
+
+# ═══════════════════════════════════════════════════════════════════════
+# MANDATORY NEW PROFESSIONAL CLAIM PROTOCOL (CREATE NEW CLAIM)
+# ═══════════════════════════════════════════════════════════════════════
+When the user goal asks to create, open, start, or submit a "New Professional Claim", execute this workflow without deviation:
+
+1. NAVIGATION: On the Claims page, click the "New Professional Claim" option. Do not enter the rejected-claim Edit flow unless the form is already open.
+2. QUICK FILL PATIENT SEARCH: Locate the "Quick Fill from patient record" section at the top of the claim form.
+   - Extract the patient name from the user prompt.
+   - Search using ONLY the patient FIRST NAME in the Quick Fill search field. Example: for "Dev Aica", type exactly "Dev", not "Dev Aica", not "Aica, Dev".
+   - Wait for the patient result dropdown. Select the matching patient result. If the result appears as "Lastname, Firstname", click the row that contains the supplied first name and last name.
+3. VERIFY AUTO-POPULATION: After selection, confirm whether patient details populated the form.
+4. BACK-OFFICE API COMPLETION: If patient details are missing or required columns remain empty, do not guess. Use `call_api` with the catalog endpoints to retrieve patient, organization, eligibility, or claim context, then fill required columns one-by-one.
+5. FIRST SAVE: Click "Save Claim" and wait for validation errors or redirect to /claims.
+6. POST-SAVE ERROR RESOLUTION: If validation errors remain, summarize all errors, call the back-office API for missing values, and fill the exact failing fields. This includes text fields, DOBs, dropdowns, and searchable dropdowns.
+7. FINAL SAVE: Click "Save Claim" again after errors are resolved.
+8. REPORT RESULT: Finish only after the page redirects to /claims or a final success/error message is visible. Report the displayed message to the user.
 
 # ═══════════════════════════════════════════════════════════════════════
 # MANDATORY REJECTED CLAIMS PROTOCOL (DEFAULT STEPS)
@@ -499,8 +538,8 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 
 ## 4F. DROPDOWNS, COMBOBOXES & DROPDOWN SELECTIONS
 - Modern framework comboboxes (like Radix/Shadcn) use a `<button>` tag displaying "Search patient..." as an anchor. You CANNOT use the "type" action on a `<button>` tag — this causes an "Illegal invocation" error. Always click it first to reveal the search container.
-- **Strict Query Format Rule:** When typing into any patient or provider lookup search box on this EHR platform, you MUST type ONLY the Last Name. Typing a comma or the first name (e.g., "Santos, Abigail" or "Abigail Santos") will return zero results.
-- **Selection Rule:** After typing ONLY the Last Name, the dropdown options will render. You MUST target your subsequent click directly onto the element matching the full `"Lastname, Firstname"` record text string. Do not assume typing text auto-selects the row.
+- **Quick Fill Query Format Rule:** For New Professional Claim creation, type ONLY the patient FIRST NAME from the prompt. For rejected-claim Edit/Quick Fill, type ONLY the patient LAST NAME. Never type the full "First Last" string into Medora patient search boxes.
+- **Selection Rule:** After typing the allowed single-name search term, the dropdown options will render. You MUST target your subsequent click directly onto the element matching the patient record. If the option appears as `"Lastname, Firstname"`, click that exact patient result.
 
 ## 4G. SCROLLING
 - If scrolled=0, the container cannot scroll further. Try a different container, use Tab, or interact directly.
@@ -563,6 +602,85 @@ SYSTEM;
         }
         $block .= "→ Currently on step " . ($currentIndex + 1) . ". Complete it, then set \"planStepCompleted\":true.\n";
         return $block;
+    }
+
+    private function buildWorkflowProtocolBlock(string $prompt): string
+    {
+        if (!$this->isNewProfessionalClaimPrompt($prompt)) {
+            return '';
+        }
+
+        $patientName = $this->extractPatientNameFromCreateClaimPrompt($prompt);
+        $firstName = $this->extractFirstName($patientName);
+        $lastName = $this->extractLastName($patientName);
+        $patientLine = $patientName
+            ? "Patient name supplied: '{$patientName}'. Use first_name='{$firstName}' for Quick Fill search. Expected matching result may contain last_name='{$lastName}' and first_name='{$firstName}'.\n"
+            : "No quoted patient name was detected. Extract the patient name from the user goal, then use only the first name for the Quick Fill search.\n";
+
+        return <<<WORKFLOW
+
+# MANDATORY NEW PROFESSIONAL CLAIM WORKFLOW
+The current goal is to create a New Professional Claim. Follow this protocol instead of the rejected-claim Edit flow:
+1. Click "New Professional Claim" from the Claims page.
+2. Open "Quick Fill from patient record".
+3. Search using ONLY the patient first name. {$patientLine}4. Select the matching patient result and verify patient details auto-populated.
+5. If required fields remain empty, call the back-office API and fill required columns one-by-one.
+6. Click "Save Claim".
+7. If validation errors remain, call the back-office API for the missing values and fill each failing field exactly, including dropdowns, DOBs, and searchable dropdowns.
+8. Click "Save Claim" again.
+9. Finish only after redirect to /claims or a final success/error message appears, then report that displayed message to the user.
+WORKFLOW;
+    }
+
+    private function isNewProfessionalClaimPrompt(string $prompt): bool
+    {
+        return (bool) preg_match('/\b(create|open|start)\b.*\b(new\s+professional\s+claim|professional\s+claim|new\s+claim)\b|\bnew\s+professional\s+claim\b/i', $prompt);
+    }
+
+    private function extractPatientNameFromCreateClaimPrompt(string $prompt): string
+    {
+        $normalized = str_replace(['“', '”'], '"', $prompt);
+        $normalized = str_replace(['‘', '’'], "'", $normalized);
+
+        if (preg_match('/\bpatient\b\s*(?:named|name|is)?\s*["\']?([^"\'.,;:]+(?:\s+[^"\'.,;:]+){0,3})["\']?/i', $normalized, $matches)) {
+            return $this->cleanExtractedName($matches[1]);
+        }
+
+        if (preg_match('/\bfor\s+patient\b\s*["\']?([^"\'.,;:]+(?:\s+[^"\'.,;:]+){0,3})["\']?/i', $normalized, $matches)) {
+            return $this->cleanExtractedName($matches[1]);
+        }
+
+        return '';
+    }
+
+    private function cleanExtractedName(string $name): string
+    {
+        return trim(preg_replace('/\s+/', ' ', str_replace(['"', "'"], '', $name)));
+    }
+
+    private function extractFirstName(string $patientName): string
+    {
+        if (!$patientName) {
+            return '';
+        }
+
+        $parts = preg_split('/\s+/', trim($patientName));
+        return $parts[0] ?? '';
+    }
+
+    private function extractLastName(string $patientName): string
+    {
+        if (!$patientName) {
+            return '';
+        }
+
+        if (str_contains($patientName, ',')) {
+            $parts = explode(',', $patientName, 2);
+            return $this->cleanExtractedName($parts[0]);
+        }
+
+        $parts = preg_split('/\s+/', trim($patientName));
+        return $parts[count($parts) - 1] ?? '';
     }
 
     private function buildMultiActionBlock(): string
@@ -652,7 +770,7 @@ Use this catalog to construct your "action": "call_api" parameters.
 Do NOT invent endpoints or parameters. Explicitly follow these routes:
 
 **1. Patients Module (Ability: patients:read)**
-- GET /api/v1/patients  -> List patients for the active organization. Optional query filters: ?last_name=STRING
+- GET /api/v1/patients  -> List patients for the active organization. Optional query filters: ?first_name=STRING, ?last_name=STRING, or both.
 - GET /api/v1/patients/{id} -> Retrieve a single patient profile by their unique ID.
 
 **2. Claims Module (Ability: claims:read)**

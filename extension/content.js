@@ -1751,6 +1751,14 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             // Option text starts with search text (common for autocomplete)
             if (optLower.startsWith(searchLower)) return true;
 
+            // Prefer patient-style "Lastname, Firstname" options when the search term is the first name.
+            const commaMatch = firstLine.match(/^([^,]+),\s*(.+)$/);
+            if (commaMatch) {
+                const first = commaMatch[2].trim().split(/\s+/)[0].toLowerCase();
+                if (first === searchLower) return true;
+                if (first.startsWith(searchLower)) return true;
+            }
+
             // Search text contains the option's first line (reverse containment)
             if (searchLower.includes(firstLine) && firstLine.length > 2) return true;
 
@@ -1774,6 +1782,15 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             if (optLower.startsWith(searchLower)) return 75;
             if (firstLine.includes(searchLower)) return 60;    // Contains in first line
             if (optLower.includes(searchLower)) return 40;     // Contains anywhere
+
+            // Patient-style "Lastname, Firstname" match when the search term is the first name.
+            const commaMatch = firstLine.match(/^([^,]+),\s*(.+)$/);
+            if (commaMatch) {
+                const first = commaMatch[2].trim().split(/\s+/)[0].toLowerCase();
+                if (first === searchLower) return 92;
+                if (first.startsWith(searchLower)) return 86;
+            }
+
             if (searchLower.includes(firstLine) && firstLine.length > 2) return 30;
             return 0;
         }
