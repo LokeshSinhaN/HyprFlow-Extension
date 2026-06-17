@@ -40,6 +40,8 @@ class ExtensionController extends Controller
         $imageBase64 = $request->input('image');
         $somMap = $request->input('somMap', []);
         $dropdownStates = $request->input('dropdownStates', []);
+        $validationErrors = $request->input('validationErrors', []);
+        $quickFillState = $request->input('quickFillState', []);
         $sopProgress = $request->input('sopProgress', []);
 
         if (!$prompt) {
@@ -62,6 +64,8 @@ class ExtensionController extends Controller
         $blockedList = $this->buildBlockedList($clickedSelectors);
         $toggleStateInfo = !empty($toggledOptions) ? json_encode($toggledOptions, JSON_UNESCAPED_UNICODE) : 'None yet';
         $dropdownStatesBlock = $this->buildDropdownStatesBlock($dropdownStates);
+        $validationErrorsBlock = $this->buildValidationErrorsBlock($validationErrors);
+        $quickFillStateBlock = $this->buildQuickFillStateBlock($quickFillState);
         $comboboxStatesBlock = $this->buildComboboxStatesBlock($elements);
         $formFieldStatus = $this->buildFormFieldStatus($elements);
         $sopProgressBlock = $this->buildSopProgressBlock($sopProgress, $history);
@@ -119,7 +123,7 @@ class ExtensionController extends Controller
         }
 
         // Dynamic user prompt
-        $userPrompt = "{$modeIndicator}\n{$somDescription}\nGoal: {$prompt}\n{$planContext}\n{$workflowProtocolBlock}\n{$popupDirectiveBlock}\n{$reflexionBlock}\n{$siteKnowledgeBlock}\n{$dropdownStatesBlock}\n{$comboboxStatesBlock}\n{$formFieldStatus}\n{$sopProgressBlock}\n{$multiActionBlock}\n\n# CURRENT STATE\nURL: {$url}\nElements:\n{$pageInfo}\n\n# ACTION HISTORY\n{$historyJson}\n\n# CLICKED ELEMENTS:\n{$clickedList}\n\n# BLOCKED SELECTORS:\n{$blockedList}\n\n# TOGGLE STATE:\n{$toggleStateInfo}";
+        $userPrompt = "{$modeIndicator}\n{$somDescription}\nGoal: {$prompt}\n{$planContext}\n{$workflowProtocolBlock}\n{$popupDirectiveBlock}\n{$reflexionBlock}\n{$siteKnowledgeBlock}\n{$dropdownStatesBlock}\n{$validationErrorsBlock}\n{$quickFillStateBlock}\n{$comboboxStatesBlock}\n{$formFieldStatus}\n{$sopProgressBlock}\n{$multiActionBlock}\n\n# CURRENT STATE\nURL: {$url}\nElements:\n{$pageInfo}\n\n# ACTION HISTORY\n{$historyJson}\n\n# CLICKED ELEMENTS:\n{$clickedList}\n\n# BLOCKED SELECTORS:\n{$blockedList}\n\n# TOGGLE STATE:\n{$toggleStateInfo}";
 
         try {
             $response = null;
@@ -217,7 +221,9 @@ class ExtensionController extends Controller
 
             // Validate selector presence (only for actions that require selectors)
             if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector'])) {
-                if (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
+                if (!empty($decision['field'])) {
+                    // Dynamic field-intent targeting is resolved in the content script.
+                } elseif (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
                     $decision['selector'] = $somMap[(string)$decision['somIndex']];
                 } elseif (!in_array($action, $selectorFreeActions)) {
                     return response()->json(['error' => 'Empty selector for ' . $action, 'retry' => true], 500);
@@ -503,10 +509,11 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 
 ## 3A. POST-SAVE ERROR RECOVERY
 1. After clicking "Save Claim", observe the page for new or unresolved verification error tags.
-2. If errors exist, DO NOT call "finish".
-3. Read ALL new error messages simultaneously.
-4. Execute `call_api` autonomously to try and resolve all new errors at once.
-5. If the back-office API lacks the answers, emit a single, consolidated `ask_user` action listing every remaining error that requires human input.
+2. If the system provides validation targets, fill those exact fields first using `field` intent when available.
+3. If errors exist, DO NOT call "finish".
+4. Read ALL new error messages simultaneously.
+5. Execute `call_api` autonomously to try and resolve all new errors at once.
+6. If the back-office API lacks the answers, emit a single, consolidated `ask_user` action listing every remaining error that requires human input.
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 4: CORE AUTOMATION RULES
@@ -519,10 +526,11 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 ## 4B. PRECISION
 - Only interact with elements explicitly listed in the DOM state. Do NOT hallucinate or guess CSS selectors.
 - If an element is not in the elements list, it does not exist on the page.
+- Prefer semantic `field` intent over brittle CSS selectors for form fields. Supported intents: `patient_search`, `insured_id`, `state`, `procedure`, `diagnosis_pointer`, `charges`.
 
 ## 4C. EFFICIENCY
 - Use "action_sequence" to chain up to 5 simple, independent actions (e.g., filling obvious fields).
-- Use "batch_fill" to fill multiple standard text inputs at once. Do NOT use batch_fill for dropdowns.
+- Use "batch_fill" to fill multiple standard text inputs at once. You may use `field` intent for dynamic field resolution, but do NOT use batch_fill for searchable dropdowns unless each dropdown has a clear `field` intent and the value is already known.
 - NEVER use action_sequence or batch_fill for fields that were flagged with errors — those MUST go through the ask_user flow.
 
 ## 4D. ANTI-LOOP
@@ -540,12 +548,25 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 - Modern framework comboboxes (like Radix/Shadcn) use a `<button>` tag displaying "Search patient..." as an anchor. You CANNOT use the "type" action on a `<button>` tag — this causes an "Illegal invocation" error. Always click it first to reveal the search container.
 - **Quick Fill Query Format Rule:** For New Professional Claim creation, type ONLY the patient FIRST NAME from the prompt. For rejected-claim Edit/Quick Fill, type ONLY the patient LAST NAME. Never type the full "First Last" string into Medora patient search boxes.
 - **Selection Rule:** After typing the allowed single-name search term, the dropdown options will render. You MUST target your subsequent click directly onto the element matching the patient record. If the option appears as `"Lastname, Firstname"`, click that exact patient result.
+- **Quick Fill Failure Rule:** If `textMatchFailed` is true, the option was NOT selected. Do NOT treat the click as successful. Do NOT click "New Professional Claim" again. Keep the current form/dropdown context and select the exact visible patient option.
+- **Procedure vs Diagnosis Pointer Rule:** Procedure/CPT and Diagnosis Pointer are separate fields. When filling procedure code `97161`, target the field labeled Procedure, CPT, or HCPCS. Do NOT click Diagnosis Pointer for the procedure code. If "No options found" appears in the Diagnosis Pointer dropdown, interpret it as a Diagnosis Pointer issue, not a Procedure failure.
 
 ## 4G. SCROLLING
 - If scrolled=0, the container cannot scroll further. Try a different container, use Tab, or interact directly.
 - Do NOT scroll endlessly — if you've scrolled 3+ times without finding the target, use a different approach.
+- Prefer `field` intent targeting and the validation target list over blind scrolling. Scroll to the exact failing field when validation targets are provided.
 
-## 4H. POST-ACTION VERIFICATION
+## 4H. FIELD-INTENT TARGETING
+- Use `field` intent when the label is clear but the CSS selector is brittle:
+  - `patient_search` for the Quick Fill patient search box.
+  - `insured_id` for Insured/Subscribers/Member ID.
+  - `state` for patient State/Province.
+  - `procedure` for Procedure/CPT/HCPCS.
+  - `diagnosis_pointer` for Diagnosis Pointer/DX Pointer.
+  - `charges` for Charges/Amount/Fee.
+- Do NOT use structural selectors like `div:nth-of-type(...)` for service-line fields when a `field` intent can resolve the label dynamically.
+
+## 4I. POST-ACTION VERIFICATION
 - After submitting forms: verify success/error messages before calling finish.
 - After Quick Fill: verify which fields got populated and which remain empty.
 - After typing into combobox: verify the dropdown appeared and option was selected.
@@ -624,7 +645,7 @@ The current goal is to create a New Professional Claim. Follow this protocol ins
 1. Click "New Professional Claim" from the Claims page.
 2. Open "Quick Fill from patient record".
 3. Search using ONLY the patient first name. {$patientLine}4. Select the matching patient result and verify patient details auto-populated.
-5. If required fields remain empty, call the back-office API and fill required columns one-by-one.
+5. If required fields remain empty, call the back-office API and fill required columns using dynamic field intents (`insured_id`, `state`, `procedure`, `diagnosis_pointer`, `charges`) instead of brittle structural selectors.
 6. Click "Save Claim".
 7. If validation errors remain, call the back-office API for the missing values and fill each failing field exactly, including dropdowns, DOBs, and searchable dropdowns.
 8. Click "Save Claim" again.
@@ -715,6 +736,34 @@ WORKFLOW;
         return $block;
     }
 
+    private function buildValidationErrorsBlock(array $validationErrors): string
+    {
+        if (empty($validationErrors)) return '';
+        $block = "\n# VALIDATION TARGETS (TRUTH SOURCE):\n";
+        foreach ($validationErrors as $i => $e) {
+            $field = $e['field'] || $e['fieldIntent'] || 'Unknown field';
+            $selector = $e['selector'] ? " selector={$e['selector']}" : '';
+            $type = !empty($e['isCombobox']) ? ' combobox/searchable dropdown' : ($e['type'] ? " {$e['type']}" : '');
+            $block .= ($i + 1) . ". {$field}{$type}: {$e['text']}.{$selector}\n";
+        }
+        $block .= "Rules: Fill these exact failing fields first. Use field intents for Procedure/CPT, Diagnosis Pointer, Charges, State, and Insured ID. Do NOT scroll randomly.\n";
+        return $block;
+    }
+
+    private function buildQuickFillStateBlock(array $quickFillState): string
+    {
+        if (empty($quickFillState) || empty($quickFillState['active'])) return '';
+        $searched = !empty($quickFillState['searched']) ? 'searched' : 'not searched';
+        $optionClicked = !empty($quickFillState['optionClicked']) ? 'option clicked' : 'option not clicked';
+        $selected = !empty($quickFillState['selected']) ? 'selected' : 'not selected';
+        $restarts = (int) ($quickFillState['restartCount'] ?? 0);
+        $patient = $quickFillState['patientName'] ?? '';
+        $block = "\n# QUICK FILL STATE:\nactive=true, {$searched}, {$optionClicked}, {$selected}, restarts={$restarts}";
+        if ($patient) $block .= ", patient={$patient}";
+        $block .= "\nRules: If the patient dropdown is open, click the exact matching patient option. Do NOT click New Professional Claim again while still on /claims. If the option click failed, retry exact option selection before continuing.\n";
+        return $block;
+    }
+
     private function buildComboboxStatesBlock(array $elements): string
     {
         $combos = array_filter($elements, fn($el) => !empty($el['comboboxState']['isCombobox']));
@@ -787,6 +836,9 @@ Do NOT invent endpoints or parameters. Explicitly follow these routes:
 - GET /api/v1/organizations -> List organizations the authenticated user belongs to.
 - GET /api/v1/organizations/{id} -> Retrieve a single organization metadata profile.
 - GET /api/v1/auth/me -> Return the active user profile identity context and organizational assignment mapping.
+
+**5. New Professional Claim Test Results**
+- GET /test-results -> Return fixed sample claim result data for new professional claim creation. No parameters required.
 
 **USAGE PARAMS RULES:**
 - Paths containing `{id}` or `{dos}` placeholders MUST be passed dynamically as path variables. Your parameter block should separate path mapping keys cleanly.

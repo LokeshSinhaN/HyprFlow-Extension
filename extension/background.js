@@ -691,6 +691,15 @@ async function agentLoop(prompt, tabId, planSteps = []) {
     let recentFingerprints = [];      // Last 3 page fingerprints for stale detection
     let staleStateCount = 0;          // Consecutive steps with identical fingerprints
     let lastPageUrl = '';             // Track URL changes for vision triggering
+    let quickFillState = {
+        active: false,
+        searched: false,
+        optionClicked: false,
+        selected: false,
+        patientName: '',
+        restartCount: 0,
+        lastSearch: ''
+    };
 
     try { // ── OUTER TRY: guarantees AGENT_DONE fires even on unhandled crash ──
         for (let step = 0; step < maxSteps && isRunning; step++) {
@@ -882,6 +891,10 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         recentNewFieldRate: sopProgress.recentNewFieldRate,
                         isStagnating: sopProgress.isStagnating
                     },
+                    // Quick Fill state
+                    quickFillState: quickFillState,
+                    // Validation errors with field context when available
+                    validationErrors: observeResult.validationErrors || [],
                     // Enhancement 1: Plan-aware execution
                     planSteps: planSteps,
                     currentPlanStepIndex: currentPlanStepIndex,
@@ -1237,7 +1250,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     for (const subAction of aiDecision.actions.slice(0, 5)) {
                         // Guard: skip sub-actions with missing selectors (except navigate/extract/scroll)
                         const selectorOptional = ['navigate', 'extract', 'scroll_down', 'scroll_up', 'keyboard_event'];
-                        if (!subAction.selector && !selectorOptional.includes(subAction.action)) {
+                        if (!subAction.selector && !subAction.field && !selectorOptional.includes(subAction.action)) {
                             seqResults.push({ action: subAction.action, selector: null, success: false, error: 'Missing selector' });
                             sendLogToPanel(`Sequence step skipped: ${subAction.action} has no selector`, 'warn');
                             break;
@@ -1381,6 +1394,17 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     if (actionResult) {
                         actionSuccess = actionResult.success;
 
+                        if (isTextMatchFailure(aiDecision, actionResult)) {
+                            actionSuccess = false;
+                            actionResult.error = `Text match failed for "${actionResult.searchedFor || aiDecision.text_match || ''}". Do not treat this as a successful click.`;
+                            postPopupDirective = `TEXT MATCH FAILED: The previous click did not actually match "${actionResult.searchedFor || aiDecision.text_match || ''}". Retry with the exact visible option or field. Do NOT continue as if the click succeeded.`;
+                        }
+
+                        const quickFillDirective = updateQuickFillState(aiDecision, actionResult, currentTabUrl, lastObservedElements);
+                        if (quickFillDirective && !postPopupDirective) {
+                            postPopupDirective = quickFillDirective;
+                        }
+
                         // Enhancement 7: Scroll Verification — detect zero-scroll and inject directive
                         if ((aiDecision.action === 'scroll_down' || aiDecision.action === 'scroll_up') && actionResult.success) {
                             if (actionResult.scrollFailed || (actionResult.scrolled === 0 && !actionResult.scrollRecovery)) {
@@ -1414,39 +1438,40 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                 // Wait for potential error messages to render
                                 await waitForStability(currentTabId, 3000);
 
-                                // Re-observe the page to check for new error elements
+                                // Re-observe the page and extract validation errors with nearby field context
                                 const postSaveObserve = await executeContentScript(currentTabId, 'OBSERVE');
-                                if (postSaveObserve && postSaveObserve.elements) {
-                                    // Look for error indicators in the DOM
-                                    const errorElements = postSaveObserve.elements.filter(el => {
-                                        const text = (el.text || '').toLowerCase();
-                                        const cls = (el.className || '').toLowerCase();
-                                        const role = (el.role || '').toLowerCase();
-                                        return (
-                                            text.includes('error') || text.includes('invalid') ||
-                                            text.includes('required') || text.includes('must be') ||
-                                            text.includes('cannot be') || text.includes('is not valid') ||
-                                            cls.includes('error') || cls.includes('invalid') ||
-                                            cls.includes('validation') || cls.includes('alert-danger') ||
-                                            role === 'alert'
-                                        );
-                                    });
+                                const validationErrors = await executeContentScript(currentTabId, 'GET_VALIDATION_ERRORS', null, 3);
+                                const errors = (validationErrors && validationErrors.success ? validationErrors.errors : []) || [];
+                                const fallbackErrorElements = postSaveObserve && postSaveObserve.elements ? postSaveObserve.elements.filter(el => {
+                                    const text = (el.text || '').toLowerCase();
+                                    const cls = (el.className || '').toLowerCase();
+                                    const role = (el.role || '').toLowerCase();
+                                    return (
+                                        text.includes('error') || text.includes('invalid') ||
+                                        text.includes('required') || text.includes('must be') ||
+                                        text.includes('cannot be') || text.includes('is not valid') ||
+                                        cls.includes('error') || cls.includes('invalid') ||
+                                        cls.includes('validation') || cls.includes('alert-danger') ||
+                                        role === 'alert'
+                                    );
+                                }) : [];
 
-                                    if (errorElements.length > 0) {
-                                        const errorTexts = errorElements
-                                            .map(el => el.text || el.ariaLabel || '')
-                                            .filter(t => t.length > 0)
-                                            .slice(0, 10)
-                                            .join('; ');
+                                if (errors.length > 0 || fallbackErrorElements.length > 0) {
+                                    const errorTexts = errors.length > 0
+                                        ? errors.map(e => `${e.field || e.fieldIntent || 'Unknown field'}: ${e.text}`).slice(0, 10).join('; ')
+                                        : fallbackErrorElements.map(el => el.text || el.ariaLabel || '').filter(t => t.length > 0).slice(0, 10).join('; ');
 
-                                        historyEntry.postSaveErrors = errorTexts;
-                                        sendLogToPanel(`⚠️ Post-save errors detected (${errorElements.length}): ${errorTexts.slice(0, 200)}`, 'error');
+                                    historyEntry.postSaveErrors = errorTexts;
+                                    historyEntry.validationTargets = errors;
+                                    sendLogToPanel(`⚠️ Post-save errors detected (${errors.length || fallbackErrorElements.length}): ${errorTexts.slice(0, 200)}`, 'error');
 
-                                        postPopupDirective = `POST-SAVE ERROR DETECTED: After clicking Save/Submit, ${errorElements.length} error(s) appeared on the page: `
-                                            + `"${errorTexts.slice(0, 500)}". `
-                                            + `DO NOT call finish. DO NOT ignore these errors. `
-                                            + `You MUST re-enter the conversational loop, summarize these new errors to the user, call the back-office API for missing values, fill the exact failing fields, and save again.`;
-                                    } else {
+                                    const validationDirective = buildValidationDirective(errors);
+                                    postPopupDirective = `POST-SAVE ERROR DETECTED: After clicking Save/Submit, ${errors.length || fallbackErrorElements.length} error(s) appeared on the page: `
+                                        + `"${errorTexts.slice(0, 500)}". `
+                                        + (validationDirective ? validationDirective + ' ' : '')
+                                        + `DO NOT call finish. DO NOT ignore these errors. `
+                                        + `You MUST re-enter the conversational loop, summarize these new errors to the user, call the back-office API for missing values, fill the exact failing fields, and save again.`;
+                                } else {
                                         // No errors detected — check if page changed (success indicator)
                                         const pageUrlNow = postSaveObserve.url || '';
                                         sendLogToPanel('No post-save errors detected. Save may have succeeded.', 'success');
@@ -1490,7 +1515,8 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                             postPopupDirective = `DROPDOWN VISIBLE BUT NOT AUTO-SELECTED: After typing "${aiDecision.text}" into the field "${aiDecision.selector}", `
                                 + `a dropdown/autocomplete list appeared with visible options: ["${optionsList}"]. `
                                 + `You MUST click the correct matching option from this dropdown in your NEXT action. `
-                                + `Use "click" action targeting the option element (look for [role="option"], li, or similar). `
+                                + `Use field-intent targeting: Procedure/CPT must target the field labeled Procedure/CPT/HCPCS, not Diagnosis Pointer. `
+                                + `If "No options found" appears in Diagnosis Pointer, do not treat it as a Procedure failure unless the Procedure field itself is empty. `
                                 + `Do NOT call "finish" — the value is NOT properly selected until you click the dropdown option. `
                                 + `Do NOT re-type the value. The dropdown should still be visible.`;
                             sendLogToPanel('Dropdown appeared but option not auto-selected — AI must click it next step', 'warn');
@@ -1507,12 +1533,13 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                         // ── ENHANCED: Combobox with no dropdown appeared ──
                         if (actionResult.comboboxNoDropdownAppeared && aiDecision.action === 'type') {
-                            postPopupDirective = `COMBOBOX WARNING: The field "${aiDecision.selector}" is a searchable combobox, `
-                                + `but no dropdown appeared after typing "${aiDecision.text}". Possible causes: `
-                                + `1) The search term didn't match any options. Try a shorter/different search term. `
-                                + `2) The field needs a click first to activate it before typing. `
-                                + `3) There may be a loading delay. Try clicking the field's dropdown arrow/chevron button. `
-                                + `Do NOT call "finish" — the combobox value is NOT set.`;
+            postPopupDirective = `COMBOBOX WARNING: The field "${aiDecision.selector}" is a searchable combobox, `
+                + `but no dropdown appeared after typing "${aiDecision.text}". Possible causes: `
+                + `1) The search term didn't match any options. Try a shorter/different search term. `
+                + `2) The field needs a click first to activate it before typing. `
+                + `3) There may be a loading delay. Try clicking the field's dropdown arrow/chevron button. `
+                + `If this is Procedure/CPT, first verify the Procedure field is the active field before blaming the CPT code. `
+                + `Do NOT call "finish" — the combobox value is NOT set.`;
                             sendLogToPanel('Combobox field — no dropdown appeared after typing', 'warn');
                         }
 
@@ -1653,6 +1680,90 @@ async function agentLoop(prompt, tabId, planSteps = []) {
         sendLogToPanel('Loop ended.', 'info');
         chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => { });
     }
+}
+
+// ─── QUICK FILL STATE HELPERS ───────────────────────────────
+function isClaimsListUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.pathname === '/claims' || parsed.pathname.endsWith('/claims');
+    } catch (e) {
+        return false;
+    }
+}
+
+function hasPatientSelectionEvidence(elements) {
+    if (!elements || elements.length === 0) return false;
+    const textBlob = elements.map(e => [e.text, e.ariaLabel, e.currentValue, e.selectedOptionText].filter(Boolean).join(' ')).join(' ').toLowerCase();
+    return textBlob.includes('save claim') ||
+        textBlob.includes('dev, aica') ||
+        textBlob.includes('aica, dev') ||
+        textBlob.includes('749416') ||
+        textBlob.includes('jan 01, 1900') ||
+        textBlob.includes('jan 1, 1900');
+}
+
+function isPatientSearchType(action, observedElements) {
+    if (!action || action.action !== 'type') return false;
+    const selector = action.selector || '';
+    return observedElements.some(el => {
+        if (el.selector !== selector) return false;
+        const text = [el.text, el.ariaLabel, el.currentValue, el.selectedOptionText].filter(Boolean).join(' ').toLowerCase();
+        return text.includes('search patient') || text.includes('patient search') || text.includes('quick fill');
+    });
+}
+
+function updateQuickFillState(aiDecision, actionResult, currentTabUrl, observedElements) {
+    const action = aiDecision || {};
+    const result = actionResult || {};
+    const clickedText = (result.clickedText || '').toLowerCase();
+
+    if (clickedText.includes('new professional claim')) {
+        quickFillState.active = true;
+        quickFillState.restartCount++;
+        if (quickFillState.restartCount > 1 && isClaimsListUrl(currentTabUrl)) {
+            return 'QUICK FILL RESTART BLOCKED: You already clicked "New Professional Claim" more than once and the page is still the Claims list. Do NOT click it again. Re-open or continue the current claim form, then select the exact patient option from the dropdown.';
+        }
+    }
+
+    if (isPatientSearchType(action, observedElements)) {
+        quickFillState.active = true;
+        quickFillState.searched = true;
+        quickFillState.lastSearch = action.text || quickFillState.lastSearch;
+    }
+
+    if (result.quickFillOptionMatched === true) {
+        quickFillState.active = true;
+        quickFillState.optionClicked = true;
+        quickFillState.selected = true;
+        quickFillState.patientName = result.quickFillOptionText || quickFillState.patientName;
+    }
+
+    if (quickFillState.active && quickFillState.searched && !quickFillState.optionClicked && isClaimsListUrl(currentTabUrl)) {
+        return 'QUICK FILL SELECTION REQUIRED: The patient dropdown opened after typing, but no exact patient option was selected. Do NOT click "New Professional Claim" again. Click the visible option that matches the patient name before continuing.';
+    }
+
+    if (quickFillState.active && quickFillState.optionClicked && !hasPatientSelectionEvidence(observedElements) && isClaimsListUrl(currentTabUrl)) {
+        return 'QUICK FILL DID NOT OPEN FORM: You clicked a patient option, but the page is still the Claims list and no patient/form evidence appeared. Do NOT restart from the Claims list. Re-open the current form if available, then select the exact patient option again.';
+    }
+
+    return '';
+}
+
+function buildValidationDirective(errors) {
+    if (!errors || errors.length === 0) return '';
+    const lines = errors.slice(0, 10).map((err, i) => {
+        const field = err.field || err.fieldIntent || 'Unknown field';
+        const selector = err.selector ? ` Selector: ${err.selector}` : '';
+        const type = err.isCombobox ? ' combobox/searchable dropdown' : (err.type ? ` ${err.type}` : '');
+        return `${i + 1}. ${field}${type} is required/invalid: "${err.text}".${selector}`;
+    });
+    return 'VALIDATION TARGETS DETECTED: ' + lines.join(' ') + ' Fill these exact fields using field-intent targeting. Do NOT scroll randomly. Do NOT confuse Procedure/CPT with Diagnosis Pointer.';
+}
+
+function isTextMatchFailure(action, result) {
+    if (!result || !result.textMatchFailed) return false;
+    return action && (action.action === 'click' || action.action === 'select_option');
 }
 
 // ─── HYBRID VISION: Dynamically decide when to use vision ──────

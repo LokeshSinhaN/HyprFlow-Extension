@@ -224,6 +224,331 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         target.click();
     }
 
+    function normalizeText(value) {
+        return (value || '').toString().toLowerCase().replace(/\s+/g, ' ').trim();
+    }
+
+    function getAccessibleLabel(el) {
+        if (!el) return '';
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        const ariaLabelledBy = el.getAttribute('aria-labelledby');
+        if (ariaLabel) return ariaLabel.trim();
+        if (ariaLabelledBy) {
+            const labelEl = document.getElementById(ariaLabelledBy);
+            if (labelEl) return (labelEl.textContent || '').trim();
+        }
+        const placeholder = el.getAttribute('placeholder') || '';
+        if (placeholder) return placeholder.trim();
+        const name = el.getAttribute('name') || '';
+        if (name) return name.trim();
+        const id = el.id || '';
+        if (id) {
+            try {
+                const labelEl = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+                if (labelEl) return (labelEl.textContent || '').trim();
+            } catch (e) { }
+        }
+        return (el.textContent || '').trim().slice(0, 120);
+    }
+
+    function getNearbySectionText(el, maxDepth = 6) {
+        let current = el;
+        const parts = [];
+        while (current && current !== document.body && maxDepth-- > 0) {
+            const tag = current.tagName ? current.tagName.toLowerCase() : '';
+            if (['section', 'form', 'main', 'div', 'article', 'fieldset', 'table'].includes(tag)) {
+                const heading = current.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+                if (heading) parts.push((heading.textContent || '').trim());
+                const ariaLabel = current.getAttribute('aria-label');
+                if (ariaLabel) parts.push(ariaLabel.trim());
+            }
+            current = current.parentElement;
+        }
+        return parts.filter(Boolean).join(' | ');
+    }
+
+    function isElementVisible(el) {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5) return false;
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0;
+    }
+
+    function isComboboxElement(el) {
+        if (!el) return false;
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const ariaHasPopup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
+        const ariaAutocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
+        return role === 'combobox' || role === 'searchbox' ||
+            ariaHasPopup === 'listbox' || ariaHasPopup === 'true' ||
+            ariaAutocomplete === 'list' || ariaAutocomplete === 'both' ||
+            !!el.getAttribute('aria-controls') || !!el.getAttribute('aria-owns') ||
+            !!el.closest('[class*="combobox"]') || !!el.closest('[class*="autocomplete"]') ||
+            !!el.closest('[class*="searchable"]') || !!el.closest('[class*="react-select"]') ||
+            !!el.closest('[data-radix-combobox-input]');
+    }
+
+    function getInteractiveCandidates() {
+        const selectors = [
+            'input:not([type="hidden"])', 'textarea', 'select',
+            '[role="combobox"]', '[role="searchbox"]', '[role="textbox"]',
+            '[role="button"]', 'button',
+            '[aria-haspopup]', '[aria-controls]',
+            '[class*="combobox"] input', '[class*="autocomplete"] input',
+            '[class*="react-select"] input'
+        ].join(', ');
+        return Array.from(document.querySelectorAll(selectors)).filter(isElementVisible);
+    }
+
+    function scoreFieldIntent(el, intent) {
+        const label = getAccessibleLabel(el);
+        const nearby = getNearbySectionText(el);
+        const combined = normalizeText([label, nearby, el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('aria-label')].filter(Boolean).join(' '));
+        const aliasMap = {
+            patient_search: ['search patient', 'patient search', 'quick fill patient'],
+            insured_id: ['insured', 'subscriber', 'member id', 'memberid', 'insurance id'],
+            state: ['state', 'province'],
+            procedure: ['procedure', 'cpt', 'hcpcs', 'cpt/hcps'],
+            diagnosis_pointer: ['diagnosis pointer', 'diagnosis', 'dx pointer', 'pointer'],
+            charges: ['charges', 'charge', 'amount', 'fee', 'payment']
+        };
+        const aliases = aliasMap[intent] || [];
+        let score = 0;
+        for (const alias of aliases) {
+            const n = normalizeText(alias);
+            if (combined === n) score = Math.max(score, 100);
+            else if (combined.includes(n)) score = Math.max(score, 85);
+            else if (n.split(/\s+/).every(w => w && combined.includes(w))) score = Math.max(score, 65);
+        }
+        if (intent === 'procedure' && combined.includes('diagnosis')) score -= 35;
+        if (intent === 'diagnosis_pointer' && combined.includes('procedure')) score -= 20;
+        if (intent === 'charges' && combined.includes('diagnosis')) score -= 20;
+        return score;
+    }
+
+    function resolveFieldByIntent(intent) {
+        const normalizedIntent = normalizeText(intent || '').replace(/[^a-z0-9_]/g, '_');
+        if (!['patient_search', 'insured_id', 'state', 'procedure', 'diagnosis_pointer', 'charges'].includes(normalizedIntent)) return null;
+
+        let bestEl = null;
+        let bestScore = 0;
+        let bestContext = '';
+        for (const el of getInteractiveCandidates()) {
+            const score = scoreFieldIntent(el, normalizedIntent);
+            if (score > bestScore) {
+                bestScore = score;
+                bestEl = el;
+                bestContext = getNearbySectionText(el);
+            }
+        }
+        if (!bestEl || bestScore < 50) return null;
+
+        try {
+            bestEl.scrollIntoView({ behavior: 'instant', block: 'center' });
+        } catch (e) { }
+        const rect = bestEl.getBoundingClientRect();
+        return {
+            el: bestEl,
+            selector: generateCss(bestEl),
+            label: getAccessibleLabel(bestEl),
+            section: bestContext,
+            score: bestScore,
+            boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+        };
+    }
+
+    function parsePatientSearchText(text) {
+        const raw = normalizeText(text || '');
+        const firstLine = (text || '').split('\n')[0].trim();
+        const comma = firstLine.match(/^([^,]+),\s*(.+)$/);
+        const tokens = { raw, first: '', last: '', terms: [] };
+        if (comma) {
+            tokens.last = normalizeText(comma[1]);
+            tokens.first = normalizeText(comma[2].split(/\s+/)[0]);
+            tokens.terms = [tokens.first, tokens.last, `${tokens.last}, ${tokens.first}`, `${tokens.first} ${tokens.last}`];
+        } else {
+            const words = raw.split(' ').filter(Boolean);
+            tokens.first = words[0] || raw;
+            tokens.last = words.length > 1 ? words[words.length - 1] : '';
+            tokens.terms = raw ? [raw, ...words] : [];
+        }
+        return tokens;
+    }
+
+    function scorePatientOption(optionText, searchText) {
+        const tokens = parsePatientSearchText(searchText);
+        const opt = normalizeText(optionText);
+        const firstLine = normalizeText((optionText || '').split('\n')[0]);
+        if (!opt || !searchText) return 0;
+
+        const comma = firstLine.match(/^([^,]+),\s*(.+)$/);
+        if (comma) {
+            const optLast = normalizeText(comma[1]);
+            const optFirst = normalizeText(comma[2].split(/\s+/)[0]);
+            if (tokens.first && tokens.last) {
+                if (optFirst === tokens.first && optLast === tokens.last) return 100;
+                if (optFirst.startsWith(tokens.first) && optLast.startsWith(tokens.last)) return 92;
+            }
+            if (tokens.first && optFirst === tokens.first) return tokens.last ? 0 : 78;
+            if (tokens.last && optLast === tokens.last) return 70;
+        }
+
+        if (tokens.last && !opt.includes(tokens.last)) return 0;
+        if (tokens.raw && opt === tokens.raw) return 96;
+        if (tokens.raw && firstLine === tokens.raw) return 94;
+        if (tokens.first && firstLine.startsWith(tokens.first)) return tokens.last ? 82 : 68;
+        if (tokens.terms.some(t => t && opt.includes(t))) return tokens.last ? 74 : 58;
+        if (tokens.last && opt.includes(tokens.last)) return 45;
+        if (tokens.first && opt.includes(tokens.first)) return tokens.last ? 35 : 42;
+        return 0;
+    }
+
+    function collectVisibleDropdownOptions() {
+        const selectors = [
+            '[role="option"]', '[role="menuitem"]', '[cmdk-item]', '[data-radix-collection-item]',
+            '[data-value]', '[class*="option"]:not([class*="optional"])', '[class*="item"]:not([class*="form-item"])',
+            '.dropdown-item', '.MuiMenuItem-root', '.MuiAutocomplete-option', '.ant-select-item-option',
+            '[data-radix-popper-content-wrapper] > div > div', '[data-radix-popper-content-wrapper] > div > div > div',
+            'div[tabindex]', 'div[data-index]'
+        ].join(', ');
+        const out = [];
+        for (const opt of Array.from(document.querySelectorAll(selectors))) {
+            if (!isElementVisible(opt)) continue;
+            const text = (opt.textContent || '').trim();
+            const firstLine = text.split('\n')[0].trim();
+            if (!firstLine || firstLine.length > 120) continue;
+            if (!out.some(o => o.text === text)) out.push({ el: opt, text, firstLine, selector: generateCss(opt) });
+            if (out.length >= 20) break;
+        }
+        return out;
+    }
+
+    function resolveQuickFillOption(action) {
+        const searchText = action.text_match || action.text || action.option || '';
+        const visibleOptions = collectVisibleDropdownOptions();
+        let best = null;
+        let bestScore = 0;
+        for (const opt of visibleOptions) {
+            const score = scorePatientOption(opt.text, searchText);
+            if (score > bestScore) {
+                bestScore = score;
+                best = opt;
+            }
+        }
+        const tokens = parsePatientSearchText(searchText);
+        const hasLastToken = Boolean(tokens.last && tokens.last !== tokens.first);
+        if (!best || bestScore < (hasLastToken ? 70 : 55)) {
+            return {
+                found: false,
+                searchedFor: searchText,
+                visibleOptions: visibleOptions.map(o => o.firstLine),
+                bestScore
+            };
+        }
+        return { found: true, el: best.el, selector: best.selector, text: best.text, score: bestScore, visibleOptions: visibleOptions.map(o => o.firstLine) };
+    }
+
+    async function clickOptionElement(optEl) {
+        optEl.scrollIntoView({ block: 'center' });
+        await new Promise(r => setTimeout(r, 50));
+        optEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        optEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        optEl.click();
+        optEl.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+        optEl.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+        await new Promise(r => setTimeout(r, 300));
+    }
+
+    function findNearestScrollableAncestor(el) {
+        let current = el;
+        while (current && current !== document.body) {
+            const style = window.getComputedStyle(current);
+            const scrollable = /(auto|scroll|overlay)/.test(style.overflowY + style.overflow) && current.scrollHeight > current.clientHeight + 10;
+            if (scrollable) return current;
+            current = current.parentElement;
+        }
+        return document.scrollingElement || document.documentElement;
+    }
+
+    async function scrollToField(field) {
+        if (!field || !field.el) return;
+        try {
+            const container = findNearestScrollableAncestor(field.el);
+            const rect = field.el.getBoundingClientRect();
+            if (rect.top < 80 || rect.bottom > window.innerHeight - 80) {
+                container.scrollBy({ top: rect.top + container.scrollTop - window.innerHeight / 2, behavior: 'smooth' });
+                await new Promise(r => setTimeout(r, 350));
+            }
+            field.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await new Promise(r => setTimeout(r, 250));
+        } catch (e) { }
+    }
+
+    function extractFieldIntentFromElement(el) {
+        const label = getAccessibleLabel(el);
+        const section = getNearbySectionText(el);
+        const combined = normalizeText([label, section, el.getAttribute('placeholder'), el.getAttribute('name')].filter(Boolean).join(' '));
+        if (combined.includes('procedure') || combined.includes('cpt') || combined.includes('hcpcs')) return 'procedure';
+        if (combined.includes('diagnosis') || combined.includes('pointer') || combined.includes('dx')) return 'diagnosis_pointer';
+        if (combined.includes('charge') || combined.includes('amount') || combined.includes('fee')) return 'charges';
+        if (combined.includes('insured') || combined.includes('subscriber') || combined.includes('member id')) return 'insured_id';
+        if (combined.includes('state') || combined.includes('province')) return 'state';
+        if (combined.includes('search patient')) return 'patient_search';
+        return '';
+    }
+
+    function findNearestFieldForError(errorEl) {
+        const field = errorEl.closest('input, textarea, select, [role="combobox"], [role="searchbox"]') ||
+            errorEl.querySelector('input, textarea, select, [role="combobox"], [role="searchbox"]');
+        if (field) return field;
+
+        const parent = errorEl.closest('[class*="field"], [class*="form"], section, form, [role="dialog"]') || errorEl.parentElement;
+        if (parent) {
+            const nearby = parent.querySelector('input, textarea, select, [role="combobox"], [role="searchbox"]');
+            if (nearby) return nearby;
+        }
+
+        const rect = errorEl.getBoundingClientRect();
+        const candidates = getInteractiveCandidates()
+            .map(el => {
+                const r = el.getBoundingClientRect();
+                const distance = Math.abs((r.top + r.height / 2) - (rect.top + rect.height / 2)) + Math.abs((r.left + r.width / 2) - (rect.left + rect.width / 2));
+                return { el, distance };
+            })
+            .filter(item => item.distance < 900)
+            .sort((a, b) => a.distance - b.distance);
+        return candidates[0]?.el || null;
+    }
+
+    function extractValidationErrors() {
+        const errorSelector = [
+            '[role="alert"]', '[aria-invalid="true"]', '[data-invalid="true"]',
+            '[class*="error" i]', '[class*="invalid" i]', '[class*="validation" i]',
+            '.text-danger', '.error-message', '.field-error', '.invalid-feedback'
+        ].join(', ');
+        const out = [];
+        for (const errorEl of Array.from(document.querySelectorAll(errorSelector))) {
+            if (!isElementVisible(errorEl)) continue;
+            const text = (errorEl.textContent || '').trim();
+            if (!text || text.length > 250) continue;
+            if (!/\b(required|error|invalid|must|cannot|select|choose|missing)\b/i.test(text)) continue;
+            const field = findNearestFieldForError(errorEl);
+            const rect = errorEl.getBoundingClientRect();
+            out.push({
+                text,
+                field: field ? getAccessibleLabel(field) : '',
+                fieldIntent: field ? extractFieldIntentFromElement(field) : '',
+                selector: field ? generateCss(field) : '',
+                type: field ? field.tagName.toLowerCase() : '',
+                isCombobox: field ? isComboboxElement(field) : false,
+                boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+            });
+            if (out.length >= 20) break;
+        }
+        return out;
+    }
+
     /**
      * Resolves a DOM element by visible text content or accessible name.
      * Iterates all interactive elements in the DOM and scores them based on
@@ -471,7 +796,17 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             sendResponse({
                 url: window.location.href,
                 title: document.title,
-                elements: elements
+                elements: elements,
+                validationErrors: extractValidationErrors()
+            });
+            return true;
+        }
+
+        if (message.type === 'GET_VALIDATION_ERRORS') {
+            sendResponse({
+                success: true,
+                url: window.location.href,
+                errors: extractValidationErrors()
             });
             return true;
         }
@@ -600,12 +935,62 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
         // ─── EXECUTE ACTION ──────────────────────────────────────
         if (message.type === 'EXECUTE_ACTION') {
-            const action = message.payload;
-
+            let action = message.payload || {};
             (async () => {
                 let success = false;
                 let extraData = {};
                 try {
+                    if (action.field) {
+                        const resolvedField = resolveFieldByIntent(action.field);
+                        if (resolvedField) {
+                            action = { ...action, selector: resolvedField.selector };
+                            extraData.resolvedFieldIntent = {
+                                field: action.field,
+                                label: resolvedField.label,
+                                section: resolvedField.section,
+                                score: resolvedField.score
+                            };
+                            await scrollToField(resolvedField);
+                        } else if (!action.selector) {
+                            throw new Error(`Field intent "${action.field}" not found`);
+                        }
+                    }
+
+                    const quickFillOptionClick = action.action === 'click' &&
+                        (action.field === 'patient_option' || /option|patient|quick fill/i.test(action.text_match || action.text || action.option || ''));
+                    if (quickFillOptionClick) {
+                        const quickResult = resolveQuickFillOption(action);
+                        if (!quickResult.found) {
+                            success = false;
+                            extraData.quickFillOptionMatched = false;
+                            extraData.quickFillSearchText = quickResult.searchedFor;
+                            extraData.quickFillVisibleOptions = quickResult.visibleOptions || [];
+                            extraData.quickFillBestScore = quickResult.bestScore || 0;
+                            extraData.error = `Quick Fill option not found for "${quickResult.searchedFor}". Visible options: ${(quickResult.visibleOptions || []).join(', ')}`;
+                            sendResponse({ success: false, ...extraData });
+                            return;
+                        }
+                        const semanticEl = quickResult.el;
+                        extraData.quickFillOptionMatched = true;
+                        extraData.quickFillOptionText = quickResult.text;
+                        extraData.quickFillMatchScore = quickResult.score;
+                        extraData.quickFillVisibleOptions = quickResult.visibleOptions || [];
+                        action = { ...action, selector: quickResult.selector };
+                        try { semanticEl.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
+                        window.__hyprflow_popupOpened = false;
+                        dispatchUniversalClick(semanticEl);
+                        await new Promise(r => setTimeout(r, 300));
+                        if (window.__hyprflow_popupOpened) {
+                            extraData.windowOpenDetected = true;
+                            extraData.windowOpenUrl = window.__hyprflow_popupUrl;
+                            window.__hyprflow_popupOpened = false;
+                            window.__hyprflow_popupUrl = '';
+                        }
+                        success = true;
+                        sendResponse({ success, ...extraData });
+                        return;
+                    }
+
                     // ── SEMANTIC TARGET RESOLUTION ──
                     // If the AI provides text_match, resolve by visible text/accessible name
                     // BEFORE falling back to CSS selector lookup.
@@ -1348,8 +1733,18 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 const results = [];
                 for (const field of fields) {
                     try {
-                        const el = document.querySelector(field.selector);
-                        if (!el) { results.push({ selector: field.selector, success: false, error: 'Not found' }); continue; }
+                        let selector = field.selector;
+                        if (!selector && field.field) {
+                            const resolvedField = resolveFieldByIntent(field.field);
+                            if (!resolvedField) {
+                                results.push({ field: field.field, selector: null, success: false, error: 'Field not found' });
+                                continue;
+                            }
+                            selector = resolvedField.selector;
+                            field.resolvedFieldIntent = { label: resolvedField.label, section: resolvedField.section, score: resolvedField.score };
+                        }
+                        const el = document.querySelector(selector);
+                        if (!el) { results.push({ selector, success: false, error: 'Not found' }); continue; }
                         el.scrollIntoView({ behavior: 'instant', block: 'center' });
                         el.focus();
                         const tag = el.tagName.toLowerCase();
@@ -1359,12 +1754,12 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             const optText = (field.text || field.option || '').trim();
                             const targetOpt = options.find(o => o.text.trim().toLowerCase() === optText.toLowerCase() || o.value.toLowerCase() === optText.toLowerCase())
                                 || options.find(o => o.text.trim().toLowerCase().includes(optText.toLowerCase()));
-                            if (targetOpt) { setNativeValue(el, targetOpt.value); results.push({ selector: field.selector, success: true, value: targetOpt.text.trim() }); }
-                            else { results.push({ selector: field.selector, success: false, error: 'Option not found' }); }
+                            if (targetOpt) { setNativeValue(el, targetOpt.value); results.push({ selector, success: true, value: targetOpt.text.trim() }); }
+                            else { results.push({ selector, success: false, error: 'Option not found' }); }
                         } else if (inputType === 'date') {
                             const dateValue = parseDateToISO(field.text);
                             setNativeValue(el, dateValue || field.text);
-                            results.push({ selector: field.selector, success: true, value: dateValue || field.text });
+                            results.push({ selector, success: true, value: dateValue || field.text });
                         } else {
                             const isCombobox = el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || !!el.getAttribute('aria-controls');
                             setNativeValue(el, '');
@@ -1378,13 +1773,13 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             if (isCombobox) {
                                 await new Promise(r => setTimeout(r, 600));
                                 const dropResult = await detectAndSelectDropdownOption(el, field.text);
-                                results.push({ selector: field.selector, success: true, value: el.value, isCombobox: true, autoSelected: dropResult.found });
+                                results.push({ selector, success: true, value: el.value, isCombobox: true, autoSelected: dropResult.found });
                             } else {
-                                results.push({ selector: field.selector, success: true, value: el.value });
+                                results.push({ selector, success: true, value: el.value });
                             }
                         }
                         await new Promise(r => setTimeout(r, 80));
-                    } catch (e) { results.push({ selector: field.selector, success: false, error: e.message }); }
+                    } catch (e) { results.push({ selector: selector || field.selector, success: false, error: e.message }); }
                 }
                 sendResponse({ success: true, results, filledCount: results.filter(r => r.success).length });
             })();
@@ -2320,6 +2715,8 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     checked: isChecked || null, selected: isSelected || null,
                     selectedOptionText,
                     isPlaceholderSelected: isPlaceholderSelected || null,
+                    fieldIntent: extractFieldIntentFromElement(el) || null,
+                    section: getNearbySectionText(el) || null,
                     currentValue,
                     comboboxState: comboboxState,
                     visible: true,
