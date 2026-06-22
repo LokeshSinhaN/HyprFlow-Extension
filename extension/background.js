@@ -143,7 +143,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
-    // ─── MAIN WORLD EVENT SIMULATION ───
+// ─── MAIN WORLD EVENT SIMULATION ───
     // Content scripts run in an ISOLATED world where dispatched events have
     // isTrusted:false. React/CMDK/Radix ignores these. This handler uses
     // chrome.scripting.executeScript with world:'MAIN' to run code in the
@@ -1597,10 +1597,9 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                     }
                                 }
                             }
+                        } else {
+                            actionSuccess = false;
                         }
-                    } else {
-                        actionSuccess = false;
-                    }
                 }
 
                 // 9. Update failure counter and record success/failure in history
