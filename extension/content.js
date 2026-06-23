@@ -941,23 +941,41 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 let extraData = {};
                 try {
                     if (action.field) {
-                        const resolvedField = resolveFieldByIntent(action.field);
-                        if (resolvedField) {
-                            action = { ...action, selector: resolvedField.selector };
-                            extraData.resolvedFieldIntent = {
-                                field: action.field,
-                                label: resolvedField.label,
-                                section: resolvedField.section,
-                                score: resolvedField.score
-                            };
-                            await scrollToField(resolvedField);
-                        } else if (!action.selector) {
-                            throw new Error(`Field intent "${action.field}" not found`);
+                        // For TYPE actions, an explicit selector that already points to a
+                        // visible, typable input wins over field-intent — field-intent often
+                        // resolves to a combobox TRIGGER (div/button), not the inner text
+                        // input, which would make typing fail with "Illegal invocation".
+                        const explicitTypable = (action.action === 'type' && action.selector)
+                            ? document.querySelector(action.selector) : null;
+                        if (explicitTypable && isTypableElement(explicitTypable) && isElementVisible(explicitTypable)) {
+                            extraData.keptExplicitSelector = action.selector;
+                        } else {
+                            const resolvedField = resolveFieldByIntent(action.field);
+                            if (resolvedField) {
+                                action = { ...action, selector: resolvedField.selector };
+                                extraData.resolvedFieldIntent = {
+                                    field: action.field,
+                                    label: resolvedField.label,
+                                    section: resolvedField.section,
+                                    score: resolvedField.score
+                                };
+                                await scrollToField(resolvedField);
+                            } else if (!action.selector) {
+                                throw new Error(`Field intent "${action.field}" not found`);
+                            }
                         }
                     }
 
+                    // Only treat a click as a patient-RESULT selection when it is clearly an
+                    // option — never when it targets the search TRIGGER/input itself. The
+                    // trigger's label ("Search patient...", "Quick Fill") previously matched
+                    // the /patient/ heuristic and made the agent hunt for a non-existent option.
+                    const qfOptionText = (action.text_match || action.text || action.option || '');
+                    const isSearchTriggerLabel = /search\s*patient|patient\s*search|quick\s*fill|search name|mrn|search\.\.\./i.test(qfOptionText);
                     const quickFillOptionClick = action.action === 'click' &&
-                        (action.field === 'patient_option' || /option|patient|quick fill/i.test(action.text_match || action.text || action.option || ''));
+                        action.field !== 'patient_search' &&
+                        !isSearchTriggerLabel &&
+                        (action.field === 'patient_option' || /\boption\b/i.test(qfOptionText));
                     if (quickFillOptionClick) {
                         const quickResult = resolveQuickFillOption(action);
                         if (!quickResult.found) {
@@ -1018,7 +1036,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     }
 
                     // Resolve element: semantic target takes priority over CSS selector
-                    const el = semanticEl || (action.selector ? document.querySelector(action.selector) : null);
+                    let el = semanticEl || (action.selector ? document.querySelector(action.selector) : null);
                     // Actions that can work WITHOUT a selector
                     const selectorOptionalActions = ['navigate', 'extract', 'scroll_down', 'scroll_up', 'click_coordinate', 'keyboard_event'];
                     if (!el && !selectorOptionalActions.includes(action.action)) {
@@ -1030,6 +1048,20 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                     if (el) {
                         try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
+                    }
+
+                    // ── TYPABLE TARGET RESOLUTION (combobox / searchable dropdowns) ──
+                    // If we're about to TYPE but the resolved element isn't directly typable
+                    // (it's a combobox trigger/wrapper), drill in / open it to find the real
+                    // <input>. Prevents "Illegal invocation" and makes API-backed searchable
+                    // dropdowns actually receive the typed text.
+                    if (action.action === 'type' && el && !isTypableElement(el)) {
+                        const typable = await resolveTypableTarget(el);
+                        if (typable) {
+                            extraData.retargetedToInput = generateCss(typable);
+                            el = typable;
+                            try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
+                        }
                     }
 
                     // ── CLICK ──
@@ -1919,6 +1951,68 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         return path.join(' > ');
     }
 
+    // ─── HELPER: Is this element directly typable? ───
+    function isTypableElement(el) {
+        if (!el || !el.tagName) return false;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'input') {
+            const t = (el.getAttribute('type') || 'text').toLowerCase();
+            return !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'range', 'color'].includes(t);
+        }
+        if (tag === 'textarea') return true;
+        if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === '') return true;
+        return false;
+    }
+
+    // ─── HELPER: Resolve the real typable <input> for a combobox/searchable control ───
+    // Field-intent (e.g. patient_search) and some selectors resolve to a combobox
+    // TRIGGER (a div/button) instead of the inner text input. Typing into a non-input
+    // throws "Illegal invocation" and nothing is entered. This finds (or opens to reveal)
+    // the actual input so ALL API-backed searchable dropdowns become typable.
+    async function resolveTypableTarget(el) {
+        const findInside = (root) => {
+            if (!root || !root.querySelectorAll) return null;
+            const cands = Array.from(root.querySelectorAll(
+                'input:not([type="hidden"]), textarea, [contenteditable="true"], [contenteditable=""]'
+            ));
+            return cands.find(c => isTypableElement(c) && isElementVisible(c)) || null;
+        };
+
+        const container = el.closest(
+            '[class*="combobox"], [class*="autocomplete"], [class*="searchable"], ' +
+            '[class*="react-select"], [class*="select"], [role="combobox"]'
+        ) || el.parentElement || el;
+
+        // 1. Input already present inside the control/container.
+        let inner = findInside(el) || findInside(container);
+        if (inner) return inner;
+
+        // 2. Not present yet — open the control, then look again.
+        try { dispatchUniversalClick(el); } catch (e) { try { el.click(); } catch (e2) { /* ignore */ } }
+        await new Promise(r => setTimeout(r, 350));
+
+        // 2a. The opened control usually focuses its search input.
+        const active = document.activeElement;
+        if (isTypableElement(active) && isElementVisible(active)) return active;
+
+        // 2b. Re-scan the control/container.
+        inner = findInside(el) || findInside(container);
+        if (inner) return inner;
+
+        // 2c. Last resort — scan freshly opened popups/portals (not the whole body).
+        const popupSelectors = [
+            '[data-radix-popper-content-wrapper]', '[role="dialog"]', '[role="listbox"]',
+            '[class*="popover"]', '[class*="dropdown"]', '[class*="menu"]', '[class*="popup"]'
+        ];
+        for (const sel of popupSelectors) {
+            for (const root of document.querySelectorAll(sel)) {
+                const cand = findInside(root);
+                if (cand) return cand;
+            }
+        }
+        return null;
+    }
+
     // ─── HELPER: Set value using native input setter (React/Vue/Angular compatible) ───
     function setNativeValue(el, value) {
         const tag = el.tagName.toLowerCase();
@@ -1936,14 +2030,22 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             window.HTMLTextAreaElement.prototype, 'value'
         )?.set;
 
-        if (tag === 'select' && nativeSelectValueSetter) {
-            nativeSelectValueSetter.call(el, value);
-        } else if (tag === 'textarea' && nativeTextareaValueSetter) {
-            nativeTextareaValueSetter.call(el, value);
-        } else if (nativeInputValueSetter) {
-            nativeInputValueSetter.call(el, value);
-        } else {
-            el.value = value;
+        // Guard each native setter with an instanceof check. Calling a prototype value
+        // setter on an element it does not belong to (e.g. a <div role="combobox"> trigger)
+        // throws "Illegal invocation". The try/catch guarantees we never surface that error
+        // to the caller and always fall back to a safe assignment.
+        try {
+            if (tag === 'select' && nativeSelectValueSetter && el instanceof window.HTMLSelectElement) {
+                nativeSelectValueSetter.call(el, value);
+            } else if (tag === 'textarea' && nativeTextareaValueSetter && el instanceof window.HTMLTextAreaElement) {
+                nativeTextareaValueSetter.call(el, value);
+            } else if (nativeInputValueSetter && el instanceof window.HTMLInputElement) {
+                nativeInputValueSetter.call(el, value);
+            } else if ('value' in el) {
+                el.value = value;
+            }
+        } catch (e) {
+            try { if ('value' in el) el.value = value; } catch (e2) { /* ignore */ }
         }
 
         // Dispatch events that React/Vue/Angular listen to

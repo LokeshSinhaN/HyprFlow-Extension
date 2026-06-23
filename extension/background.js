@@ -691,6 +691,11 @@ async function agentLoop(prompt, tabId, planSteps = []) {
     let recentFingerprints = [];      // Last 3 page fingerprints for stale detection
     let staleStateCount = 0;          // Consecutive steps with identical fingerprints
     let lastPageUrl = '';             // Track URL changes for vision triggering
+// Quick Fill state — single source of truth for THIS agent run.
+    // Declared locally (per-run) so it resets cleanly between runs. It is passed BY
+    // REFERENCE into updateQuickFillState() (a module-level helper) which mutates its
+    // properties. The helper cannot see this local binding via scope, so it MUST receive
+    // quickFillState as a parameter — otherwise it throws "quickFillState is not defined".
     let quickFillState = {
         active: false,
         searched: false,
@@ -1400,7 +1405,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                             postPopupDirective = `TEXT MATCH FAILED: The previous click did not actually match "${actionResult.searchedFor || aiDecision.text_match || ''}". Retry with the exact visible option or field. Do NOT continue as if the click succeeded.`;
                         }
 
-                        const quickFillDirective = updateQuickFillState(aiDecision, actionResult, currentTabUrl, lastObservedElements);
+                        const quickFillDirective = updateQuickFillState(quickFillState, aiDecision, actionResult, currentTabUrl, lastObservedElements);
                         if (quickFillDirective && !postPopupDirective) {
                             postPopupDirective = quickFillDirective;
                         }
@@ -1712,7 +1717,7 @@ function isPatientSearchType(action, observedElements) {
     });
 }
 
-function updateQuickFillState(aiDecision, actionResult, currentTabUrl, observedElements) {
+function updateQuickFillState(quickFillState, aiDecision, actionResult, currentTabUrl, observedElements) {
     const action = aiDecision || {};
     const result = actionResult || {};
     const clickedText = (result.clickedText || '').toLowerCase();
