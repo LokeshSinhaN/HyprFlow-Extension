@@ -223,6 +223,8 @@ class ExtensionController extends Controller
             if (in_array($action, ['click', 'type', 'hover', 'select_option']) && empty($decision['selector'])) {
                 if (!empty($decision['field'])) {
                     // Dynamic field-intent targeting is resolved in the content script.
+                } elseif (!empty($decision['text_match']) || !empty($decision['role_hint'])) {
+                    // Agent Mode semantic targeting (by visible text / role) is resolved in the content script.
                 } elseif (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
                     $decision['selector'] = $somMap[(string)$decision['somIndex']];
                 } elseif (!in_array($action, $selectorFreeActions)) {

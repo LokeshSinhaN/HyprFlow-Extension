@@ -449,14 +449,31 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         return { found: true, el: best.el, selector: best.selector, text: best.text, score: bestScore, visibleOptions: visibleOptions.map(o => o.firstLine) };
     }
 
+    // Click a dropdown/combobox OPTION reliably. CRITICAL: never call focus() here —
+    // focusing the option blurs the search input, which makes Radix/cmdk/React-Select close
+    // the list BEFORE the click registers (the click then lands on the backdrop and can
+    // dismiss the whole modal — exactly the "form closed, restart" bug). We dispatch hover +
+    // a mousedown-FIRST pointer/mouse lifecycle so the option is selected while the list is
+    // still open.
     async function clickOptionElement(optEl) {
-        optEl.scrollIntoView({ block: 'center' });
+        try { optEl.scrollIntoView({ block: 'center' }); } catch (e) { }
         await new Promise(r => setTimeout(r, 50));
-        optEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        optEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        const rect = optEl.getBoundingClientRect();
+        const opts = {
+            bubbles: true, cancelable: true, view: window,
+            clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2, button: 0
+        };
+        // Hover first — many lists only attach selection handlers to the highlighted item.
+        optEl.dispatchEvent(new PointerEvent('pointerover', opts));
+        optEl.dispatchEvent(new MouseEvent('mouseover', opts));
+        optEl.dispatchEvent(new PointerEvent('pointermove', opts));
+        optEl.dispatchEvent(new MouseEvent('mousemove', opts));
+        // mousedown BEFORE any blur can close the list — this is what commits the selection.
+        optEl.dispatchEvent(new PointerEvent('pointerdown', opts));
+        optEl.dispatchEvent(new MouseEvent('mousedown', opts));
+        optEl.dispatchEvent(new PointerEvent('pointerup', opts));
+        optEl.dispatchEvent(new MouseEvent('mouseup', opts));
         optEl.click();
-        optEl.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-        optEl.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
         await new Promise(r => setTimeout(r, 300));
     }
 
@@ -966,20 +983,49 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         }
                     }
 
-                    // Only treat a click as a patient-RESULT selection when it is clearly an
-                    // option — never when it targets the search TRIGGER/input itself. The
-                    // trigger's label ("Search patient...", "Quick Fill") previously matched
-                    // the /patient/ heuristic and made the agent hunt for a non-existent option.
+                    // ── PATIENT / SEARCHABLE-DROPDOWN RESULT SELECTION ──
+                    // Any click that is NOT the search trigger may be a result-option selection.
+                    // We DOM-check the open dropdown: if a visible option matches the requested
+                    // text, select it via the robust mousedown-first path (clickOptionElement),
+                    // which avoids blurring the search input (that blur closes the list and can
+                    // dismiss the whole modal). If nothing matches, fall through to a normal click
+                    // — so non-option clicks (e.g. "Save Claim") are unaffected.
                     const qfOptionText = (action.text_match || action.text || action.option || '');
                     const isSearchTriggerLabel = /search\s*patient|patient\s*search|quick\s*fill|search name|mrn|search\.\.\./i.test(qfOptionText);
-                    const quickFillOptionClick = action.action === 'click' &&
+                    // A genuine patient result is "Last, First" (has a comma) or an explicit
+                    // patient_option. Requiring that avoids misrouting ordinary clicks like
+                    // "Save Claim". Other dropdown options (no comma) are still handled robustly
+                    // by the option-aware generic click path further below.
+                    const looksLikePatientResult = action.field === 'patient_option' || /,/.test(qfOptionText);
+                    const maybeQuickFillOption = action.action === 'click' &&
                         action.field !== 'patient_search' &&
                         !isSearchTriggerLabel &&
-                        (action.field === 'patient_option' || /\boption\b/i.test(qfOptionText));
-                    if (quickFillOptionClick) {
+                        looksLikePatientResult;
+                    if (maybeQuickFillOption) {
                         const quickResult = resolveQuickFillOption(action);
-                        if (!quickResult.found) {
-                            success = false;
+                        if (quickResult.found) {
+                            const semanticEl = quickResult.el;
+                            extraData.quickFillOptionMatched = true;
+                            extraData.quickFillOptionText = quickResult.text;
+                            extraData.clickedText = quickResult.text;
+                            extraData.quickFillMatchScore = quickResult.score;
+                            extraData.quickFillVisibleOptions = quickResult.visibleOptions || [];
+                            action = { ...action, selector: quickResult.selector };
+                            window.__hyprflow_popupOpened = false;
+                            await clickOptionElement(semanticEl);
+                            if (window.__hyprflow_popupOpened) {
+                                extraData.windowOpenDetected = true;
+                                extraData.windowOpenUrl = window.__hyprflow_popupUrl;
+                                window.__hyprflow_popupOpened = false;
+                                window.__hyprflow_popupUrl = '';
+                            }
+                            success = true;
+                            sendResponse({ success, ...extraData });
+                            return;
+                        }
+                        // Only hard-fail when the AI EXPLICITLY targeted a patient option but none
+                        // matched; otherwise fall through to the generic click handler below.
+                        if (action.field === 'patient_option') {
                             extraData.quickFillOptionMatched = false;
                             extraData.quickFillSearchText = quickResult.searchedFor;
                             extraData.quickFillVisibleOptions = quickResult.visibleOptions || [];
@@ -988,25 +1034,6 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             sendResponse({ success: false, ...extraData });
                             return;
                         }
-                        const semanticEl = quickResult.el;
-                        extraData.quickFillOptionMatched = true;
-                        extraData.quickFillOptionText = quickResult.text;
-                        extraData.quickFillMatchScore = quickResult.score;
-                        extraData.quickFillVisibleOptions = quickResult.visibleOptions || [];
-                        action = { ...action, selector: quickResult.selector };
-                        try { semanticEl.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
-                        window.__hyprflow_popupOpened = false;
-                        dispatchUniversalClick(semanticEl);
-                        await new Promise(r => setTimeout(r, 300));
-                        if (window.__hyprflow_popupOpened) {
-                            extraData.windowOpenDetected = true;
-                            extraData.windowOpenUrl = window.__hyprflow_popupUrl;
-                            window.__hyprflow_popupOpened = false;
-                            window.__hyprflow_popupUrl = '';
-                        }
-                        success = true;
-                        sendResponse({ success, ...extraData });
-                        return;
                     }
 
                     // ── SEMANTIC TARGET RESOLUTION ──
@@ -1106,10 +1133,29 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                         window.__hyprflow_popupOpened = false;
 
-                        // ─── UNIVERSAL EVENT DISPATCHER ───────────────────────
-                        // Full pointer + mouse lifecycle via reusable dispatchUniversalClick.
-                        // Bypasses Radix UI's synthetic event blockers.
-                        dispatchUniversalClick(clickTarget);
+                        // ─── OPTION-AWARE CLICK ───────────────────────────────
+                        // If the target is (or sits inside) an OPEN dropdown/combobox list,
+                        // select it with the mousedown-first, NO-focus sequence. Focusing an
+                        // option blurs the search input → Radix/cmdk closes the list before the
+                        // click lands (dismissing the selection and sometimes the whole modal).
+                        // This generalises to EVERY searchable dropdown, not just patient search.
+                        const optionAncestor = clickTarget.closest(
+                            '[role="option"], [role="menuitem"], [cmdk-item], [data-radix-collection-item], ' +
+                            '.MuiAutocomplete-option, .ant-select-item-option, .dropdown-item'
+                        );
+                        const inOpenPopup = !!clickTarget.closest(
+                            '[role="listbox"], [role="menu"], [data-radix-popper-content-wrapper], ' +
+                            '[cmdk-list], .MuiAutocomplete-popper, .ant-select-dropdown'
+                        );
+                        if (optionAncestor || inOpenPopup) {
+                            extraData.clickedAsDropdownOption = true;
+                            await clickOptionElement(optionAncestor || clickTarget);
+                        } else {
+                            // Full pointer + mouse lifecycle via reusable dispatchUniversalClick.
+                            // Bypasses Radix UI's synthetic event blockers.
+                            dispatchUniversalClick(clickTarget);
+                        }
+                        extraData.clickedText = ((optionAncestor || clickTarget).textContent || '').trim().slice(0, 80);
 
                         // --- POST-CLICK TREE AJAX WAIT ---
                         // Tree views often load content via AJAX after clicking a node.

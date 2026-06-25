@@ -282,7 +282,30 @@ async function performGeneration(sendResponse) {
 }
 
 // ─── LOGGING ───────────────────────────────────────────────────
+// Agent Mode should read like a plain-English narrative of WHAT is happening —
+// not raw selectors / internal execution traces. These patterns are suppressed in
+// Agent Mode so the panel only shows the user-facing story. Record mode is unchanged.
+const AGENT_MODE_SUPPRESSED_LOG_PATTERNS = [
+    /^AI decided:/, /^AI thought:/, /^Executing:/, /^Action result:/, /^Tab Action result:/,
+    /^Waiting for page stability/, /^Vision mode activated/, /^Captured SoM screenshot/,
+    /^Observing page elements/, /^Page: http/, /^Thinking\.\.\./, /^Step \d+ completed/,
+    /^--- Step \d+ ---$/, /^API Endpoint:/, /^API Params:/, /^Action failed \(/,
+    /^Scroll returned/, /^Stale state detected/, /^Plan step \d+ completed/
+];
+
+function isAgentVisibleLog(text) {
+    // Always show explicitly user-facing lines (emoji-prefixed narrative & prompts).
+    if (/^(🗣️|👤|⏸️|⚠️|🔍|✅|🚫)/.test(text)) return true;
+    // Otherwise hide known-technical lines.
+    return !AGENT_MODE_SUPPRESSED_LOG_PATTERNS.some(re => re.test(text));
+}
+
 function sendLogToPanel(text, level = 'info') {
+    // Agent Mode: keep the panel readable — only forward the user-facing narrative.
+    if (isAgentMode && !isAgentVisibleLog(text)) {
+        console.log('[agent-mode hidden]', text);
+        return;
+    }
     chrome.runtime.sendMessage({ type: 'LOG', text, level }).catch(() => { });
     if (level === 'error') console.error(text);
     else console.log(text);
@@ -691,6 +714,8 @@ async function agentLoop(prompt, tabId, planSteps = []) {
     let recentFingerprints = [];      // Last 3 page fingerprints for stale detection
     let staleStateCount = 0;          // Consecutive steps with identical fingerprints
     let lastPageUrl = '';             // Track URL changes for vision triggering
+    let apiCallCounts = {};           // call_api attempts per endpoint (loop + fallback detection)
+    let consecutiveApiFailures = 0;   // consecutive failed API calls → triggers human-input fallback
 // Quick Fill state — single source of truth for THIS agent run.
     // Declared locally (per-run) so it resets cleanly between runs. It is passed BY
     // REFERENCE into updateQuickFillState() (a module-level helper) which mutates its
@@ -1082,19 +1107,17 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     continue;
                 }
 
-                // 6-HITL. Handle CALL_API — Back-office API with Human Approval
+                // 6. Handle CALL_API — Autonomous back-office API call with human-input fallback
                 if (aiDecision.action === 'call_api') {
-                    sendLogToPanel('🔍 Executing approved back-office API call...', 'decision');
                     const apiEndpoint = aiDecision.api_endpoint || aiDecision.endpoint || '';
                     const apiMethod = (aiDecision.api_method || aiDecision.method || 'GET').toUpperCase();
                     const apiParams = aiDecision.api_params || aiDecision.params || {};
 
                     if (!apiEndpoint) {
-                        sendLogToPanel('CALL_API failed: endpoint is required.', 'error');
+                        sendLogToPanel('Back-office API call skipped: no endpoint provided.', 'error');
                         historyEntry.actionSuccess = false;
-                        historyEntry.apiEndpoint = apiEndpoint;
                         historyEntry.error = 'Missing API endpoint';
-                        postPopupDirective = 'CALL_API FAILED: The AI requested a back-office API call without an endpoint. Retry with a valid catalog endpoint.';
+                        postPopupDirective = 'CALL_API FAILED: No endpoint was provided. Either retry with a valid catalog endpoint or use `ask_user` to request the missing values from the human.';
                         failedActionCount++;
                         lastActionFailed = true;
                         lastActionError = 'Missing API endpoint';
@@ -1102,45 +1125,11 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         continue;
                     }
 
-                    sendLogToPanel(`API Endpoint: ${apiEndpoint}`, 'info');
-                    sendLogToPanel(`API Params: ${JSON.stringify(apiParams)}`, 'info');
+                    // Track repeated calls to the same endpoint (prevents infinite API loops).
+                    apiCallCounts[apiEndpoint] = (apiCallCounts[apiEndpoint] || 0) + 1;
+                    sendLogToPanel(`🔍 Calling back-office API: ${apiEndpoint}`, 'decision');
 
-                    const keepAliveInterval = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
-                    const apiApproval = await new Promise(resolve => {
-                        const listener = (msg) => {
-                            if (msg.type === 'HITL_RESPONSE') {
-                                chrome.runtime.onMessage.removeListener(listener);
-                                resolve(msg.payload);
-                            }
-                        };
-                        chrome.runtime.onMessage.addListener(listener);
-
-                        chrome.runtime.sendMessage({
-                            type: 'SHOW_HITL_UI',
-                            payload: {
-                                message: aiDecision.conversational_message || 'The agent needs approval to execute a back-office API call.',
-                                api_endpoint: apiEndpoint,
-                                api_method: apiMethod,
-                                api_params: apiParams,
-                                ask_user_prompt: aiDecision.ask_user_prompt
-                            }
-                        }).catch(() => { });
-                    });
-                    clearInterval(keepAliveInterval);
-
-                    if (apiApproval?.reply && /^(no|cancel|stop)$/i.test(apiApproval.reply.trim())) {
-                        sendLogToPanel('Human cancelled the back-office API call.', 'warn');
-                        historyEntry.actionSuccess = false;
-                        historyEntry.apiEndpoint = apiEndpoint;
-                        historyEntry.apiParams = apiParams;
-                        postPopupDirective = `HUMAN CANCELLED API CALL: "${apiApproval.reply}". Do not retry this endpoint unless the human approves it.`;
-                        failedActionCount++;
-                        lastActionFailed = true;
-                        lastActionError = 'Human cancelled API call';
-                        actionHistory.push(historyEntry);
-                        continue;
-                    }
-
+                    // Autonomous execution — the agent calls the API on its own (no manual approval).
                     let apiResult = null;
                     try {
                         const apiResponse = await fetch(CALL_API_URL, {
@@ -1153,31 +1142,47 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         apiResult = { success: false, error: e.message };
                     }
 
-                    if (apiResult?.success) {
+                    // Did the API actually return usable details (not just a 200 with empty data)?
+                    const apiData = apiResult ? (apiResult.data ?? apiResult) : null;
+                    const hasUsefulData = !!(apiResult && apiResult.success && apiData &&
+                        !(Array.isArray(apiData) && apiData.length === 0) &&
+                        !(typeof apiData === 'object' && !Array.isArray(apiData) && Object.keys(apiData).length === 0));
+
+                    if (hasUsefulData) {
+                        consecutiveApiFailures = 0;
                         historyEntry.actionSuccess = true;
-                        historyEntry.apiResult = apiResult.data || apiResult;
+                        historyEntry.apiResult = apiData;
                         historyEntry.apiEndpoint = apiEndpoint;
                         historyEntry.apiParams = apiParams;
                         historyEntry.apiRowCount = apiResult.rowCount || 0;
 
                         postPopupDirective = 'BACK-OFFICE API SUCCESS:\n'
-                            + JSON.stringify(apiResult.data || apiResult, null, 2)
-                            + '\nAnalyze the API response and apply it to the form. Ensure you target the correct field type (combobox vs text).';
+                            + JSON.stringify(apiData, null, 2)
+                            + '\nApply this data to the matching form fields now. Target the correct field type (combobox vs text). Do NOT call the same endpoint again.';
 
                         failedActionCount = 0;
                         lastActionFailed = false;
                         lastActionError = '';
                     } else {
-                        const apiError = apiResult?.error || 'API call failed';
-                        sendLogToPanel(`Back-office API failed: ${apiError}`, 'error');
+                        consecutiveApiFailures++;
+                        const apiError = (apiResult && apiResult.error) || 'API returned no usable data';
+                        sendLogToPanel(`🔍 Back-office API could not provide the details (${apiError}).`, 'error');
                         historyEntry.actionSuccess = false;
                         historyEntry.apiEndpoint = apiEndpoint;
                         historyEntry.apiParams = apiParams;
                         historyEntry.error = apiError;
 
-                        postPopupDirective = 'BACK-OFFICE API FAILED:\n'
-                            + apiError
-                            + '\nCRITICAL: Do NOT retry this endpoint automatically. Use `ask_user` immediately if the missing values still need resolution.';
+                        // Human-input fallback: after repeated failures or repeated calls to the
+                        // same endpoint, STOP guessing and ask the human for the exact values.
+                        if (consecutiveApiFailures >= 2 || apiCallCounts[apiEndpoint] >= 3) {
+                            postPopupDirective = `BACK-OFFICE API CANNOT PROVIDE THE DETAILS (failed ${consecutiveApiFailures}x). `
+                                + `Do NOT call_api again for this. Your NEXT action MUST be "ask_user": clearly list the exact `
+                                + `missing values you still need (e.g., Procedure/CPT code, State, Insurance Payer, Panel Group, DOB) `
+                                + `and ask the human to provide them.`;
+                        } else {
+                            postPopupDirective = `BACK-OFFICE API FAILED: ${apiError}. `
+                                + `Try ONE different catalog endpoint if clearly relevant; otherwise use "ask_user" to get the values from the human.`;
+                        }
 
                         lastActionFailed = true;
                         lastActionError = apiError;
@@ -1602,8 +1607,6 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                     }
                                 }
                             }
-                        } else {
-                            actionSuccess = false;
                         }
                 }
 
@@ -1709,28 +1712,37 @@ function hasPatientSelectionEvidence(elements) {
 
 function isPatientSearchType(action, observedElements) {
     if (!action || action.action !== 'type') return false;
+    // Field-intent typing into the patient search counts directly.
+    if (action.field === 'patient_search') return true;
     const selector = action.selector || '';
-    return observedElements.some(el => {
+    return (observedElements || []).some(el => {
         if (el.selector !== selector) return false;
         const text = [el.text, el.ariaLabel, el.currentValue, el.selectedOptionText].filter(Boolean).join(' ').toLowerCase();
-        return text.includes('search patient') || text.includes('patient search') || text.includes('quick fill');
+        return text.includes('search patient') || text.includes('patient search') || text.includes('quick fill') || text.includes('search name');
     });
 }
 
 function updateQuickFillState(quickFillState, aiDecision, actionResult, currentTabUrl, observedElements) {
     const action = aiDecision || {};
     const result = actionResult || {};
-    const clickedText = (result.clickedText || '').toLowerCase();
+    // The click result may expose the clicked label as clickedText OR matchedText (semantic
+    // click); fall back to what the AI asked to click. This is what lets us reliably detect
+    // repeated "New Professional Claim" clicks and block the restart loop.
+    const clickedText = (result.clickedText || result.matchedText || action.text_match || action.text || action.option || '').toLowerCase();
 
-    if (clickedText.includes('new professional claim')) {
+    if (action.action === 'click' && clickedText.includes('new professional claim')) {
         quickFillState.active = true;
         quickFillState.restartCount++;
-        if (quickFillState.restartCount > 1 && isClaimsListUrl(currentTabUrl)) {
-            return 'QUICK FILL RESTART BLOCKED: You already clicked "New Professional Claim" more than once and the page is still the Claims list. Do NOT click it again. Re-open or continue the current claim form, then select the exact patient option from the dropdown.';
+        // The claim form is a MODAL on /claims, so the URL never changes — block any repeat
+        // open. The first click opens the form; a second means the agent is wrongly restarting.
+        if (quickFillState.restartCount > 1) {
+            return 'QUICK FILL RESTART BLOCKED: You already opened a New Professional Claim form. Do NOT click "New Professional Claim" again. The patient search and the claim form are on the SAME page — if the form looks closed, the patient option selection just needs to be re-done. Continue the current form and click the exact patient option from the open dropdown.';
         }
     }
 
-    if (isPatientSearchType(action, observedElements)) {
+    const typedPatientSearch = isPatientSearchType(action, observedElements) ||
+        (action.action === 'type' && result.resolvedFieldIntent && result.resolvedFieldIntent.field === 'patient_search');
+    if (typedPatientSearch) {
         quickFillState.active = true;
         quickFillState.searched = true;
         quickFillState.lastSearch = action.text || quickFillState.lastSearch;
