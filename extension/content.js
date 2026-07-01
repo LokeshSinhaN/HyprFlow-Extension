@@ -956,6 +956,16 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             (async () => {
                 let success = false;
                 let extraData = {};
+                // Capture a pre-action snapshot so VERIFY_ACTION can confirm the
+                // post-condition (value/DOM/URL/popup change) without a pre/post race.
+                try { _verifyContext = captureVerifyContext(action); } catch (e) { _verifyContext = null; }
+                // Phase 2 local recovery: background retries with _recovery:true using
+                // alternate deterministic strategies before escalating to the LLM.
+                if (action._recovery) {
+                    try { sendResponse(await executeRecoveryStrategies(action)); }
+                    catch (e) { sendResponse({ success: false, error: e.message, recovery: true }); }
+                    return;
+                }
                 try {
                     if (action.field) {
                         // For TYPE actions, an explicit selector that already points to a
@@ -3003,4 +3013,380 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             return [];
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 2-4: LOCAL INTELLIGENCE (verifier, confidence scorer,
+    // recovery engine, incremental page graph, framework adapters)
+    // ═══════════════════════════════════════════════════════════════
+    function sleepCS(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // Single DOM MutationObserver powers both action verification (mutation
+    // counter) and the incremental page-graph cache (dirty flag). Started lazily
+    // so idle pages pay nothing until the agent first observes/acts.
+    let _domMutationCount = 0;
+    let _domObserverStarted = false;
+    let _pageGraphCache = null;
+    let _pageGraphDirty = true;
+    let _verifyContext = null;
+    let _activeScorerId = 'heuristic';
+    const _negativeTargets = new Set(); // signatures/selectors that failed this run
+
+    function ensureDomMutationObserver() {
+        if (_domObserverStarted) return;
+        _domObserverStarted = true;
+        try {
+            const target = document.documentElement || document.body;
+            if (!target) return;
+            const mo = new MutationObserver((muts) => {
+                _domMutationCount += muts.length;
+                _pageGraphDirty = true;
+            });
+            mo.observe(target, { childList: true, subtree: true, attributes: true, characterData: true });
+        } catch (e) { /* ignore */ }
+    }
+
+    // ─── STRING SIMILARITY ─────────────────────────────────────────
+    function tokenSet(str) { return new Set(normalizeText(str).split(' ').filter(Boolean)); }
+    function tokenOverlapScore(a, b) {
+        const sa = tokenSet(a), sb = tokenSet(b);
+        if (sa.size === 0 || sb.size === 0) return 0;
+        let inter = 0;
+        for (const t of sa) if (sb.has(t)) inter++;
+        return inter / Math.max(sa.size, sb.size);
+    }
+    function levenshteinRatio(a, b) {
+        a = normalizeText(a); b = normalizeText(b);
+        if (!a && !b) return 1;
+        if (!a || !b) return 0;
+        const m = a.length, n = b.length;
+        const prev = new Array(n + 1); const cur = new Array(n + 1);
+        for (let j = 0; j <= n; j++) prev[j] = j;
+        for (let i = 1; i <= m; i++) {
+            cur[0] = i;
+            for (let j = 1; j <= n; j++) {
+                cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+            }
+            for (let j = 0; j <= n; j++) prev[j] = cur[j];
+        }
+        return 1 - prev[n] / Math.max(m, n);
+    }
+    function nameSimilarity(a, b) { return Math.max(tokenOverlapScore(a, b), levenshteinRatio(a, b)); }
+
+    // Stable semantic signature — survives Radix/React re-renders that churn ids.
+    function elementSignature(el) {
+        if (!el) return '';
+        const role = (el.getAttribute('role') || el.tagName || '').toLowerCase();
+        const name = normalizeText(getAccessibleLabel(el)).slice(0, 40);
+        const section = normalizeText(getNearbySectionText(el)).slice(0, 30);
+        return role + '|' + name + '|' + section;
+    }
+
+    // ─── PLUGGABLE TARGET SCORER ───────────────────────────────────
+    // Deterministic weighted scorer today; the registry is the extension point
+    // where a trained ranker can be registered later without touching call sites.
+    const TargetScorers = {
+        heuristic(f) {
+            const w = { name: 0.42, role: 0.15, label: 0.13, section: 0.08, visible: 0.07, framework: 0.05, proximity: 0.10 };
+            let s = w.name * f.nameSim + w.role * f.roleMatch + w.label * f.labelSim
+                + w.section * f.sectionSim + w.visible * (f.visible ? 1 : 0)
+                + w.framework * f.frameworkMatch + w.proximity * f.proximity;
+            if (f.negative) s *= 0.25;   // strong penalty for known-bad targets
+            if (f.disabled) s *= 0.4;
+            return Math.max(0, Math.min(1, s));
+        }
+    };
+    function getActiveScorer() { return TargetScorers[_activeScorerId] || TargetScorers.heuristic; }
+
+    function buildTargetFeatures(el, intent) {
+        const name = getAccessibleLabel(el);
+        const role = (el.getAttribute('role') || el.tagName || '').toLowerCase();
+        const wanted = normalizeText(intent.text || intent.text_match || intent.label || '');
+        const wantedRole = normalizeText(intent.role_hint || '');
+        const labelBlob = [el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('aria-label')].filter(Boolean).join(' ');
+        const sig = elementSignature(el);
+        return {
+            nameSim: wanted ? nameSimilarity(name, wanted) : 0.5,
+            roleMatch: wantedRole ? ((role.includes(wantedRole) || wantedRole.includes(role)) ? 1 : 0) : 0.5,
+            labelSim: wanted ? nameSimilarity(labelBlob, wanted) : 0.5,
+            sectionSim: intent.section ? nameSimilarity(getNearbySectionText(el), intent.section) : 0.3,
+            visible: isElementVisible(el),
+            frameworkMatch: el.closest('[data-radix-collection-item],[cmdk-item],[class*="Mui"],[class*="react-select"]') ? 1 : 0,
+            proximity: 0.5,
+            disabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
+            negative: _negativeTargets.has(sig) || (function () { try { return _negativeTargets.has(generateCss(el)); } catch (e) { return false; } })()
+        };
+    }
+
+    // Rank candidates for a target intent; returns top confidence + alternates.
+    function resolveTargetWithConfidence(intent) {
+        const scorer = getActiveScorer();
+        const ranked = getInteractiveCandidates().map(el => {
+            let selector = ''; try { selector = generateCss(el); } catch (e) { selector = ''; }
+            return { el, selector, signature: elementSignature(el), name: getAccessibleLabel(el).slice(0, 80), score: scorer(buildTargetFeatures(el, intent)) };
+        }).sort((a, b) => b.score - a.score);
+        const top = ranked[0] || null;
+        return {
+            found: !!top,
+            confidence: top ? top.score : 0,
+            top: top ? { selector: top.selector, signature: top.signature, name: top.name, score: top.score } : null,
+            candidates: ranked.slice(0, 5).map(c => ({ selector: c.selector, name: c.name, score: Number(c.score.toFixed(3)) }))
+        };
+    }
+
+    // ─── ACTION VERIFIER ───────────────────────────────────────────
+    function countOpenPopups() {
+        return document.querySelectorAll('[role="dialog"],[role="listbox"],[role="menu"],[data-radix-popper-content-wrapper],[cmdk-list],.MuiAutocomplete-popper,.ant-select-dropdown').length;
+    }
+    function resolveVerifyTargetEl(action) {
+        if (action.selector) { try { const e = document.querySelector(action.selector); if (e) return e; } catch (_) { } }
+        if (action.field && typeof resolveFieldByIntent === 'function') { const r = resolveFieldByIntent(action.field); if (r && r.el) return r.el; }
+        return null;
+    }
+    function readElementValue(el) {
+        if (!el) return null;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') return el.value || '';
+        const chip = el.closest('[class*="select"],[class*="combobox"]');
+        const chipEl = chip ? chip.querySelector('[class*="singleValue"],[class*="chip"],[class*="tag"],[data-radix-select-value]') : null;
+        return chipEl ? (chipEl.textContent || '').trim() : (el.getAttribute('aria-expanded') || '');
+    }
+    function captureVerifyContext(action) {
+        ensureDomMutationObserver();
+        const el = resolveVerifyTargetEl(action);
+        return {
+            action: action.action, url: location.href, mut: _domMutationCount,
+            popups: countOpenPopups(), value: el ? readElementValue(el) : null, ts: Date.now()
+        };
+    }
+    function verifyAction(action) {
+        const ctx = _verifyContext;
+        const el = resolveVerifyTargetEl(action);
+        const now = { url: location.href, mut: _domMutationCount, popups: countOpenPopups(), value: el ? readElementValue(el) : null };
+        if (!ctx) return { verified: true, reason: 'no-context' };
+        const urlChanged = ctx.url !== now.url;
+        const domChanged = (now.mut - ctx.mut) > 0;
+        const popupChanged = now.popups !== ctx.popups;
+        if (action.action === 'type') {
+            const want = normalizeText(action.text || '');
+            const has = normalizeText(now.value || '');
+            const grew = has.length > normalizeText(ctx.value || '').length;
+            const ok = (want && has.includes(want)) || grew || domChanged || popupChanged;
+            return { verified: !!ok, reason: ok ? 'value/dom-changed' : 'value-unchanged', value: now.value };
+        }
+        if (action.action === 'select_option') {
+            const want = normalizeText(action.option || action.text || '');
+            const has = normalizeText(now.value || '');
+            const ok = want ? has.includes(want) : (has !== normalizeText(ctx.value || ''));
+            return { verified: !!ok, reason: ok ? 'option-selected' : 'option-unchanged', value: now.value };
+        }
+        if (action.action === 'click' || action.action === 'keyboard_event' || action.action === 'hover') {
+            const changed = urlChanged || domChanged || popupChanged;
+            return { verified: !!changed, reason: changed ? (urlChanged ? 'url-changed' : (popupChanged ? 'popup-changed' : 'dom-changed')) : 'no-effect' };
+        }
+        return { verified: true, reason: 'unverifiable-action' };
+    }
+
+    // ─── RECOVERY ENGINE ───────────────────────────────────────────
+    async function executeRecoveryStrategies(action) {
+        const extraData = { recovery: true, strategies: [] };
+        if (action.selector) _negativeTargets.add(action.selector); // avoid the failed target
+        let el = null;
+        if (action.text_match || action.text || action.field) {
+            const ranked = resolveTargetWithConfidence({ text: action.text_match || action.text, text_match: action.text_match, role_hint: action.role_hint, field: action.field });
+            if (ranked.found && ranked.top && ranked.top.selector && ranked.top.selector !== action.selector) {
+                try { el = document.querySelector(ranked.top.selector); } catch (_) { }
+                if (el) extraData.strategies.push('ranked:' + ranked.top.selector + '@' + ranked.top.score.toFixed(2));
+            }
+        }
+        if (!el && action.selector) { try { el = document.querySelector(action.selector); } catch (_) { } }
+
+        if (action.action === 'click') {
+            if (!el) return { success: false, ...extraData, error: 'No recovery target' };
+            const optionAncestor = el.closest('[role="option"],[role="menuitem"],[cmdk-item],[data-radix-collection-item]');
+            if (optionAncestor) { await clickOptionElement(optionAncestor); extraData.strategies.push('option-click'); return { success: true, ...extraData }; }
+            dispatchUniversalClick(el); extraData.strategies.push('universal-click');
+            await sleepCS(120);
+            // Coordinate fallback via elementFromPoint if universal click didn't take.
+            try {
+                const r = el.getBoundingClientRect();
+                const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                if (hit) { hit.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); extraData.strategies.push('coordinate-click'); }
+            } catch (_) { }
+            return { success: true, ...extraData };
+        }
+        if (action.action === 'type') {
+            let target = el;
+            if (target && !isTypableElement(target)) target = await resolveTypableTarget(target);
+            if (!target) return { success: false, ...extraData, error: 'No typable recovery target' };
+            setNativeValue(target, action.text || '');
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            extraData.strategies.push('native-setter');
+            return { success: true, ...extraData };
+        }
+        if (action.action === 'select_option' && el && el.tagName.toLowerCase() === 'select') {
+            const want = normalizeText(action.option || action.text || '');
+            const opt = Array.from(el.options).find(o => normalizeText(o.text).includes(want) || normalizeText(o.value).includes(want));
+            if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); extraData.strategies.push('native-select'); return { success: true, ...extraData }; }
+        }
+        return { success: false, ...extraData, error: 'No recovery strategy for ' + action.action };
+    }
+
+    // ─── FRAMEWORK ADAPTER LAYER ───────────────────────────────────
+    // Shared interface { detect, open/scope, select, verify } consolidating the
+    // deterministic recipes for Radix + React/Aria/MUI component families.
+    const FrameworkAdapters = {
+        radixSelect: {
+            detect(el) { try { return !!(el && el.closest('[data-radix-select-trigger],[role="combobox"][aria-haspopup="listbox"]')); } catch (e) { return false; } },
+            async open(trigger) { dispatchUniversalClick(trigger); await sleepCS(250); return countOpenPopups() > 0; },
+            async select(optionText) {
+                const opt = collectVisibleDropdownOptions().find(o => normalizeText(o.text).includes(normalizeText(optionText)));
+                if (!opt) return false; await clickOptionElement(opt.el); await sleepCS(180); return true;
+            },
+            verify(trigger, optionText) {
+                const scope = trigger && trigger.closest('[class*="select"],[class*="combobox"]');
+                const chip = scope ? scope.querySelector('[data-radix-select-value],[class*="singleValue"],[class*="value"]') : null;
+                return chip ? normalizeText(chip.textContent).includes(normalizeText(optionText)) : false;
+            }
+        },
+        radixDialog: {
+            detect() { return !!document.querySelector('[role="dialog"][data-state="open"],[data-radix-dialog-content]'); },
+            scope() { return document.querySelector('[role="dialog"][data-state="open"],[data-radix-dialog-content],[role="dialog"]'); },
+            // Dialog-scoped leaf click — never clicks the overlay (avoids click-outside dismissal).
+            async clickLeaf(textOrSelector) {
+                const dialog = this.scope(); if (!dialog) return false;
+                let target = null;
+                try { target = document.querySelector(textOrSelector); } catch (_) { target = null; }
+                if (!target || !dialog.contains(target)) {
+                    const opts = Array.from(dialog.querySelectorAll('button,[role="button"],a,[role="menuitem"],[role="option"]')).filter(isElementVisible);
+                    target = opts.find(o => normalizeText(o.textContent).includes(normalizeText(textOrSelector)));
+                }
+                if (!target) return false; dispatchUniversalClick(target); return true;
+            }
+        },
+        radixCommand: {
+            detect() { return !!document.querySelector('[cmdk-root],[cmdk-input]'); },
+            async typeAndSelect(text, optionText) {
+                const input = document.querySelector('[cmdk-input],[role="combobox"] input,input[placeholder]');
+                if (!input) return false;
+                setNativeValue(input, text); input.dispatchEvent(new Event('input', { bubbles: true }));
+                await sleepCS(450); // list mutation + async fetch settle
+                const opt = collectVisibleDropdownOptions().find(o => normalizeText(o.text).includes(normalizeText(optionText || text)));
+                if (!opt) return false; await clickOptionElement(opt.el); return true;
+            }
+        }
+    };
+
+    async function runFrameworkAction(payload) {
+        const p = payload || {};
+        const family = p.family;
+        if (family === 'radixSelect') {
+            let trigger = null; try { trigger = p.selector ? document.querySelector(p.selector) : null; } catch (_) { }
+            if (trigger) await FrameworkAdapters.radixSelect.open(trigger);
+            const ok = await FrameworkAdapters.radixSelect.select(p.option || p.text || '');
+            return { success: ok, verified: trigger ? FrameworkAdapters.radixSelect.verify(trigger, p.option || p.text || '') : ok };
+        }
+        if (family === 'radixDialog') { const ok = await FrameworkAdapters.radixDialog.clickLeaf(p.text || p.selector || ''); return { success: ok }; }
+        if (family === 'radixCommand') { const ok = await FrameworkAdapters.radixCommand.typeAndSelect(p.text || '', p.option || ''); return { success: ok }; }
+        return { success: false, error: 'Unknown framework family: ' + family };
+    }
+
+    // ─── INCREMENTAL PAGE GRAPH ────────────────────────────────────
+    function buildGraphEdges(nodes, elMap) {
+        const edges = [];
+        for (const n of nodes) {
+            const el = elMap.get(n.id); if (!el) continue;
+            const controls = el.getAttribute && el.getAttribute('aria-controls');
+            if (controls) {
+                const t = nodes.find(x => { const xe = elMap.get(x.id); return xe && xe.id === controls; });
+                if (t) edges.push({ from: n.id, to: t.id, type: 'aria-controls' });
+            }
+            if (el.closest && el.closest('form')) edges.push({ from: n.id, to: 'form', type: 'form-ownership' });
+            if (el.closest && el.closest('[role="dialog"]')) edges.push({ from: n.id, to: 'dialog', type: 'dialog-scope' });
+            if (el.closest && el.closest('[data-radix-popper-content-wrapper],[cmdk-list]')) edges.push({ from: n.id, to: 'portal', type: 'portal' });
+            if (el.id) {
+                let lbl = null; try { lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]'); } catch (_) { }
+                if (lbl) edges.push({ from: 'label:' + el.id, to: n.id, type: 'label-for' });
+            }
+        }
+        return edges;
+    }
+    function buildPageGraph() {
+        const els = extractClickableElements();
+        const elMap = new Map();
+        const nodes = els.map((e, i) => {
+            const id = 'n' + i;
+            let domEl = null; try { domEl = e.selector ? document.querySelector(e.selector) : null; } catch (_) { }
+            if (domEl) elMap.set(id, domEl);
+            return {
+                id, selector: e.selector,
+                signature: domEl ? elementSignature(domEl) : (e.roleHint + '|' + normalizeText(e.text || '').slice(0, 40)),
+                role: e.roleHint, name: e.ariaLabel || e.text || '', tag: e.tagName,
+                bbox: e.boundingBox || null, framePath: location.href,
+                mounted: !!domEl, staleness: 0, confidence: 1, lastSeen: Date.now(),
+                fieldIntent: e.fieldIntent || null, comboboxState: e.comboboxState || null
+            };
+        });
+        return { url: location.href, title: document.title, nodes, edges: buildGraphEdges(nodes, elMap), mutationCount: _domMutationCount, builtAt: Date.now() };
+    }
+    function getPageGraph(force) {
+        ensureDomMutationObserver();
+        if (!force && !_pageGraphDirty && _pageGraphCache) return { ...(_pageGraphCache), cached: true };
+        _pageGraphCache = buildPageGraph();
+        _pageGraphDirty = false;
+        return { ...(_pageGraphCache), cached: false };
+    }
+    // Multi-modal resolution: backendNodeId not available in-page, so resolve by
+    // selector -> semantic signature -> accessibility path (confidence match).
+    function resolveGraphNode(target) {
+        const t = target || {};
+        if (t.selector) { try { const e = document.querySelector(t.selector); if (e && isElementVisible(e)) return { found: true, selector: t.selector, via: 'selector' }; } catch (_) { } }
+        if (t.signature) {
+            const match = getInteractiveCandidates().find(el => elementSignature(el) === t.signature);
+            if (match) { try { return { found: true, selector: generateCss(match), via: 'signature' }; } catch (_) { } }
+        }
+        if (t.name) {
+            const ranked = resolveTargetWithConfidence({ text: t.name, role_hint: t.role });
+            if (ranked.found && ranked.confidence >= 0.6) return { found: true, selector: ranked.top.selector, via: 'a11y-path', confidence: ranked.confidence };
+        }
+        return { found: false };
+    }
+
+    // ─── SECONDARY MESSAGE LISTENER (new intelligence endpoints) ───
+    // Kept separate from the large legacy listener; only responds to its own
+    // message types (returns true only inside handled branches) so the original
+    // handler continues to own OBSERVE/EXECUTE_ACTION/etc.
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (!message || !message.type) return;
+        switch (message.type) {
+            case 'VERIFY_ACTION':
+                try { sendResponse(verifyAction(message.payload || {})); }
+                catch (e) { sendResponse({ verified: true, reason: 'verify-error:' + e.message }); }
+                return true;
+            case 'GET_GRAPH':
+                try { sendResponse({ success: true, graph: getPageGraph(!!(message.payload && message.payload.force)) }); }
+                catch (e) { sendResponse({ success: false, error: e.message }); }
+                return true;
+            case 'RESOLVE_NODE':
+                try { sendResponse(resolveGraphNode(message.payload || {})); }
+                catch (e) { sendResponse({ found: false, error: e.message }); }
+                return true;
+            case 'RESOLVE_CONFIDENCE':
+                try { sendResponse({ success: true, ...resolveTargetWithConfidence(message.payload || {}) }); }
+                catch (e) { sendResponse({ success: false, error: e.message }); }
+                return true;
+            case 'FRAMEWORK_ACTION':
+                (async () => {
+                    try { sendResponse(await runFrameworkAction(message.payload || {})); }
+                    catch (e) { sendResponse({ success: false, error: e.message }); }
+                })();
+                return true;
+            case 'SET_SCORER':
+                _activeScorerId = (message.payload && message.payload.scorer) || 'heuristic';
+                sendResponse({ success: true, scorer: _activeScorerId });
+                return true;
+            default:
+                return; // let the primary listener handle everything else
+        }
+    });
 }

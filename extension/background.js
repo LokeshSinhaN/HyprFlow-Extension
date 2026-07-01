@@ -7,6 +7,45 @@ const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
 const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
 const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
 const CALL_API_URL = "http://127.0.0.1:8001/api/extension/call-api";
+const CONFIG_URL = "http://127.0.0.1:8001/api/extension/config";
+
+// ─── AGENT CONFIG ──────────────────────────────────────────────
+// Mirrors backend config/automation.php. Fetched from /config at run start so
+// feature flags and timeouts have a single source of truth; falls back to these
+// defaults if the backend is unreachable. Replaces the old hard-coded 90s AI
+// timeout, 15s content timeout and 5 content retries.
+const AGENT_CONFIG_DEFAULTS = {
+    localVerify: true,
+    localRecovery: true,
+    taskQueue: true,
+    pageGraph: true,
+    radixAdapters: true,
+    crossFrame: true,
+    cdpEnabled: false,
+    targetScorer: 'heuristic',
+    targetConfidenceThreshold: 0.85,
+    aiTimeoutMs: 45000,
+    contentTimeoutMs: 8000,
+    contentRetries: 3,
+    multiActionMaxChain: 5
+};
+let AGENT_CONFIG = { ...AGENT_CONFIG_DEFAULTS };
+
+async function loadAgentConfig() {
+    try {
+        const res = await fetch(CONFIG_URL, { headers: { 'Accept': 'application/json' } });
+        if (res.ok) {
+            const cfg = await res.json();
+            AGENT_CONFIG = { ...AGENT_CONFIG_DEFAULTS, ...cfg };
+            if (chrome.storage.session) {
+                chrome.storage.session.set({ agentConfig: AGENT_CONFIG }).catch(() => { });
+            }
+        }
+    } catch (e) {
+        // Backend down — keep defaults; the loop surfaces connection errors itself.
+    }
+    return AGENT_CONFIG;
+}
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -33,6 +72,253 @@ chrome.storage.local.get(['lastAgentHistory', 'lastAgentPrompt', 'lastAgentStart
     if (result.lastAgentPrompt) lastAgentPrompt = result.lastAgentPrompt;
     if (result.lastAgentStartUrl) lastAgentStartUrl = result.lastAgentStartUrl;
 });
+
+// ─── DURABLE RUN STATE (survives MV3 service-worker restarts) ──
+// The MV3 service worker can be torn down at any time, wiping in-memory globals
+// and the agent-loop's local variables. We snapshot the active run to
+// chrome.storage.session (whose lifetime matches the browser session — the right
+// scope for an in-flight automation) and restore/resume when the worker wakes.
+const RUN_STATE_KEY = 'hyprflowRunState';
+let runStateSaveTimer = null;
+let pendingResumeState = null;   // Hydrated into agentLoop when resuming after a restart
+
+function persistRunState(loopState = {}, immediate = false) {
+    if (!chrome.storage.session) return;
+    const write = () => {
+        const snapshot = {
+            isRunning,
+            isAgentMode,
+            currentTabId,
+            prompt: lastAgentPrompt,
+            startUrl: lastAgentStartUrl,
+            planSteps: currentPlanSteps,
+            updatedAt: Date.now(),
+            loop: loopState   // step, actionHistory, counters, quickFillState, taskQueue, ...
+        };
+        chrome.storage.session.set({ [RUN_STATE_KEY]: snapshot }).catch(() => { });
+    };
+    if (immediate) {
+        if (runStateSaveTimer) { clearTimeout(runStateSaveTimer); runStateSaveTimer = null; }
+        write();
+        return;
+    }
+    // Throttle rapid writes within a single step.
+    if (runStateSaveTimer) clearTimeout(runStateSaveTimer);
+    runStateSaveTimer = setTimeout(() => { runStateSaveTimer = null; write(); }, 250);
+}
+
+async function loadRunState() {
+    if (!chrome.storage.session) return null;
+    try {
+        const data = await chrome.storage.session.get([RUN_STATE_KEY]);
+        return data[RUN_STATE_KEY] || null;
+    } catch (e) { return null; }
+}
+
+function clearRunState() {
+    if (runStateSaveTimer) { clearTimeout(runStateSaveTimer); runStateSaveTimer = null; }
+    if (!chrome.storage.session) return;
+    chrome.storage.session.remove(RUN_STATE_KEY).catch(() => { });
+}
+
+// ─── DURABLE TASK QUEUE / STATE MACHINE (Phase 3) ──────────────
+// A restartable state machine layered over the plan. Each plan step becomes a
+// task that moves planned -> queued -> executing -> verifying -> complete, with
+// retrying / needs_llm / needs_user / failed branches, an idempotency key and a
+// retry budget. The queue is persisted inside the run snapshot so it survives
+// service-worker restarts. The LLM still chooses concrete actions; the queue
+// governs step lifecycle, progress, and retry accounting.
+const TASK_STATES = ['planned', 'queued', 'executing', 'verifying', 'complete', 'retrying', 'needs_llm', 'needs_user', 'failed'];
+
+function seedTaskQueue(planSteps) {
+    return (planSteps || []).map((step, i) => ({
+        id: 'task_' + i,
+        index: i,
+        description: typeof step === 'string' ? step : (step && step.description ? step.description : String(step)),
+        state: i === 0 ? 'queued' : 'planned',
+        idempotencyKey: 'step-' + i,
+        retryBudget: 3,
+        attempts: 0,
+        timeoutMs: 120000,
+        updatedAt: Date.now()
+    }));
+}
+
+function taskTransition(queue, index, state, note) {
+    if (!Array.isArray(queue) || index < 0 || index >= queue.length) return queue;
+    const t = queue[index];
+    if (!t || !TASK_STATES.includes(state)) return queue;
+    t.state = state;
+    if (state === 'retrying') t.attempts = (t.attempts || 0) + 1;
+    if (note) t.note = String(note).slice(0, 200);
+    t.updatedAt = Date.now();
+    // Advance the next task to 'queued' when this one completes.
+    if (state === 'complete' && queue[index + 1] && queue[index + 1].state === 'planned') {
+        queue[index + 1].state = 'queued';
+    }
+    // Surface progress to the panel (best-effort).
+    chrome.runtime.sendMessage({ type: 'TASK_QUEUE_UPDATE', payload: { queue } }).catch(() => { });
+    return queue;
+}
+
+// On service-worker wake, restore cached config and resume an interrupted run.
+(async function restoreOnStartup() {
+    if (chrome.storage.session) {
+        try {
+            const cached = await chrome.storage.session.get(['agentConfig']);
+            if (cached.agentConfig) AGENT_CONFIG = { ...AGENT_CONFIG_DEFAULTS, ...cached.agentConfig };
+        } catch (e) { /* ignore */ }
+    }
+    const state = await loadRunState();
+    if (!state || !state.isRunning) return;
+    // A run was in flight when the worker died — restore globals and continue it.
+    isAgentMode = !!state.isAgentMode;
+    currentTabId = state.currentTabId;
+    lastAgentPrompt = state.prompt || '';
+    lastAgentStartUrl = state.startUrl || '';
+    currentPlanSteps = state.planSteps || [];
+    let tabAlive = false;
+    try {
+        const tab = await new Promise(r => chrome.tabs.get(currentTabId, t => { if (chrome.runtime.lastError) r(null); else r(t); }));
+        tabAlive = !!tab;
+    } catch (e) { tabAlive = false; }
+    if (!tabAlive) { clearRunState(); return; }
+    pendingResumeState = state.loop || {};
+    await loadAgentConfig();
+    isRunning = true;
+    sendLogToPanel('🔄 Resuming interrupted run after extension restart...', 'info');
+    chrome.runtime.sendMessage({ type: 'RUN_RESUMED', payload: { prompt: lastAgentPrompt } }).catch(() => { });
+    try { await injectContentScript(currentTabId); } catch (e) { /* content script auto-injects too */ }
+    agentLoop(lastAgentPrompt, currentTabId, currentPlanSteps, pendingResumeState);
+})();
+
+// ─── FRAME REGISTRY (cross-origin iframe support) ──────────────
+// content.js now injects into all frames (manifest all_frames:true). We track
+// every frame per tab so the agent can observe/act inside iframes, and so
+// main-frame messages target frameId 0 explicitly (avoids ambiguous responses
+// now that multiple frames could each reply to a broadcast sendMessage).
+const frameRegistry = new Map(); // tabId -> Map(frameId -> {frameId, parentFrameId, url})
+
+function registerFrame(tabId, frameId, parentFrameId, url) {
+    if (!frameRegistry.has(tabId)) frameRegistry.set(tabId, new Map());
+    frameRegistry.get(tabId).set(frameId, { frameId, parentFrameId, url: url || '', ts: Date.now() });
+}
+
+if (chrome.webNavigation) {
+    chrome.webNavigation.onCommitted.addListener((d) => registerFrame(d.tabId, d.frameId, d.parentFrameId, d.url));
+    chrome.webNavigation.onCompleted.addListener((d) => registerFrame(d.tabId, d.frameId, d.parentFrameId, d.url));
+}
+chrome.tabs.onRemoved.addListener((tabId) => frameRegistry.delete(tabId));
+
+// Send a message to a SPECIFIC frame (frameId 0 = main/top frame).
+function sendMessageToFrame(tabId, frameId, message) {
+    return new Promise((resolve) => {
+        try {
+            chrome.tabs.sendMessage(tabId, message, { frameId }, (response) => {
+                if (chrome.runtime.lastError) resolve(null);
+                else resolve(response);
+            });
+        } catch (e) { resolve(null); }
+    });
+}
+
+// Observe every frame and aggregate elements, tagging each with its frameId so
+// the executor can route the action back to the right frame. Returns null when
+// only the main frame exists (caller falls back to the legacy single-frame path).
+async function observeAllFrames(tabId) {
+    if (!AGENT_CONFIG.crossFrame || !chrome.webNavigation) return null;
+    let frames = [];
+    try {
+        frames = await new Promise((resolve) => {
+            chrome.webNavigation.getAllFrames({ tabId }, (f) => {
+                if (chrome.runtime.lastError || !f) resolve([]); else resolve(f);
+            });
+        });
+    } catch (e) { frames = []; }
+    if (!frames || frames.length <= 1) return null; // only main frame
+
+    const aggregated = [];
+    let mainResult = null;
+    for (const fr of frames) {
+        const resp = await sendMessageToFrame(tabId, fr.frameId, { type: 'OBSERVE', payload: { frameId: fr.frameId } });
+        if (resp && Array.isArray(resp.elements)) {
+            for (const el of resp.elements) {
+                el.frameId = fr.frameId;
+                el.frameUrl = fr.url;
+                aggregated.push(el);
+            }
+            if (fr.frameId === 0) mainResult = resp;
+        }
+    }
+    if (aggregated.length === 0) return null;
+    if (!mainResult) mainResult = { url: '', title: '', validationErrors: [] };
+    return {
+        url: mainResult.url,
+        title: mainResult.title,
+        elements: aggregated,
+        validationErrors: mainResult.validationErrors || [],
+        multiFrame: true,
+        frameCount: frames.length
+    };
+}
+
+// ─── CDP MODULE (guarded, best-effort) ─────────────────────────
+// For frames/elements the content script cannot reach, chrome.debugger drives
+// input and reads the accessibility tree via the DevTools Protocol. Off by
+// default (AGENT_CONFIG.cdpEnabled) since attaching shows a "being debugged"
+// banner; coordinate input works regardless of frame origin.
+const _cdpAttached = new Set();
+
+function cdpSend(tabId, method, params) {
+    return new Promise((resolve, reject) => {
+        try {
+            chrome.debugger.sendCommand({ tabId }, method, params || {}, (res) => {
+                if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                else resolve(res);
+            });
+        } catch (e) { reject(e); }
+    });
+}
+async function cdpAttach(tabId) {
+    if (!AGENT_CONFIG.cdpEnabled || !chrome.debugger) return false;
+    if (_cdpAttached.has(tabId)) return true;
+    try {
+        await new Promise((resolve, reject) => chrome.debugger.attach({ tabId }, '1.3', () => chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve()));
+        _cdpAttached.add(tabId);
+        for (const domain of ['DOM.enable', 'Runtime.enable', 'Accessibility.enable']) {
+            try { await cdpSend(tabId, domain, {}); } catch (e) { /* domain optional */ }
+        }
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+async function cdpDetach(tabId) {
+    if (!_cdpAttached.has(tabId)) return;
+    try { await new Promise((resolve) => chrome.debugger.detach({ tabId }, () => resolve())); } catch (e) { /* ignore */ }
+    _cdpAttached.delete(tabId);
+}
+// Click at absolute viewport coordinates (works across origins).
+async function cdpClickAtPoint(tabId, x, y) {
+    if (!(await cdpAttach(tabId))) return { success: false, error: 'CDP attach failed/disabled' };
+    try {
+        await cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+        await cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+        return { success: true };
+    } catch (e) { return { success: false, error: e.message }; }
+}
+// Coordinate click fallback from an element's bounding box (viewport-relative).
+async function cdpClickElementFallback(tabId, bbox) {
+    if (!bbox || typeof bbox.x !== 'number') return { success: false, error: 'No bbox' };
+    return cdpClickAtPoint(tabId, Math.round(bbox.x + bbox.width / 2), Math.round(bbox.y + bbox.height / 2));
+}
+// Read the full accessibility tree of a frame (best-effort, for inaccessible frames).
+async function cdpGetAxTree(tabId) {
+    if (!(await cdpAttach(tabId))) return null;
+    try { return await cdpSend(tabId, 'Accessibility.getFullAXTree', {}); }
+    catch (e) { return null; }
+}
+chrome.tabs.onRemoved.addListener((tabId) => { if (_cdpAttached.has(tabId)) cdpDetach(tabId); });
 
 // Tab auto-detection: track newly created tabs so we can detect popups
 let recentlyCreatedTabs = [];
@@ -68,6 +354,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
             if (tabs.length === 0) return;
             currentTabId = tabs[0].id;
+            // Pull the latest feature flags / timeouts before doing anything.
+            await loadAgentConfig();
+            lastAgentPrompt = prompt;
+            persistRunState({}, true); // recoverable even if the worker dies during planning
             await injectContentScript(currentTabId);
             sendResponse({ status: 'started' });
 
@@ -87,6 +377,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         isAwaitingHuman = false;
         lastAskUserContext = null;
+        clearRunState(); // user-initiated stop is not resumable
         sendResponse({ status: 'stopped' });
         return true;
     }
@@ -324,21 +615,26 @@ async function injectContentScript(tabId) {
 }
 
 // ─── CONTENT SCRIPT COMMUNICATION WITH RETRIES + TIMEOUT ────────
-async function executeContentScript(tabId, actionType, payload = null, retries = 5) {
-    for (let i = 0; i < retries; i++) {
+async function executeContentScript(tabId, actionType, payload = null, retries = null, frameId = 0) {
+    const maxRetries = retries != null ? retries : (AGENT_CONFIG.contentRetries || 3);
+    const timeoutMs = AGENT_CONFIG.contentTimeoutMs || 8000;
+    for (let i = 0; i < maxRetries; i++) {
         const result = await Promise.race([
             new Promise((resolve) => {
-                chrome.tabs.sendMessage(tabId, { type: actionType, payload }, (response) => {
+                // Target a specific frame (default: main frame 0). With all_frames
+                // injection an untargeted sendMessage would race replies from every
+                // frame, so we always pin the frame explicitly.
+                chrome.tabs.sendMessage(tabId, { type: actionType, payload }, { frameId }, (response) => {
                     if (chrome.runtime.lastError) resolve(null);
                     else resolve(response);
                 });
             }),
             // Timeout: prevent infinite hang if content script never responds
-            new Promise((resolve) => setTimeout(() => resolve(null), 15000))
+            new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs))
         ]);
         if (result) return result;
 
-        console.log(`Message failed, retrying (${i + 1}/${retries})...`);
+        console.log(`Message failed, retrying (${i + 1}/${maxRetries})...`);
         await sleep(1000);
         await injectContentScript(tabId);
     }
@@ -354,6 +650,49 @@ async function waitForStability(tabId, timeoutMs = 3000) {
         // Fallback: simple delay
         await sleep(2000);
     }
+}
+
+// ─── FRAME ROUTING ─────────────────────────────────────────────
+// Determine which frame an action targets, from the matched element's frameId
+// in the aggregated cross-frame observation. Defaults to the main frame (0).
+function resolveActionFrameId(decision, elements) {
+    if (!decision || !AGENT_CONFIG.crossFrame) return 0;
+    const sel = decision.selector;
+    if (!sel || !Array.isArray(elements)) return 0;
+    const match = elements.find(e => e && e.selector === sel && typeof e.frameId === 'number');
+    return match ? match.frameId : 0;
+}
+
+// ─── LOCAL VERIFIER + RECOVERY (Phase 2) ───────────────────────
+// A mutating action is "verified" when its post-condition holds (value changed,
+// option/chip selected, dialog opened/closed, DOM/URL changed). Verification is
+// a cheap content-script round-trip — NOT an LLM call — so confirming locally
+// avoids burning an LLM turn just to notice an action silently failed, and lets
+// the recovery engine retry deterministically before we escalate.
+const VERIFIABLE_ACTIONS = ['click', 'type', 'select_option', 'hover', 'keyboard_event'];
+
+async function verifyActionLocally(tabId, decision, frameId) {
+    if (!AGENT_CONFIG.localVerify || !VERIFIABLE_ACTIONS.includes(decision.action)) {
+        return { verified: true, skipped: true };
+    }
+    const res = await executeContentScript(tabId, 'VERIFY_ACTION', {
+        action: decision.action,
+        selector: decision.selector || null,
+        field: decision.field || null,
+        text: decision.text || null,
+        option: decision.option || null,
+        text_match: decision.text_match || null
+    }, 1, frameId);
+    // If the verifier is unavailable (older content script), don't block the loop.
+    if (!res) return { verified: true, unavailable: true };
+    return res;
+}
+
+async function attemptLocalRecovery(tabId, decision, frameId) {
+    if (!AGENT_CONFIG.localRecovery) return null;
+    // Ask the content script to retry with alternate deterministic strategies
+    // (universal click -> coordinate click -> keyboard nav; reopen portal; next candidate).
+    return executeContentScript(tabId, 'EXECUTE_ACTION', { ...decision, _recovery: true }, 1, frameId);
 }
 
 // ─── TAB MANAGEMENT ────────────────────────────────────────────
@@ -683,7 +1022,7 @@ async function captureSoMScreenshot(tabId) {
 }
 
 // ─── MAIN AGENT LOOP ───────────────────────────────────────────
-async function agentLoop(prompt, tabId, planSteps = []) {
+async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
     const maxSteps = 50; // Increased from default to handle complex SOPs
     let actionHistory = [];           // Full rich history for Selenium code gen
     let currentPlanStepIndex = 0;     // Enhancement 1: Track current plan step
@@ -730,12 +1069,54 @@ async function agentLoop(prompt, tabId, planSteps = []) {
         restartCount: 0,
         lastSearch: ''
     };
+    // Phase 3: durable task queue seeded from the plan (one task per step).
+    let taskQueue = AGENT_CONFIG.taskQueue ? seedTaskQueue(planSteps) : [];
+
+    // ── RESUME HYDRATION ──
+    // When the service worker restarts mid-run, restoreOnStartup() re-enters this
+    // function with the persisted loop state so we continue instead of restarting.
+    let startStep = 0;
+    if (resumeState && typeof resumeState === 'object') {
+        if (Array.isArray(resumeState.actionHistory)) actionHistory = resumeState.actionHistory;
+        if (typeof resumeState.currentPlanStepIndex === 'number') currentPlanStepIndex = resumeState.currentPlanStepIndex;
+        if (Array.isArray(resumeState.clickedSelectors)) clickedSelectors = resumeState.clickedSelectors;
+        if (resumeState.toggledOptions) toggledOptions = resumeState.toggledOptions;
+        if (resumeState.actionRetryCount) actionRetryCount = resumeState.actionRetryCount;
+        if (typeof resumeState.lastActionKey === 'string') lastActionKey = resumeState.lastActionKey;
+        if (typeof resumeState.failedActionCount === 'number') failedActionCount = resumeState.failedActionCount;
+        if (resumeState.quickFillState) quickFillState = resumeState.quickFillState;
+        if (resumeState.apiCallCounts) apiCallCounts = resumeState.apiCallCounts;
+        if (typeof resumeState.lastPageUrl === 'string') lastPageUrl = resumeState.lastPageUrl;
+        if (typeof resumeState.step === 'number') startStep = resumeState.step;
+        if (Array.isArray(resumeState.taskQueue)) taskQueue = resumeState.taskQueue;
+        lastAgentHistory = actionHistory;
+        sendLogToPanel(`Resumed at step ${startStep + 1} with ${actionHistory.length} prior actions.`, 'info');
+    }
 
     try { // ── OUTER TRY: guarantees AGENT_DONE fires even on unhandled crash ──
-        for (let step = 0; step < maxSteps && isRunning; step++) {
+        for (let step = startStep; step < maxSteps && isRunning; step++) {
             try { // ── PER-STEP TRY-CATCH: prevents silent crashes ──
                 const stepStartTime = Date.now();
                 sendLogToPanel(`--- Step ${step + 1} ---`, 'step');
+
+                // Durable snapshot at each step boundary (survives SW restarts).
+                persistRunState({
+                    step,
+                    currentPlanStepIndex,
+                    actionHistory,
+                    clickedSelectors,
+                    toggledOptions,
+                    actionRetryCount,
+                    lastActionKey,
+                    failedActionCount,
+                    quickFillState,
+                    apiCallCounts,
+                    lastPageUrl,
+                    taskQueue
+                }, true);
+
+                // Task queue: mark the current step's task as executing.
+                if (AGENT_CONFIG.taskQueue) taskTransition(taskQueue, currentPlanStepIndex, 'executing');
 
                 // Check consecutive failure limit
                 if (failedActionCount >= maxFailedActions) {
@@ -790,7 +1171,14 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 // DOM-ONLY MODE (default): Fast, reliable, no screenshot
                 if (!observeResult) {
                     sendLogToPanel('Observing page elements...', 'info');
-                    observeResult = await executeContentScript(currentTabId, 'OBSERVE');
+                    // Cross-frame: aggregate elements from all iframes when present;
+                    // falls back to the main frame when there is only one frame.
+                    observeResult = AGENT_CONFIG.crossFrame ? await observeAllFrames(currentTabId) : null;
+                    if (observeResult && observeResult.multiFrame) {
+                        sendLogToPanel(`Observed ${observeResult.elements.length} elements across ${observeResult.frameCount} frames`, 'info');
+                    } else {
+                        observeResult = await executeContentScript(currentTabId, 'OBSERVE');
+                    }
                     if (!observeResult || !observeResult.elements) {
                         sendLogToPanel("Failed to observe page. Retrying...", 'error');
                         await sleep(2000);
@@ -936,7 +1324,8 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 try {
                     sendLogToPanel('Thinking... (waiting for AI response)', 'info');
                     const controller = new AbortController();
-                    const apiTimeout = setTimeout(() => controller.abort(), 90000); // 90s timeout (complex pages need more AI processing time)
+                    const aiTimeoutMs = AGENT_CONFIG.aiTimeoutMs || 45000; // configurable (was hard-coded 90s)
+                    const apiTimeout = setTimeout(() => controller.abort(), aiTimeoutMs);
                     const response = await fetch(API_URL, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -981,7 +1370,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 } catch (error) {
                     if (error.name === 'AbortError') {
                         apiTimeoutCount++;
-                        sendLogToPanel(`AI API timed out after 90s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
+                        sendLogToPanel(`AI API timed out after ${Math.round((AGENT_CONFIG.aiTimeoutMs || 45000) / 1000)}s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
                         // API timeouts are infrastructure issues — use separate counter
                         // Only count toward main failure counter if we've exhausted timeout retries
                         if (apiTimeoutCount >= maxApiTimeouts) {
@@ -1023,6 +1412,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // Enhancement 1: Plan step tracking
                 if (aiDecision.planStepCompleted && currentPlanStepIndex < planSteps.length) {
+                    if (AGENT_CONFIG.taskQueue) taskTransition(taskQueue, currentPlanStepIndex, 'complete');
                     currentPlanStepIndex++;
                     sendLogToPanel(`Plan step ${currentPlanStepIndex} completed`, 'success');
                 }
@@ -1194,6 +1584,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // 6-HITL. Handle ASK_USER — Human-in-the-Loop Pause
                 if (aiDecision.action === 'ask_user') {
+                    if (AGENT_CONFIG.taskQueue) taskTransition(taskQueue, currentPlanStepIndex, 'needs_user');
                     sendLogToPanel(`AI asks: ${aiDecision.conversational_message}`, 'warn');
                     sendLogToPanel(`⏸️ Agent paused — waiting indefinitely for human input...`, 'warn');
 
@@ -1247,6 +1638,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // 7b. Handle FINISH
                 if (aiDecision.action === 'finish') {
+                    if (AGENT_CONFIG.taskQueue) taskTransition(taskQueue, currentPlanStepIndex, 'complete');
                     sendLogToPanel(`Agent finished: ${aiDecision.summary}`, 'decision');
                     actionHistory.push(historyEntry);
                     break;
@@ -1398,7 +1790,43 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         }
                     }
 
-                    actionResult = await executeContentScript(currentTabId, 'EXECUTE_ACTION', aiDecision);
+                    // Route to the element's frame (cross-origin iframe support); default main frame.
+                    const actionFrameId = resolveActionFrameId(aiDecision, lastObservedElements);
+                    actionResult = await executeContentScript(currentTabId, 'EXECUTE_ACTION', aiDecision, null, actionFrameId);
+
+                    // Phase 2: verify the action locally and recover deterministically
+                    // BEFORE spending another LLM round-trip on a silent failure.
+                    if (actionResult && actionResult.success && AGENT_CONFIG.localVerify) {
+                        const verification = await verifyActionLocally(currentTabId, aiDecision, actionFrameId);
+                        if (verification && verification.verified === false) {
+                            sendLogToPanel(`Verify: not confirmed (${verification.reason || 'no post-condition'}) — local recovery...`, 'warn');
+                            const recovered = await attemptLocalRecovery(currentTabId, aiDecision, actionFrameId);
+                            if (recovered && recovered.success) {
+                                const reVerify = await verifyActionLocally(currentTabId, aiDecision, actionFrameId);
+                                actionResult = recovered;
+                                actionResult.verified = !(reVerify && reVerify.verified === false);
+                                actionResult.recovered = true;
+                                sendLogToPanel(`Local recovery ${actionResult.verified ? 'succeeded' : 'attempted (unconfirmed)'}.`, actionResult.verified ? 'success' : 'warn');
+                            } else {
+                                actionResult.success = false;
+                                actionResult.verified = false;
+                                actionResult.error = verification.reason || 'Action not verified';
+                            }
+                        } else if (verification) {
+                            actionResult.verified = verification.verified !== false;
+                        }
+                    }
+
+                    // Last-resort CDP coordinate click for unreachable/obscured targets
+                    // (guarded by AGENT_CONFIG.cdpEnabled; default off).
+                    if (AGENT_CONFIG.cdpEnabled && aiDecision.action === 'click' && actionResult && actionResult.success === false) {
+                        const matchEl = lastObservedElements.find(e => e && e.selector === aiDecision.selector);
+                        if (matchEl && matchEl.boundingBox) {
+                            sendLogToPanel('Attempting CDP coordinate-click fallback...', 'warn');
+                            const cdpRes = await cdpClickElementFallback(currentTabId, matchEl.boundingBox);
+                            if (cdpRes.success) { actionResult.success = true; actionResult.cdpFallback = true; }
+                        }
+                    }
                     sendLogToPanel(`Action result: ${JSON.stringify(actionResult)}`, 'info');
 
                     if (actionResult) {
@@ -1659,6 +2087,9 @@ async function agentLoop(prompt, tabId, planSteps = []) {
     } finally {
         // ── GUARANTEE: AGENT_DONE always fires, even on crash ──
         isRunning = false;
+        // Run completed/stopped normally → not resumable. (If the worker is killed
+        // mid-run this finally never executes, so the snapshot survives for resume.)
+        clearRunState();
         // Reset human-in-the-loop state
         if (humanResponseResolver) {
             humanResponseResolver('stop');

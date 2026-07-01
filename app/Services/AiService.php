@@ -16,7 +16,7 @@ use OpenAI;
  * AI for automation: Gemini primary, Mistral secondary, OpenAI third.
  * Models are configured dynamically via .env file using:
  * - GEMINI_MODEL
- * - MISTRAL_MODEL  
+ * - MISTRAL_MODEL
  * - OPENAI_MODEL
  */
 class AiService
@@ -40,8 +40,8 @@ class AiService
     /**
      * Generate text using the selected UI provider first, then OpenAI, then Mistral.
      *
-     * @param  string       $prompt        The user/main prompt content.
-     * @param  string|null  $provider      Preferred AI provider (gemini, openai, mistral).
+     * @param  string  $prompt  The user/main prompt content.
+     * @param  string|null  $provider  Preferred AI provider (gemini, openai, mistral).
      * @param  string|null  $systemPrompt  Optional system-level instructions sent separately
      *                                     so they are not repeated in every user turn and can
      *                                     be cached by the provider (Gemini systemInstruction,
@@ -50,29 +50,34 @@ class AiService
     public function generate(string $prompt, ?string $provider = null, ?string $systemPrompt = null): ?string
     {
         $this->lastError = null;
-        $maxRetries = 3;
+        $chain = $this->getProviderChain($provider);
+        $maxRetries = max(1, (int) config('automation.provider_max_retries', 2));
 
-        // Gemini-only with retry on failure (no OpenAI/Mistral fallback)
-        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
-            try {
-                return $this->generateWithGemini($prompt, $systemPrompt);
-            } catch (\Throwable $e) {
-                $this->lastError = $e->getMessage();
+        // Walk the provider chain; each provider gets bounded retries with backoff
+        // before we fall through to the next configured provider.
+        foreach ($chain as $currentProvider) {
+            for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+                try {
+                    return $this->generateWithProvider($currentProvider, $prompt, $systemPrompt);
+                } catch (\Throwable $e) {
+                    $this->lastError = $e->getMessage();
 
-                Log::warning("Gemini API attempt {$attempt}/{$maxRetries} failed", [
-                    'error' => $this->lastError,
-                    'attempt' => $attempt,
-                ]);
+                    Log::warning("AI provider '{$currentProvider}' attempt {$attempt}/{$maxRetries} failed", [
+                        'provider' => $currentProvider,
+                        'error' => $this->lastError,
+                        'attempt' => $attempt,
+                    ]);
 
-                // Wait before retrying (exponential backoff: 1s, 2s, 4s)
-                if ($attempt < $maxRetries) {
-                    usleep((int) (pow(2, $attempt - 1) * 1000000));
+                    // Exponential backoff between retries of the SAME provider (1s, 2s, 4s)
+                    if ($attempt < $maxRetries) {
+                        usleep((int) (pow(2, $attempt - 1) * 1000000));
+                    }
                 }
             }
         }
 
-        Log::error('Gemini API failed after all retries', [
-            'attempts' => $maxRetries,
+        Log::error('All AI providers failed', [
+            'chain' => $chain,
             'last_error' => $this->lastError,
         ]);
 
@@ -85,28 +90,39 @@ class AiService
     public function generateVision(string $prompt, string $imageBase64, ?string $provider = null, ?string $systemPrompt = null): ?string
     {
         $this->lastError = null;
-        $maxRetries = 3;
 
-        // Gemini-only vision with retry (no OpenAI/Mistral fallback)
-        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
-            try {
-                return $this->generateVisionWithGemini($prompt, $imageBase64, $systemPrompt);
-            } catch (\Throwable $e) {
-                $this->lastError = $e->getMessage();
+        // Only vision-capable providers participate (Mistral has no vision support here).
+        $chain = array_values(array_filter(
+            $this->getProviderChain($provider),
+            fn ($p) => in_array($p, ['gemini', 'openai'], true)
+        ));
+        if (empty($chain)) {
+            $chain = ['gemini'];
+        }
+        $maxRetries = max(1, (int) config('automation.provider_max_retries', 2));
 
-                Log::warning("Gemini Vision API attempt {$attempt}/{$maxRetries} failed", [
-                    'error' => $this->lastError,
-                    'attempt' => $attempt,
-                ]);
+        foreach ($chain as $currentProvider) {
+            for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+                try {
+                    return $this->generateVisionWithProvider($currentProvider, $prompt, $imageBase64, $systemPrompt);
+                } catch (\Throwable $e) {
+                    $this->lastError = $e->getMessage();
 
-                if ($attempt < $maxRetries) {
-                    usleep((int) (pow(2, $attempt - 1) * 1000000));
+                    Log::warning("AI vision provider '{$currentProvider}' attempt {$attempt}/{$maxRetries} failed", [
+                        'provider' => $currentProvider,
+                        'error' => $this->lastError,
+                        'attempt' => $attempt,
+                    ]);
+
+                    if ($attempt < $maxRetries) {
+                        usleep((int) (pow(2, $attempt - 1) * 1000000));
+                    }
                 }
             }
         }
 
-        Log::error('Gemini Vision API failed after all retries', [
-            'attempts' => $maxRetries,
+        Log::error('All AI vision providers failed', [
+            'chain' => $chain,
             'last_error' => $this->lastError,
         ]);
 
@@ -118,8 +134,40 @@ class AiService
      */
     private function getProviderChain(?string $provider = null): array
     {
-        // Only Gemini — no OpenAI/Mistral fallback. Gemini retries on failure.
-        return ['gemini'];
+        $fallbackEnabled = (bool) config('automation.provider_fallback_enabled', true);
+        $primary = $provider ?: config('automation.primary_ai', $this->primary);
+
+        // Fallback disabled → behave like before: only the requested/primary provider.
+        if (! $fallbackEnabled) {
+            return [$primary];
+        }
+
+        // Ordered, de-duplicated preference list: requested/primary → secondary → tertiary.
+        $ordered = array_values(array_unique(array_filter([
+            $primary,
+            config('automation.secondary_ai', $this->secondary),
+            config('automation.tertiary_ai', $this->tertiary),
+        ])));
+
+        // Keep only providers that actually have an API key configured.
+        $withKeys = array_values(array_filter($ordered, fn ($p) => $this->providerHasKey($p)));
+
+        // If nothing is configured, still return the primary so a meaningful
+        // "API key not configured" error surfaces to the caller.
+        return ! empty($withKeys) ? $withKeys : [$primary];
+    }
+
+    /**
+     * Whether the given provider has an API key configured.
+     */
+    private function providerHasKey(string $provider): bool
+    {
+        return match ($provider) {
+            'gemini' => ! empty(config('gemini.api_key')),
+            'openai' => ! empty(config('openai.api_key')),
+            'mistral' => ! empty(config('mistral.api_key')),
+            default => false,
+        };
     }
 
     /**
@@ -127,7 +175,7 @@ class AiService
      */
     private function generateWithProvider(string $provider, string $prompt, ?string $systemPrompt = null): string
     {
-        return match($provider) {
+        return match ($provider) {
             'gemini' => $this->generateWithGemini($prompt, $systemPrompt),
             'mistral' => $this->generateWithMistral($prompt, $systemPrompt),
             'openai' => $this->generateWithOpenAI($prompt, $systemPrompt),
@@ -140,9 +188,9 @@ class AiService
      */
     private function generateVisionWithProvider(string $provider, string $prompt, string $imageBase64, ?string $systemPrompt = null): string
     {
-        return match($provider) {
+        return match ($provider) {
             'gemini' => $this->generateVisionWithGemini($prompt, $imageBase64, $systemPrompt),
-            'mistral' => throw new \RuntimeException("Mistral vision not fully supported yet, falling back"),
+            'mistral' => throw new \RuntimeException('Mistral vision not fully supported yet, falling back'),
             'openai' => $this->generateVisionWithOpenAI($prompt, $imageBase64, $systemPrompt),
             default => throw new \RuntimeException("Unknown provider: {$provider}"),
         };
@@ -241,7 +289,7 @@ class AiService
 
         try {
             $guzzleClient = $this->getGuzzleClient();
-            $geminiClient = (new Factory())
+            $geminiClient = (new Factory)
                 ->withHttpClient($guzzleClient)
                 ->withApiKey($apiKey)
                 ->make();
@@ -255,11 +303,12 @@ class AiService
                     responseMimeType: ResponseMimeType::APPLICATION_JSON,
                 ));
 
-            $fullPrompt = $systemPrompt ? $systemPrompt . "\n\n" . $prompt : $prompt;
+            $fullPrompt = $systemPrompt ? $systemPrompt."\n\n".$prompt : $prompt;
             $result = $generativeModel->generateContent($fullPrompt);
 
             $text = $result->text();
             Log::debug('Gemini API response received', ['response_length' => strlen($text)]);
+
             return $text;
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
@@ -291,19 +340,19 @@ class AiService
 
         try {
             $guzzleClient = $this->getGuzzleClient();
-            $geminiClient = (new Factory())
+            $geminiClient = (new Factory)
                 ->withHttpClient($guzzleClient)
                 ->withApiKey($apiKey)
                 ->make();
 
             $generativeModel = $geminiClient->generativeModel($model);
-            
+
             $b64Data = preg_replace('#^data:image/[^;]+;base64,#', '', $imageBase64);
             $blob = new Blob(MimeType::IMAGE_JPEG, $b64Data);
 
             if ($systemPrompt) {
                 // Combine system prompt with user prompt for vision
-                $fullPrompt = $systemPrompt . "\n\n" . $prompt;
+                $fullPrompt = $systemPrompt."\n\n".$prompt;
                 $result = $generativeModel->generateContent(Content::parse([$fullPrompt, $blob]));
             } else {
                 $result = $generativeModel->generateContent(Content::parse([$prompt, $blob]));
@@ -311,6 +360,7 @@ class AiService
 
             $text = $result->text();
             Log::debug('Gemini Vision API response received', ['response_length' => strlen($text)]);
+
             return $text;
         } catch (\Exception $e) {
             Log::error('Gemini Vision API call failed', ['model' => $model, 'error' => $e->getMessage()]);
@@ -350,7 +400,7 @@ class AiService
                     'response_format' => ['type' => 'json_object'],
                 ],
                 'headers' => [
-                    'Authorization' => 'Bearer ' . $apiKey,
+                    'Authorization' => 'Bearer '.$apiKey,
                     'Content-Type' => 'application/json',
                 ],
             ]);
@@ -358,10 +408,11 @@ class AiService
             $body = json_decode((string) $response->getBody(), true);
 
             if (isset($body['error'])) {
-                throw new \RuntimeException('Mistral API error: ' . ($body['error']['message'] ?? json_encode($body['error'])));
+                throw new \RuntimeException('Mistral API error: '.($body['error']['message'] ?? json_encode($body['error'])));
             }
 
             $content = $body['choices'][0]['message']['content'] ?? '';
+
             return is_string($content) ? $content : '';
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
@@ -424,6 +475,7 @@ class AiService
             ]);
 
             $content = $response->choices[0]->message->content;
+
             return is_string($content) ? $content : '';
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
@@ -464,10 +516,10 @@ class AiService
             } else {
                 $client = OpenAI::client($apiKey);
             }
-            
+
             $dataUri = $imageBase64;
-            if (!str_starts_with($imageBase64, 'data:image')) {
-                $dataUri = 'data:image/jpeg;base64,' . $imageBase64;
+            if (! str_starts_with($imageBase64, 'data:image')) {
+                $dataUri = 'data:image/jpeg;base64,'.$imageBase64;
             }
 
             $messages = [];
@@ -475,11 +527,11 @@ class AiService
                 $messages[] = ['role' => 'system', 'content' => $systemPrompt];
             }
             $messages[] = [
-                'role' => 'user', 
+                'role' => 'user',
                 'content' => [
                     ['type' => 'text', 'text' => $prompt],
-                    ['type' => 'image_url', 'image_url' => ['url' => $dataUri]]
-                ]
+                    ['type' => 'image_url', 'image_url' => ['url' => $dataUri]],
+                ],
             ];
 
             $response = $client->chat()->create([
@@ -488,6 +540,7 @@ class AiService
             ]);
 
             $content = $response->choices[0]->message->content;
+
             return is_string($content) ? $content : '';
         } catch (\Exception $e) {
             Log::error('OpenAI Vision API call failed', ['model' => $model, 'error' => $e->getMessage()]);
@@ -506,10 +559,10 @@ class AiService
      * This ensures the payload sent to the AI provider remains within token limits
      * and is strict application/json (no binary blobs inflating the request).
      *
-     * @param  array  $messages       The full conversation message array.
-     * @param  int    $maxTurns       Threshold after which compaction triggers (default: 6).
-     * @param  int    $preserveRecent Number of recent interactions to preserve fully (default: 2).
-     * @return array  The compacted message array with Base64 payloads stripped from older turns.
+     * @param  array  $messages  The full conversation message array.
+     * @param  int  $maxTurns  Threshold after which compaction triggers (default: 6).
+     * @param  int  $preserveRecent  Number of recent interactions to preserve fully (default: 2).
+     * @return array The compacted message array with Base64 payloads stripped from older turns.
      */
     public function compactHistory(array $messages, int $maxTurns = 6, int $preserveRecent = 2): array
     {
@@ -541,6 +594,7 @@ class AiService
             // Always preserve the system prompt (first message) and recent messages fully
             if ($index === 0 || $index >= $compactionEndIndex) {
                 $compacted[] = $message;
+
                 continue;
             }
 
@@ -567,9 +621,9 @@ class AiService
      * - Inline base64 strings in content fields
      * - Image data in nested tool/function results
      *
-     * @param  array  $message       A single message from the conversation.
-     * @param  int    &$strippedCount Counter incremented for each stripped image.
-     * @return array  The message with image payloads replaced by placeholders.
+     * @param  array  $message  A single message from the conversation.
+     * @param  int  &$strippedCount  Counter incremented for each stripped image.
+     * @return array The message with image payloads replaced by placeholders.
      */
     private function stripImagePayloads(array $message, int &$strippedCount): array
     {

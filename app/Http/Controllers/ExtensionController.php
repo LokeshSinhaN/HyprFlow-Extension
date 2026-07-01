@@ -311,6 +311,31 @@ class ExtensionController extends Controller
     }
 
     /**
+     * GET /api/extension/config
+     * Exposes the JS-relevant automation flags so the extension honors the same
+     * feature toggles/timeouts as the backend (single source of truth). The
+     * extension falls back to built-in defaults if this endpoint is unreachable.
+     */
+    public function config(): JsonResponse
+    {
+        return response()->json([
+            'localVerify' => (bool) config('automation.local_verify_enabled', true),
+            'localRecovery' => (bool) config('automation.local_recovery_enabled', true),
+            'taskQueue' => (bool) config('automation.task_queue_enabled', true),
+            'pageGraph' => (bool) config('automation.page_graph_enabled', true),
+            'radixAdapters' => (bool) config('automation.radix_adapters_enabled', true),
+            'crossFrame' => (bool) config('automation.cross_frame_enabled', true),
+            'cdpEnabled' => (bool) config('automation.cdp_enabled', false),
+            'targetScorer' => config('automation.target_scorer', 'heuristic'),
+            'targetConfidenceThreshold' => (float) config('automation.target_confidence_threshold', 0.85),
+            'aiTimeoutMs' => (int) config('automation.ai_timeout_ms', 45000),
+            'contentTimeoutMs' => (int) config('automation.content_timeout_ms', 8000),
+            'contentRetries' => (int) config('automation.content_retries', 3),
+            'multiActionMaxChain' => (int) config('automation.multi_action_max_chain', 5),
+        ]);
+    }
+
+    /**
      * POST /api/extension/plan
      */
     public function plan(Request $request): JsonResponse
@@ -749,10 +774,16 @@ WORKFLOW;
         if (empty($validationErrors)) return '';
         $block = "\n# VALIDATION TARGETS (TRUTH SOURCE):\n";
         foreach ($validationErrors as $i => $e) {
-            $field = $e['field'] || $e['fieldIntent'] || 'Unknown field';
-            $selector = $e['selector'] ? " selector={$e['selector']}" : '';
-            $type = !empty($e['isCombobox']) ? ' combobox/searchable dropdown' : ($e['type'] ? " {$e['type']}" : '');
-            $block .= ($i + 1) . ". {$field}{$type}: {$e['text']}.{$selector}\n";
+            // Use null-coalescing (??): the previous `||` collapsed the field name to a
+            // boolean (true/false) and emitted "1"/"" instead of the real label. The
+            // adjacent reads are also coalesced to avoid undefined-array-key warnings.
+            $field = $e['field'] ?? $e['fieldIntent'] ?? 'Unknown field';
+            $selector = !empty($e['selector']) ? " selector={$e['selector']}" : '';
+            $type = !empty($e['isCombobox'])
+                ? ' combobox/searchable dropdown'
+                : (!empty($e['type']) ? " {$e['type']}" : '');
+            $text = $e['text'] ?? '';
+            $block .= ($i + 1) . ". {$field}{$type}: {$text}.{$selector}\n";
         }
         $block .= "Rules: Fill these exact failing fields first. Use field intents for Procedure/CPT, Diagnosis Pointer, Charges, State, and Insured ID. Do NOT scroll randomly.\n";
         return $block;

@@ -16,6 +16,10 @@ use Illuminate\Support\Facades\Route;
 Route::get('/extension/health', [ExtensionController::class, 'health'])
     ->name('extension.health');
 
+// Automation feature flags / timeouts for the extension (single source of truth)
+Route::get('/extension/config', [ExtensionController::class, 'config'])
+    ->name('extension.config');
+
 // Extension loop — AI brain endpoint
 Route::post('/extension/loop', [ExtensionController::class, 'loop'])
     ->name('extension.loop');

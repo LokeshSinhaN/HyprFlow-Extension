@@ -81,4 +81,62 @@ return [
 
     'multi_action_max_chain' => (int) env('AUTOMATION_MULTI_ACTION_MAX', 5), // max actions in one response
 
+    /*
+    |--------------------------------------------------------------------------
+    | Provider Fallback (Phase 1)
+    | When true, generate()/generateVision() walk primary -> secondary ->
+    | tertiary providers (filtered to those with a configured API key) instead
+    | of Gemini-only. When false, behaves as before (primary with retries).
+    |--------------------------------------------------------------------------
+    */
+    'provider_fallback_enabled' => (bool) env('AUTOMATION_PROVIDER_FALLBACK', true),
+
+    'tertiary_ai' => env('AUTOMATION_TERTIARY_AI', 'mistral'),
+
+    'provider_max_retries' => (int) env('AUTOMATION_PROVIDER_MAX_RETRIES', 2), // attempts per provider before falling through
+
+    /*
+    |--------------------------------------------------------------------------
+    | Local-First Execution (Phase 2)
+    | Verifier + deterministic confidence resolver + local recovery reduce the
+    | number of LLM round-trips. The scorer is pluggable so a trained model can
+    | be added later without touching call sites.
+    |--------------------------------------------------------------------------
+    */
+    'local_verify_enabled' => (bool) env('AUTOMATION_LOCAL_VERIFY', true),
+
+    'local_recovery_enabled' => (bool) env('AUTOMATION_LOCAL_RECOVERY', true),
+
+    'target_scorer' => env('AUTOMATION_TARGET_SCORER', 'heuristic'), // heuristic | <future-model-id>
+
+    'target_confidence_threshold' => (float) env('AUTOMATION_TARGET_CONFIDENCE_THRESHOLD', 0.85),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Durable Task Queue & Page Graph (Phase 3)
+    |--------------------------------------------------------------------------
+    */
+    'task_queue_enabled' => (bool) env('AUTOMATION_TASK_QUEUE', true),
+
+    'page_graph_enabled' => (bool) env('AUTOMATION_PAGE_GRAPH', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Framework Adapters, Timeouts & Cross-Origin (Phase 4)
+    | Timeouts are configurable with lower defaults than the legacy hard-coded
+    | values (AI 90s, content 15s, 5 retries).
+    |--------------------------------------------------------------------------
+    */
+    'radix_adapters_enabled' => (bool) env('AUTOMATION_RADIX_ADAPTERS', true),
+
+    'ai_timeout_ms' => (int) env('AUTOMATION_AI_TIMEOUT_MS', 45000),
+
+    'content_timeout_ms' => (int) env('AUTOMATION_CONTENT_TIMEOUT_MS', 8000),
+
+    'content_retries' => (int) env('AUTOMATION_CONTENT_RETRIES', 3),
+
+    'cross_frame_enabled' => (bool) env('AUTOMATION_CROSS_FRAME', true),
+
+    'cdp_enabled' => (bool) env('AUTOMATION_CDP_ENABLED', false), // guarded chrome.debugger fallback for unreachable frames
+
 ];
