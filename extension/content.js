@@ -919,6 +919,16 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             return true;
         }
 
+        // ─── CLEANUP SoM OVERLAY ────────────────────────────────
+        if (message.type === 'CLEANUP_SOM') {
+            try {
+                const overlay = document.getElementById('hyprflow-som-overlay');
+                if (overlay) overlay.remove();
+            } catch (e) { /* ignore */ }
+            sendResponse({ success: true });
+            return true;
+        }
+
         // ─── RESOLVE SEMANTIC TARGET (message handler for background.js) ──
         if (message.type === 'RESOLVE_SEMANTIC_TARGET') {
             const action = message.payload || {};
@@ -2674,16 +2684,46 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             const elements = extractClickableElements();
             const topElements = elements.slice(0, config.maxElements || 60);
 
-            let index = 1;
+            // ── Create SoM overlay container (draw BEFORE returning to background) ──
+            // Pointer-events none so the overlay does not affect clicks/scroll.
+            const overlay = document.createElement('div');
+            overlay.id = 'hyprflow-som-overlay';
+            overlay.style.position = 'absolute';
+            overlay.style.top = '0';
+            overlay.style.left = '0';
+            overlay.style.width = '100%';
+            overlay.style.height = '100%';
+            overlay.style.zIndex = '2147483647';
+            overlay.style.pointerEvents = 'none';
+            overlay.style.margin = '0';
+            overlay.style.padding = '0';
+            overlay.style.background = 'transparent';
+
+            // Ensure overlay is on top immediately (helps when screenshot capture is fast)
+            document.body.appendChild(overlay);
+
             const somMap = {};
+            let index = 1;
+
+            // Distinct colors (similar to browser-use feel)
+            const colors = [
+                { border: 'rgba(255, 0, 0, 0.95)', labelBg: 'rgba(255, 0, 0, 0.98)' },     // red
+                { border: 'rgba(0, 128, 255, 0.95)', labelBg: 'rgba(0, 128, 255, 0.98)' },    // blue
+                { border: 'rgba(0, 200, 120, 0.95)', labelBg: 'rgba(0, 200, 120, 0.98)' },  // green
+                { border: 'rgba(255, 165, 0, 0.95)', labelBg: 'rgba(255, 165, 0, 0.98)' },  // orange
+                { border: 'rgba(180, 60, 255, 0.95)', labelBg: 'rgba(180, 60, 255, 0.98)' }, // purple
+            ];
 
             for (const el of topElements) {
+                if (index > 99) break;
+
                 const domEl = document.querySelector(el.selector);
                 if (!domEl) continue;
 
                 const rect = domEl.getBoundingClientRect();
                 if (rect.width < 5 || rect.height < 5) continue;
 
+                // Store bounding box in absolute (page) coords for background actions
                 el.boundingBox = {
                     x: rect.x + window.scrollX,
                     y: rect.y + window.scrollY,
@@ -2695,8 +2735,44 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 somMap[index.toString()] = el.selector;
                 el.somIndex = index;
 
+                // Draw overlay box in *viewport* coordinates (overlay is viewport-anchored)
+                const color = colors[(index - 1) % colors.length];
+
+                const box = document.createElement('div');
+                box.style.position = 'absolute';
+                box.style.left = `${rect.x}px`;
+                box.style.top = `${rect.y}px`;
+                box.style.width = `${rect.width}px`;
+                box.style.height = `${rect.height}px`;
+                box.style.boxSizing = 'border-box';
+                box.style.border = `2px solid ${color.border}`;
+                box.style.borderRadius = '4px';
+                box.style.background = 'rgba(255, 255, 255, 0.04)';
+
+                // Label (top-right)
+                const label = document.createElement('div');
+                label.textContent = String(index);
+                label.style.position = 'absolute';
+                label.style.right = '-2px';
+                label.style.top = '-2px';
+                label.style.minWidth = '20px';
+                label.style.height = '20px';
+                label.style.lineHeight = '20px';
+                label.style.textAlign = 'center';
+                label.style.fontSize = '12px';
+                label.style.fontFamily = 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial';
+                label.style.fontWeight = '700';
+                label.style.color = '#fff';
+                label.style.background = color.labelBg;
+                label.style.border = `1px solid rgba(0,0,0,0.25)`;
+                label.style.borderRadius = '10px';
+                label.style.boxShadow = '0 1px 4px rgba(0,0,0,0.25)';
+                label.style.pointerEvents = 'none';
+
+                box.appendChild(label);
+                overlay.appendChild(box);
+
                 index++;
-                if (index > 99) break;
             }
 
             // Return success with elements - background will capture screenshot

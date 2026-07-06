@@ -910,11 +910,8 @@ async function captureSoMScreenshot(tabId) {
         try {
             const tabInfo = await new Promise((resolve) => {
                 chrome.tabs.get(tabId, (tab) => {
-                    if (chrome.runtime.lastError) {
-                        resolve(null);
-                    } else {
-                        resolve(tab);
-                    }
+                    if (chrome.runtime.lastError) resolve(null);
+                    else resolve(tab);
                 });
             });
             windowId = tabInfo ? tabInfo.windowId : null;
@@ -924,6 +921,8 @@ async function captureSoMScreenshot(tabId) {
 
         if (!windowId) {
             sendLogToPanel('Could not determine windowId for screenshot, using text-only mode', 'warn');
+            // Cleanup best-effort even if we can't capture
+            try { await executeContentScript(tabId, 'CLEANUP_SOM', null, 1); } catch (e) { }
             return {
                 success: true,
                 image: null,
@@ -956,7 +955,6 @@ async function captureSoMScreenshot(tabId) {
         }
 
         // Capture the actual screenshot from the tab using the correct windowId
-        // Note: quality must be an integer (0-100), not a decimal
         const screenshot = await new Promise((resolve) => {
             chrome.tabs.captureVisibleTab(windowId, {
                 format: 'jpeg',
@@ -971,10 +969,19 @@ async function captureSoMScreenshot(tabId) {
             });
         });
 
+        // IMMEDIATELY cleanup SoM overlay after the first capture attempt resolves
+        // (success or failure), so the user can interact normally.
+        try { await executeContentScript(tabId, 'CLEANUP_SOM', null, 1); } catch (e) { }
+
         // If first attempt failed, retry once after a short delay
         let finalScreenshot = screenshot;
         if (!finalScreenshot) {
             await sleep(500);
+
+            // Re-draw overlay for retry (because it was cleaned up above).
+            // This ensures boxes are present in the retry screenshot too.
+            try { await executeContentScript(tabId, 'CAPTURE_SOM', visionConfig, 1); } catch (e) { }
+
             finalScreenshot = await new Promise((resolve) => {
                 chrome.tabs.captureVisibleTab(windowId, {
                     format: 'jpeg',
@@ -988,6 +995,9 @@ async function captureSoMScreenshot(tabId) {
                     }
                 });
             });
+
+            // Cleanup after retry as well
+            try { await executeContentScript(tabId, 'CLEANUP_SOM', null, 1); } catch (e) { }
         }
 
         if (finalScreenshot) {
@@ -1017,6 +1027,8 @@ async function captureSoMScreenshot(tabId) {
         }
     } catch (e) {
         sendLogToPanel(`SoM capture failed: ${e.message}`, 'warn');
+        // Best-effort cleanup on exception
+        try { await executeContentScript(tabId, 'CLEANUP_SOM', null, 1); } catch (e2) { }
     }
     return null;
 }
