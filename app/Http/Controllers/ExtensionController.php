@@ -232,6 +232,55 @@ class ExtensionController extends Controller
                 }
             }
 
+            // ── Deterministic validation-driven guardrail (New Professional Claim) ──
+            // Goal: During form fill, never wander into optional UI (e.g., Panel Group)
+            // and never ask the human unless API-first resolution fails.
+            //
+            // If validationErrors are present, only allow actions that are clearly linked
+            // to those fields; otherwise force a retry so the agent “eyes” remain on the
+            // validation-error targets.
+            $hasValidationTargets = is_array($validationErrors) && !empty($validationErrors);
+            $quickFillActive = !empty($quickFillState) && !empty($quickFillState['active']);
+            $panelGroupInDecision = isset($decision['selector']) && is_string($decision['selector']) &&
+                (stripos($decision['selector'], 'panel') !== false || stripos($decision['selector'], 'group') !== false) ||
+                (isset($decision['text']) && is_string($decision['text']) && stripos($decision['text'], 'panel') !== false);
+
+            if ($quickFillActive && $hasValidationTargets) {
+                // If the model tries to ask the human while we still have validation targets,
+                // block it and force a retry (agent must resolve via validation-driven fill).
+                if (($decision['action'] ?? '') === 'ask_user') {
+                    return response()->json([
+                        'error' => 'HUMAN_ASK_BLOCKED_DURING_VALIDATION_RESOLUTION',
+                        'retry' => true,
+                        'conversational_message' => 'Validation errors still exist; resolving them via targeted API + refill first. No human input yet.'
+                    ], 500);
+                }
+
+                // If the model tries to interact with Panel Group while Panel Group is NOT among
+                // the validation targets, block the action and force retry.
+                if ($panelGroupInDecision) {
+                    $validationFields = array_map(function ($e) {
+                        return strtolower((string)($e['field'] ?? $e['fieldIntent'] ?? ''));
+                    }, $validationErrors);
+
+                    $panelGroupIsTarget = in_array('panel group', $validationFields, true) ||
+                        in_array('panel_group', $validationFields, true) ||
+                        in_array('panelgroup', $validationFields, true) ||
+                        array_reduce($validationFields, function ($carry, $f) {
+                            if ($carry) return true;
+                            return str_contains($f, 'panel') && str_contains($f, 'group');
+                        }, false);
+
+                    if (!$panelGroupIsTarget) {
+                        return response()->json([
+                            'error' => 'PANEL_GROUP_INTERACTION_BLOCKED',
+                            'retry' => true,
+                            'conversational_message' => 'Panel Group is not a current validation target. Focus only on the highlighted validation errors.'
+                        ], 500);
+                    }
+                }
+            }
+
             return response()->json($decision);
 
         } catch (\Exception $e) {
