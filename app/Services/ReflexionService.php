@@ -24,38 +24,157 @@ class ReflexionService
             return false;
         }
 
-        // Check last 3 actions for repeated failures on same target
+        // ── Semantic Reflexion: outcome-based loop detection ──
+        // Detect repeated UI error messages (e.g., "Maximum Quantity Reached") even when selectors differ.
+        // We approximate "sequentially across different elements" using sequential failure entries that
+        // share the same normalized error message.
+        $recent = array_slice($history, -8);
+
+        $normalizedErrors = [];
+        foreach ($recent as $entry) {
+            $actionSuccess = $entry['actionSuccess'] ?? true;
+            if ($actionSuccess) {
+                continue;
+            }
+
+            $candidates = [];
+
+            $err = $entry['error'] ?? '';
+            if (is_string($err) && trim($err) !== '') {
+                $candidates[] = $err;
+            }
+
+            // Some flows pass lastActionError separately, but keep compatibility if it is present in history.
+            $lastErr = $entry['lastActionError'] ?? '';
+            if (is_string($lastErr) && trim($lastErr) !== '') {
+                $candidates[] = $lastErr;
+            }
+
+            // If the extension captures post-save errors, they may appear as a string/array.
+            $postErrors = $entry['postSaveErrors'] ?? ($entry['post_errors'] ?? null);
+            if (is_string($postErrors) && trim($postErrors) !== '') {
+                $candidates[] = $postErrors;
+            } elseif (is_array($postErrors)) {
+                foreach ($postErrors as $pe) {
+                    if (is_string($pe) && trim($pe) !== '') {
+                        $candidates[] = $pe;
+                    }
+                }
+            }
+
+            if (empty($candidates)) {
+                continue;
+            }
+
+            // Take the first non-empty candidate as the message signal.
+            $msg = (string) $candidates[0];
+            $normalizedErrors[] = $this->normalizeErrorMessage($msg);
+        }
+
+        // Count sequential occurrences of the same normalized error.
+        $semanticConsecutiveSameError = 0;
+        $lastNorm = '';
+        for ($i = count($normalizedErrors) - 1; $i >= 0; $i--) {
+            $norm = $normalizedErrors[$i];
+            if ($norm === '' || $norm === $lastNorm) {
+                $semanticConsecutiveSameError++;
+                $lastNorm = $norm;
+                continue;
+            }
+            break;
+        }
+
+        // Trigger if the same UI error message repeats 2+ times sequentially.
+        if ($semanticConsecutiveSameError >= 2) {
+            return true;
+        }
+
+        // ── Backward-compatible legacy loops: selector and action repetition ──
+
+        // Check last 3 actions for repeated failures on same target selector
         $recentHistory = array_slice($history, -3);
         $lastSelector = end($recentHistory)['selector'] ?? '';
 
-        if (empty($lastSelector)) {
-            return false;
-        }
-
-        $consecutiveFailures = 0;
-        foreach (array_reverse($recentHistory) as $entry) {
-            if (($entry['selector'] ?? '') === $lastSelector && !($entry['actionSuccess'] ?? true)) {
-                $consecutiveFailures++;
-            } else {
-                break;
+        if (!empty($lastSelector)) {
+            $consecutiveFailures = 0;
+            foreach (array_reverse($recentHistory) as $entry) {
+                if (($entry['selector'] ?? '') === $lastSelector && !($entry['actionSuccess'] ?? true)) {
+                    $consecutiveFailures++;
+                } else {
+                    break;
+                }
             }
-        }
 
-        // Activate if 2+ consecutive failures on same selector
-        if ($consecutiveFailures >= 2) {
-            return true;
+            if ($consecutiveFailures >= 2) {
+                return true;
+            }
         }
 
         // Also activate if same action type failed 3+ times (even on different selectors)
         $lastAction = end($recentHistory)['action'] ?? '';
-        $sameActionFailures = 0;
-        foreach (array_reverse(array_slice($history, -5)) as $entry) {
-            if (($entry['action'] ?? '') === $lastAction && !($entry['actionSuccess'] ?? true)) {
-                $sameActionFailures++;
+        if (!empty($lastAction)) {
+            $sameActionFailures = 0;
+            foreach (array_reverse(array_slice($history, -5)) as $entry) {
+                if (($entry['action'] ?? '') === $lastAction && !($entry['actionSuccess'] ?? true)) {
+                    $sameActionFailures++;
+                }
             }
+
+            return $sameActionFailures >= 3;
         }
 
-        return $sameActionFailures >= 3;
+        // Final fallback: if last action failed with an error and the same error persists twice in a row
+        if ($lastActionFailed && is_string($lastActionError) && trim($lastActionError) !== '') {
+            return $this->countSequentialErrorMatches($history, $lastActionError) >= 2;
+        }
+
+        return false;
+    }
+
+    /**
+     * Normalize UI error message text for semantic-loop detection.
+     */
+    private function normalizeErrorMessage(string $message): string
+    {
+        $m = mb_strtolower(trim($message));
+        // Collapse whitespace
+        $m = preg_replace('/\s+/', ' ', $m) ?? $m;
+        // Remove common punctuation noise
+        $m = preg_replace('/[^\p{L}\p{N}\s]/u', '', $m) ?? $m;
+        return trim($m);
+    }
+
+    /**
+     * Count sequential matches for an error string near the end of history.
+     */
+    private function countSequentialErrorMatches(array $history, string $error): int
+    {
+        $target = $this->normalizeErrorMessage($error);
+        if ($target === '') return 0;
+
+        $count = 0;
+        $lastNorm = null;
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            $entry = $history[$i];
+            if (($entry['actionSuccess'] ?? true)) {
+                continue;
+            }
+
+            $msg = (string) ($entry['error'] ?? $entry['lastActionError'] ?? '');
+            if (trim($msg) === '') {
+                continue;
+            }
+
+            $norm = $this->normalizeErrorMessage($msg);
+            if ($norm === '' || $norm !== $target) {
+                break;
+            }
+
+            $count++;
+            $lastNorm = $norm;
+        }
+
+        return (int) $count;
     }
 
     /**
