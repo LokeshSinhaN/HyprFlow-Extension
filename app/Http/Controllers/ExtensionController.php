@@ -233,12 +233,11 @@ class ExtensionController extends Controller
             }
 
             // ── Deterministic validation-driven guardrail (New Professional Claim) ──
-            // Goal: During form fill, never wander into optional UI (e.g., Panel Group)
-            // and never ask the human unless API-first resolution fails.
+            // Goal: During form fill, never wander into optional UI (e.g., Panel Group).
             //
-            // If validationErrors are present, only allow actions that are clearly linked
-            // to those fields; otherwise force a retry so the agent “eyes” remain on the
-            // validation-error targets.
+            // Human-in-the-loop behavior is controlled by the system prompt rules.
+            // IMPORTANT: Do NOT hard-block `ask_user` from here; otherwise the agent cannot
+            // ask the supervisor for single missing validation details after API lookups.
             $hasValidationTargets = is_array($validationErrors) && !empty($validationErrors);
             $quickFillActive = !empty($quickFillState) && !empty($quickFillState['active']);
             $panelGroupInDecision = isset($decision['selector']) && is_string($decision['selector']) &&
@@ -246,18 +245,6 @@ class ExtensionController extends Controller
                 (isset($decision['text']) && is_string($decision['text']) && stripos($decision['text'], 'panel') !== false);
 
             if ($quickFillActive && $hasValidationTargets) {
-                // If the model tries to ask the human while we still have validation targets,
-                // block it and force a retry (agent must resolve via validation-driven fill).
-                if (($decision['action'] ?? '') === 'ask_user') {
-                    return response()->json([
-                        'error' => 'HUMAN_ASK_BLOCKED_DURING_VALIDATION_RESOLUTION',
-                        'retry' => true,
-                        'conversational_message' => 'Validation errors still exist; resolving them via targeted API + refill first. No human input yet.'
-                    ], 500);
-                }
-
-                // If the model tries to interact with Panel Group while Panel Group is NOT among
-                // the validation targets, block the action and force retry.
                 if ($panelGroupInDecision) {
                     $validationFields = array_map(function ($e) {
                         return strtolower((string)($e['field'] ?? $e['fieldIntent'] ?? ''));
@@ -561,16 +548,17 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
     "api_params": { "last_name": "Santos" }
   }
 
-## 2B. CONSOLIDATED HUMAN-IN-THE-LOOP (ask_user)
+## 2B. ONE-BY-ONE HUMAN-IN-THE-LOOP (ask_user)
 - You must ONLY use the `ask_user` action if your `call_api` data retrieval sequences fail, return no matching indices, or if the parameter is completely absent from back-office records.
-- BULK GATHERING: If multiple fields are failing (e.g., NPI, Phone, and Procedure Code), DO NOT ask for them one by one. You MUST consolidate them into a single `ask_user` request.
-- Example:
+- ONE-BY-ONE RULE (CRITICAL): Even if multiple validation errors exist, ask the human for ONLY ONE missing value at a time.
+- SINGLE FIELD PROMPT RULE (CRITICAL): The `ask_user_prompt` must reference exactly ONE failing field and request only the missing value for that field.
+- Example (single missing field):
   {
-    "thought": "My API lookups failed to find the NPI and Procedure code. I will ask the human for both.",
+    "thought": "API lookup for Panel Group returned empty. I need the human to provide Panel Group.",
     "action": "ask_user",
     "status": "awaiting_human",
-    "conversational_message": "I could not find the missing data through the back-office API. Please provide the following: 1) Billing Provider NPI, 2) Procedure Code (CPT).",
-    "ask_user_prompt": "Please type the values for NPI and Procedure Code."
+    "conversational_message": "I could not retrieve the Panel Group value via the back-office API.",
+    "ask_user_prompt": "Please provide the Panel Group name required for the claim."
   }
 
 ## 2C. PRECISION TARGETING (ANTI-CONFUSION)
@@ -587,9 +575,9 @@ When processing tasks regarding fixing or approving rejected claims, you MUST ex
 1. After clicking "Save Claim", observe the page for new or unresolved verification error tags.
 2. If the system provides validation targets, fill those exact fields first using `field` intent when available.
 3. If errors exist, DO NOT call "finish".
-4. Read ALL new error messages simultaneously.
-5. Execute `call_api` autonomously to try and resolve all new errors at once.
-6. If the back-office API lacks the answers, emit a single, consolidated `ask_user` action listing every remaining error that requires human input.
+4. Read ALL new error messages simultaneously (for awareness).
+5. Execute `call_api` autonomously to try to resolve missing values.
+6. If the back-office API lacks the answers, emit ONE `ask_user` action asking for only ONE missing failing field at a time.
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 4: CORE AUTOMATION RULES
@@ -904,33 +892,35 @@ WORKFLOW;
 # BACK-OFFICE BACKEND API SPECIFICATIONS (RESTful JSON)
 # ═══════════════════════════════════════════════════════════════════════
 Use this catalog to construct your "action": "call_api" parameters.
-Do NOT invent endpoints or parameters. Explicitly follow these routes:
+Do NOT invent endpoints or parameters. Explicitly follow these routes.
 
 **1. Patients Module (Ability: patients:read)**
-- GET /api/v1/patients  -> List patients for the active organization. Optional query filters: ?first_name=STRING, ?last_name=STRING, or both.
-- GET /api/v1/patients/{id} -> Retrieve a single patient profile by their unique ID.
+- GET /api/v1/patients -> List patients for the active organization.
+- GET /api/v1/patients/{id} -> Retrieve a single patient.
 
-**2. Claims Module (Ability: claims:read)**
-- GET /api/v1/claims    -> List claims for the active organization.
-- GET /api/v1/claims/{id} -> Retrieve a single detailed claim record.
+**2. Appointments Module (Ability: appointments:read)**
+- GET /api/v1/appointments -> List appointments for the active organization.
+- GET /api/v1/appointments/{id} -> Retrieve a single appointment.
 
-**3. Eligibility Verification (EV) Requests & Results**
+**3. Claims Module (Ability: claims:read)**
+- GET /api/v1/claims -> List claims for the active organization.
+- GET /api/v1/claims/{id} -> Retrieve a single claim with detail.
+
+**4. Eligibility Verification (EV) Requests & Results**
+- GET /api/v1/eligibility/requests -> List EV requests for the active organization.
+- GET /api/v1/eligibility/requests/{id} -> Retrieve a single EV request with its response.
 - POST /api/v1/eligibility/requests -> Submit a realtime eligibility verification request.
-- GET /api/v1/eligibility/requests/{id} -> Retrieve a single EV request configuration.
-- GET /api/v1/eligibility/results/by-dos/{dos} -> List EV results on a date of service (YYYY-MM-DD).
-- GET /api/v1/eligibility/results/{id} -> Retrieve a single verification record details by ID.
+- GET /api/v1/eligibility/results/by-dos/{dos} -> List EV results for a date of service (YYYY-MM-DD).
+- GET /api/v1/eligibility/results/{id} -> Retrieve a single EV result by ID.
 
-**4. Organizations & Infrastructure**
+**5. Organizations & Clients (Ability: organizations:read)**
 - GET /api/v1/organizations -> List organizations the authenticated user belongs to.
-- GET /api/v1/organizations/{id} -> Retrieve a single organization metadata profile.
-- GET /api/v1/auth/me -> Return the active user profile identity context and organizational assignment mapping.
-
-**5. New Professional Claim Test Results**
-- GET /test-results -> Return fixed sample claim result data for new professional claim creation. No parameters required.
+- GET /api/v1/organizations/{id} -> Retrieve a single organization.
+- GET /api/v1/auth/me -> Return the authenticated user profile and roles.
 
 **USAGE PARAMS RULES:**
-- Paths containing `{id}` or `{dos}` placeholders MUST be passed dynamically as path variables. Your parameter block should separate path mapping keys cleanly.
-- Example: For `/api/v1/patients/45`, pass: "api_endpoint": "/api/v1/patients/{id}" and "api_params": {"id": 45}
+- Paths containing `{id}` or `{dos}` placeholders MUST be passed dynamically as path variables.
+- Example: For `/api/v1/patients/45`, pass: "api_endpoint": "/api/v1/patients/{id}" and "api_params": {"id": 45}.
 CATALOG;
     }
 
