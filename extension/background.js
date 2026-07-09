@@ -1906,7 +1906,25 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                                     );
                                 }) : [];
 
-                                if (errors.length > 0 || fallbackErrorElements.length > 0) {
+                                // Draft warning terminal state detection (SUCCESS) — must be checked before standard validation fallbacks
+                                const pageText = (postSaveObserve && postSaveObserve.elements
+                                    ? postSaveObserve.elements.map(e => [e.text, e.ariaLabel, e.currentValue, e.selectedOptionText].filter(Boolean).join(' ')).join(' ')
+                                    : '').toLowerCase();
+
+                                const isDraftWarningTerminal =
+                                    pageText.includes('draft claims missing encounter notes') ||
+                                    pageText.includes('claim is in draft') ||
+                                    pageText.includes('draft claims') && pageText.includes('encounter notes');
+
+                                if (isDraftWarningTerminal) {
+                                    historyEntry.actionSuccess = true;
+                                    sendLogToPanel('Claim saved as draft (missing encounter note). This is a terminal state.', 'success');
+
+                                    postPopupDirective =
+                                        'TERMINAL STATE REACHED: The claim was successfully saved but placed in Draft status due to missing encounter notes. '
+                                        + 'DO NOT attempt to open the draft. DO NOT attempt to fix the encounter note. '
+                                        + 'Your task is complete. Call "finish" immediately and report that the claim was saved as a draft.';
+                                } else if (errors.length > 0 || fallbackErrorElements.length > 0) {
                                     const errorTexts = errors.length > 0
                                         ? errors.map(e => `${e.field || e.fieldIntent || 'Unknown field'}: ${e.text}`).slice(0, 10).join('; ')
                                         : fallbackErrorElements.map(el => el.text || el.ariaLabel || '').filter(t => t.length > 0).slice(0, 10).join('; ');

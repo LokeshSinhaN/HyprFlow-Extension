@@ -516,7 +516,10 @@ When the user goal asks to create, open, start, or submit a "New Professional Cl
 5. FIRST SAVE: Click "Save Claim" and wait for validation errors or redirect to /claims.
 6. POST-SAVE ERROR RESOLUTION: If validation errors remain, summarize all errors, call the back-office API for missing values, and fill the exact failing fields. This includes text fields, DOBs, dropdowns, and searchable dropdowns.
 7. FINAL SAVE: Click "Save Claim" again after errors are resolved.
-8. REPORT RESULT: Finish only after the page redirects to /claims or a final success/error message is visible. Report the displayed message to the user.
+8. REPORT RESULT:
+   - Finish only after the page redirects to /claims or a final success/error message is visible.
+   - CRITICAL: If the page redirects to the dashboard and displays a warning like "Draft claims missing encounter notes", THIS IS A SUCCESSFUL TERMINAL STATE.
+   - DO NOT attempt to open the Drafts folder. DO NOT attempt to edit the draft to fix the encounter note. Call `finish` immediately.
 
 # ═══════════════════════════════════════════════════════════════════════
 # MANDATORY REJECTED CLAIMS PROTOCOL (DEFAULT STEPS)
@@ -729,6 +732,7 @@ The current goal is to create a New Professional Claim. Follow this protocol ins
 7. If validation errors remain, call the back-office API for the missing values and fill each failing field exactly, including dropdowns, DOBs, and searchable dropdowns.
 8. Click "Save Claim" again.
 9. Finish only after redirect to /claims or a final success/error message appears, then report that displayed message to the user.
+   - CRITICAL: If the page redirects to the dashboard and shows a warning like "Draft claims missing encounter notes", treat it as a SUCCESSFUL terminal state and call `finish` immediately. Do NOT attempt to open/edit the draft.
 WORKFLOW;
     }
 
