@@ -41,7 +41,7 @@ class ApiService
             $client = Http::withToken($token)
                 ->acceptJson()
                 ->withOptions([
-                    'verify' => !filter_var(env('CURL_SSL_VERIFY_DISABLED', true), FILTER_VALIDATE_BOOLEAN),
+'verify' => true,
                     'timeout' => 30
                 ]);
 

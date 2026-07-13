@@ -254,24 +254,43 @@ class AiService
     }
 
     /**
-     * Get a configured Guzzle client with SSL verification settings.
+     * Get a configured Guzzle client.
+     *
+     * SSL verification is intentionally left enabled (secure default).
      */
     private function getGuzzleClient(array $extraOptions = []): GuzzleClient
     {
-        $sslVerifyDisabled = filter_var(env('CURL_SSL_VERIFY_DISABLED', true), FILTER_VALIDATE_BOOLEAN);
-
         $timeout = config('gemini.request_timeout', 30);
         $options = [];
         if ($timeout > 0) {
             $options['timeout'] = $timeout;
         }
 
-        if ($sslVerifyDisabled) {
-            $options['verify'] = false;
+        // Keep SSL verification enabled, but allow a custom CA bundle for
+        // environments where the default trust store is missing or outdated.
+        $caBundlePath = env('SSL_CA_BUNDLE_PATH', '');
+        if (is_string($caBundlePath)) {
+            $caBundlePath = trim($caBundlePath, "\"' \t\r\n");
+            $caBundlePath = str_replace('\\', '/', $caBundlePath);
+            $caBundlePath = preg_replace('#/+#', '/', $caBundlePath) ?: $caBundlePath;
+
+            if ($caBundlePath !== '') {
+                $resolvedCaBundlePath = preg_match('#^(?:[A-Za-z]:/|/)#', $caBundlePath)
+                    ? $caBundlePath
+                    : base_path($caBundlePath);
+
+                if (! is_file($resolvedCaBundlePath) || ! is_readable($resolvedCaBundlePath)) {
+                    throw new \RuntimeException("SSL_CA_BUNDLE_PATH is set but file was not found or not readable: {$resolvedCaBundlePath}");
+                }
+
+                $options['verify'] = $resolvedCaBundlePath;
+            }
         }
 
         return new GuzzleClient(array_merge($options, $extraOptions));
     }
+
+
 
     public function generateWithGemini(string $prompt, ?string $systemPrompt = null): string
     {
@@ -447,16 +466,8 @@ class AiService
         ]);
 
         try {
-            $sslVerifyDisabled = filter_var(env('CURL_SSL_VERIFY_DISABLED', true), FILTER_VALIDATE_BOOLEAN);
-            if ($sslVerifyDisabled) {
-                $httpClient = $this->getGuzzleClient(['base_uri' => 'https://api.openai.com/v1']);
-                $client = OpenAI::factory()
-                    ->withApiKey($apiKey)
-                    ->withHttpClient($httpClient)
-                    ->make();
-            } else {
-                $client = OpenAI::client($apiKey);
-            }
+            // SSL verification is enabled (secure default). Do not allow disabling via CURL_SSL_VERIFY_DISABLED.
+            $client = OpenAI::client($apiKey);
 
             $messages = [];
             if ($systemPrompt) {
@@ -484,7 +495,7 @@ class AiService
                 str_contains($errorMsg, 'unable to get local issuer') ||
                 str_contains($errorMsg, 'curl error')) {
                 Log::error('SSL Certificate Error', ['error' => $errorMsg]);
-                throw new \RuntimeException('SSL certificate error: '.$errorMsg.'. Set CURL_SSL_VERIFY_DISABLED=true in .env for development.');
+                throw new \RuntimeException('SSL certificate error: '.$errorMsg.'. Ensure your CA trust store is configured correctly.');
             }
             Log::error('OpenAI API call failed', [
                 'model' => $model,
@@ -494,6 +505,7 @@ class AiService
             throw $e;
         }
     }
+
 
     public function generateVisionWithOpenAI(string $prompt, string $imageBase64, ?string $systemPrompt = null): string
     {
@@ -506,16 +518,9 @@ class AiService
         Log::debug('Calling OpenAI Vision API', ['model' => $model, 'prompt_length' => strlen($prompt)]);
 
         try {
-            $sslVerifyDisabled = filter_var(env('CURL_SSL_VERIFY_DISABLED', true), FILTER_VALIDATE_BOOLEAN);
-            if ($sslVerifyDisabled) {
-                $httpClient = $this->getGuzzleClient(['base_uri' => 'https://api.openai.com/v1']);
-                $client = OpenAI::factory()
-                    ->withApiKey($apiKey)
-                    ->withHttpClient($httpClient)
-                    ->make();
-            } else {
-                $client = OpenAI::client($apiKey);
-            }
+            // SSL verification is enabled (secure default). Do not allow disabling via CURL_SSL_VERIFY_DISABLED.
+            $client = OpenAI::client($apiKey);
+
 
             $dataUri = $imageBase64;
             if (! str_starts_with($imageBase64, 'data:image')) {
