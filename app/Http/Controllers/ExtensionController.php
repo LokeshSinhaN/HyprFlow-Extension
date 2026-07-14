@@ -157,12 +157,16 @@ class ExtensionController extends Controller
             }
 
             // Parse response
-            $cleanJson = preg_replace('/```(?:json)?\s*(.*?)\s*```/s', '$1', $response);
+            $cleanJson = $this->extractJsonObject($response);
             $decision = json_decode(trim($cleanJson), true);
 
             if (!$decision || !isset($decision['action'])) {
                 Log::warning('Failed to parse AI decision', ['raw' => substr($response, 0, 500)]);
-                return response()->json(['error' => 'Invalid AI response format'], 500);
+                return response()->json([
+                    'error' => 'Invalid AI response format',
+                    'retry' => true,
+                    'suggestion' => 'Return exactly one JSON object with an action field and no markdown or prose.',
+                ]);
             }
 
             // ── Enrich response with human-in-the-loop defaults ──
@@ -228,7 +232,11 @@ class ExtensionController extends Controller
                 } elseif (!empty($decision['somIndex']) && !empty($somMap) && isset($somMap[(string)$decision['somIndex']])) {
                     $decision['selector'] = $somMap[(string)$decision['somIndex']];
                 } elseif (!in_array($action, $selectorFreeActions)) {
-                    return response()->json(['error' => 'Empty selector for ' . $action, 'retry' => true], 500);
+                    return response()->json([
+                        'error' => 'Empty selector for ' . $action,
+                        'retry' => true,
+                        'suggestion' => 'Retry with a valid selector from the observed elements, a supported field intent, or text_match for semantic targeting.',
+                    ]);
                 }
             }
 
@@ -803,6 +811,22 @@ WORKFLOW;
     {
         $blocked = array_filter($clickedSelectors, fn($s) => str_starts_with($s, 'BLOCKED:'));
         return !empty($blocked) ? implode("\n", array_map(fn($s) => "🚫 " . str_replace('BLOCKED:', '', $s), $blocked)) : 'None';
+    }
+
+    private function extractJsonObject(string $response): string
+    {
+        $clean = trim(preg_replace('/```(?:json)?\s*(.*?)\s*```/s', '$1', $response) ?? $response);
+        if (str_starts_with($clean, '{') && str_ends_with($clean, '}')) {
+            return $clean;
+        }
+
+        $start = strpos($clean, '{');
+        $end = strrpos($clean, '}');
+        if ($start !== false && $end !== false && $end > $start) {
+            return substr($clean, $start, $end - $start + 1);
+        }
+
+        return $clean;
     }
 
     private function buildDropdownStatesBlock(array $dropdownStates): string

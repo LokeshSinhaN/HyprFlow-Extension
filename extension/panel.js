@@ -426,7 +426,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Add a completion summary as a new entry
-            const totalSteps = steps.length;
+            const totalSteps = message.stepCount || steps.length;
             const totalTime = agentStartTime ? ((Date.now() - agentStartTime) / 1000).toFixed(0) + 's' : '';
             const summaryDiv = document.createElement('div');
             summaryDiv.style.cssText = 'margin-top: 12px; padding: 10px; background: #0d1117; border: 1px solid #262626; border-radius: 8px; text-align: center; font-size: 12px; color: #737373;';

@@ -466,8 +466,10 @@ class AiService
         ]);
 
         try {
-            // SSL verification is enabled (secure default). Do not allow disabling via CURL_SSL_VERIFY_DISABLED.
-            $client = OpenAI::client($apiKey);
+            $client = OpenAI::factory()
+                ->withApiKey($apiKey)
+                ->withHttpClient($this->getGuzzleClient(['base_uri' => 'https://api.openai.com/v1']))
+                ->make();
 
             $messages = [];
             if ($systemPrompt) {
@@ -518,8 +520,10 @@ class AiService
         Log::debug('Calling OpenAI Vision API', ['model' => $model, 'prompt_length' => strlen($prompt)]);
 
         try {
-            // SSL verification is enabled (secure default). Do not allow disabling via CURL_SSL_VERIFY_DISABLED.
-            $client = OpenAI::client($apiKey);
+            $client = OpenAI::factory()
+                ->withApiKey($apiKey)
+                ->withHttpClient($this->getGuzzleClient(['base_uri' => 'https://api.openai.com/v1']))
+                ->make();
 
 
             $dataUri = $imageBase64;

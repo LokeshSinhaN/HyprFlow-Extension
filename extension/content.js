@@ -1098,16 +1098,34 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     }
 
                     // ── TYPABLE TARGET RESOLUTION (combobox / searchable dropdowns) ──
-                    // If we're about to TYPE but the resolved element isn't directly typable
-                    // (it's a combobox trigger/wrapper), drill in / open it to find the real
-                    // <input>. Prevents "Illegal invocation" and makes API-backed searchable
-                    // dropdowns actually receive the typed text.
-                    if (action.action === 'type' && el && !isTypableElement(el)) {
-                        const typable = await resolveTypableTarget(el);
-                        if (typable) {
-                            extraData.retargetedToInput = generateCss(typable);
-                            el = typable;
-                            try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
+                    // For searchable comboboxes (Radix/shadcn), TYPE must happen on the inner search <input>,
+                    // not on the combobox trigger (<button role="combobox">).
+                    if (action.action === 'type' && el) {
+                        const isComboboxTrigger =
+                            (el.tagName && ['button', 'div', 'span'].includes(el.tagName.toLowerCase())) &&
+                            (el.getAttribute('role') === 'combobox' ||
+                             el.getAttribute('aria-haspopup') === 'listbox' ||
+                             el.getAttribute('aria-haspopup') === 'true' ||
+                             el.getAttribute('aria-autocomplete') === 'list' ||
+                             el.getAttribute('aria-autocomplete') === 'both' ||
+                             !!el.getAttribute('aria-controls') ||
+                             !!el.getAttribute('aria-owns') ||
+                             !!el.closest('[data-radix-combobox-input],[data-radix-collection-item], [class*="react-select"], [class*="combobox"], [class*="autocomplete"], [class*="searchable"]'));
+
+                        // If it's not typable, or it's a combobox trigger, retarget to the inner input.
+                        if (!isTypableElement(el) || isComboboxTrigger) {
+                            // Try to open the combobox if it's a trigger (prevents typing into wrapper)
+                            if (isComboboxTrigger) {
+                                try { dispatchUniversalClick(el); } catch (e) { try { el.click(); } catch (_) {} }
+                                await new Promise(r => setTimeout(r, 250));
+                            }
+                            const typable = await resolveTypableTarget(el);
+                            if (typable) {
+                                extraData.retargetedToInput = generateCss(typable);
+                                extraData.originalTypeTarget = el ? (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (el.getAttribute('role') ? '[role=' + el.getAttribute('role') + ']' : '')) : '';
+                                el = typable;
+                                try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
+                            }
                         }
                     }
 
@@ -1299,8 +1317,6 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             }
                         } else {
                             // INTELLIGENT TYPE: Multi-strategy with auto-dropdown detection
-                            // ENHANCED: Combobox-aware — detects if field is a searchable dropdown
-                            // and ensures the dropdown option is actually clicked, not just typed.
                             el.focus();
 
                             // Detect if this is a combobox/searchable dropdown
@@ -1317,9 +1333,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                 !!el.closest('[class*="react-select"]') ||
                                 !!el.closest('[data-radix-combobox-input]');
 
-                            if (isCombobox) {
-                                extraData.isCombobox = true;
-                            }
+                            if (isCombobox) extraData.isCombobox = true;
 
                             // Clear existing value first
                             setNativeValue(el, '');
@@ -1330,12 +1344,8 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                             await new Promise(r => setTimeout(r, 100));
 
                             // Strategy 2: If value didn't persist, use keyboard simulation
-                            // For comboboxes, ALWAYS use keyboard simulation (triggers search/filter)
                             if (el.value !== action.text || isCombobox) {
-                                if (el.value !== action.text) {
-                                    extraData.fallbackToKeyboard = true;
-                                }
-                                // Clear again before keyboard sim for comboboxes
+                                if (el.value !== action.text) extraData.fallbackToKeyboard = true;
                                 if (isCombobox) {
                                     setNativeValue(el, '');
                                     await new Promise(r => setTimeout(r, 50));
@@ -1343,45 +1353,71 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                 await simulateTyping(el, action.text);
                             }
 
-                            // INTELLIGENT: Dropdown detection — ONLY for combobox/searchable fields
-                            // Regular text inputs (name, email, address, etc.) should NEVER trigger
-                            // dropdown detection — it wastes time and causes false positives.
                             let dropdownResult = { found: false, dropdownVisible: false, visibleOptionTexts: [] };
-
                             if (isCombobox) {
-                                // For comboboxes, wait for API response and detect dropdown
-                                await new Promise(r => setTimeout(r, 600));
+                                // Wait briefly for API results to render listbox/options.
+                                await new Promise(r => setTimeout(r, 550));
                                 dropdownResult = await detectAndSelectDropdownOption(el, action.text);
                                 if (dropdownResult.found) {
                                     extraData.autoSelectedDropdown = true;
                                     extraData.selectedDropdownText = dropdownResult.selectedText;
-                                    if (dropdownResult.matchScore) {
-                                        extraData.matchScore = dropdownResult.matchScore;
-                                    }
+                                    if (dropdownResult.matchScore) extraData.matchScore = dropdownResult.matchScore;
                                 }
                             }
 
-                            // POST-ACTION VERIFICATION: Check if value actually persisted
-                            await new Promise(r => setTimeout(r, 100));
-                            const currentVal = el.value;
-                            if (currentVal === '' && !dropdownResult.found) {
-                                // Value was cleared by framework — try one more time with execCommand
-                                extraData.valueCleared = true;
-                                await simulateTyping(el, action.text);
-                                await new Promise(r => setTimeout(r, 300));
+                            // ── Combobox post-type verification gate (dynamic) ──
+                            if (isCombobox && !dropdownResult.found) {
+                                await new Promise(r => setTimeout(r, 150));
 
-                                // Only retry dropdown detection for combobox fields
-                                if (isCombobox) {
-                                    const retryDropdown = await detectAndSelectDropdownOption(el, action.text);
-                                    if (retryDropdown.found) {
-                                        extraData.autoSelectedDropdown = true;
-                                        extraData.selectedDropdownText = retryDropdown.selectedText;
-                                        if (retryDropdown.matchScore) {
-                                            extraData.matchScore = retryDropdown.matchScore;
+                                const typed = normalizeText(action.text || '');
+                                const valNow = normalizeText(el.value || '');
+                                const expanded = el.getAttribute('aria-expanded');
+                                const inputHidden = (() => {
+                                    const st = window.getComputedStyle(el);
+                                    const rc = el.getBoundingClientRect();
+                                    return st.display === 'none' || st.visibility === 'hidden' || rc.height === 0 || rc.width === 0;
+                                })();
+
+                                const dropdownLikelyVisible = dropdownResult.dropdownVisible ||
+                                    !!document.querySelector('[role="listbox"]:not([style*="display: none"]), [cmdk-list], [data-radix-select-content], [data-radix-combobox-content]');
+
+                                const selectionSucceeded =
+                                    inputHidden ||
+                                    (expanded === 'false' && valNow && valNow !== typed) ||
+                                    (!typed ? false : valNow.includes(typed) && dropdownLikelyVisible);
+
+                                extraData.comboboxPostVerify = {
+                                    typed,
+                                    valNow,
+                                    expanded,
+                                    inputHidden,
+                                    dropdownVisible: dropdownLikelyVisible,
+                                    selectionSucceeded
+                                };
+
+                                if (!selectionSucceeded) {
+                                    // Single recovery loop: reopen trigger, retarget input, type again, then select.
+                                    const comboboxTrigger = el.closest('[role="combobox"], [aria-haspopup="listbox"], [data-radix-combobox-input], [class*="combobox"], [class*="react-select"]') || el;
+                                    try { dispatchUniversalClick(comboboxTrigger); } catch (e) { try { comboboxTrigger.click(); } catch (_) {} }
+                                    await new Promise(r => setTimeout(r, 350));
+
+                                    const typable2 = await resolveTypableTarget(comboboxTrigger);
+                                    if (typable2) {
+                                        el = typable2;
+                                        extraData.recoveryRetargetedToInput = generateCss(typable2);
+
+                                        el.focus();
+                                        setNativeValue(el, '');
+                                        await new Promise(r => setTimeout(r, 60));
+                                        await simulateTyping(el, action.text);
+
+                                        await new Promise(r => setTimeout(r, 550));
+                                        dropdownResult = await detectAndSelectDropdownOption(el, action.text);
+                                        if (dropdownResult.found) {
+                                            extraData.autoSelectedDropdown = true;
+                                            extraData.selectedDropdownText = dropdownResult.selectedText;
+                                            if (dropdownResult.matchScore) extraData.matchScore = dropdownResult.matchScore;
                                         }
-                                    } else if (retryDropdown.dropdownVisible && retryDropdown.visibleOptionTexts.length > 0) {
-                                        extraData.dropdownDetectedButNotSelected = true;
-                                        extraData.visibleOptionTexts = retryDropdown.visibleOptionTexts;
                                     }
                                 }
                             }
@@ -1393,37 +1429,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                 extraData.visibleOptionTexts = dropdownResult.visibleOptionTexts;
                             }
 
-                            // ENHANCED: For comboboxes, verify selection actually happened
-                            // A properly selected combobox usually changes the input value or
-                            // hides the input and shows a chip/tag
-                            if (isCombobox && !dropdownResult.found) {
-                                await new Promise(r => setTimeout(r, 200));
-                                // Check if the input is now hidden (replaced by chip/tag)
-                                const postStyle = window.getComputedStyle(el);
-                                const postRect = el.getBoundingClientRect();
-                                const inputHidden = postStyle.display === 'none' ||
-                                    postStyle.visibility === 'hidden' ||
-                                    postRect.height === 0;
-
-                                if (inputHidden) {
-                                    // Input was replaced by a selection chip — success
-                                    extraData.autoSelectedDropdown = true;
-                                    extraData.selectionConfirmedByHiddenInput = true;
-                                } else {
-                                    // Input still visible — check if aria-expanded is now false
-                                    // (dropdown closed = selection might have happened)
-                                    const expanded = el.getAttribute('aria-expanded');
-                                    if (expanded === 'false' && el.value !== action.text) {
-                                        // Dropdown closed and value changed — likely selected
-                                        extraData.autoSelectedDropdown = true;
-                                        extraData.selectionConfirmedByAriaState = true;
-                                    } else if (!extraData.dropdownDetectedButNotSelected) {
-                                        // Combobox but no dropdown appeared at all
-                                        extraData.comboboxNoDropdownAppeared = true;
-                                    }
-                                }
-                            }
-
+                            // Final: keep success true if typing ran; selection may or may not have happened.
                             success = true;
                             extraData.finalValue = el.value;
                         }

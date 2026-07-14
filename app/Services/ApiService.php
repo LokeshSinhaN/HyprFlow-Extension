@@ -7,6 +7,32 @@ use Illuminate\Support\Facades\Log;
 
 class ApiService
 {
+    private function sslVerifyOption(): bool|string
+    {
+        $caBundlePath = env('SSL_CA_BUNDLE_PATH', '');
+        if (! is_string($caBundlePath)) {
+            return true;
+        }
+
+        $caBundlePath = trim($caBundlePath, "\"' \t\r\n");
+        $caBundlePath = str_replace('\\', '/', $caBundlePath);
+        $caBundlePath = preg_replace('#/+#', '/', $caBundlePath) ?: $caBundlePath;
+
+        if ($caBundlePath === '') {
+            return true;
+        }
+
+        $resolvedCaBundlePath = preg_match('#^(?:[A-Za-z]:/|/)#', $caBundlePath)
+            ? $caBundlePath
+            : base_path($caBundlePath);
+
+        if (! is_file($resolvedCaBundlePath) || ! is_readable($resolvedCaBundlePath)) {
+            throw new \RuntimeException("SSL_CA_BUNDLE_PATH is set but file was not found or not readable: {$resolvedCaBundlePath}");
+        }
+
+        return $resolvedCaBundlePath;
+    }
+
     /**
      * Executes an outbound back-office API request with credential formatting
      * and route parameter interpolation.
@@ -41,7 +67,7 @@ class ApiService
             $client = Http::withToken($token)
                 ->acceptJson()
                 ->withOptions([
-'verify' => true,
+                    'verify' => $this->sslVerifyOption(),
                     'timeout' => 30
                 ]);
 

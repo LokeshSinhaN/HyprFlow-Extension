@@ -868,6 +868,60 @@ function checkForLoop(decision, actionRetryCount, lastActionKey) {
     return { isLoop: false, message: '', actionKey };
 }
 
+function decisionVisibleText(decision) {
+    if (!decision) return '';
+    return [
+        decision.text_match,
+        decision.text,
+        decision.option,
+        decision.conversational_message,
+        decision.thought
+    ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function isNewProfessionalClaimStart(decision) {
+    if (!decision || decision.action !== 'click') return false;
+    return decisionVisibleText(decision).includes('new professional claim');
+}
+
+function hasClaimTransactionProgress(history) {
+    return (history || []).some(entry => {
+        const blob = [
+            entry.action,
+            entry.thought,
+            entry.error,
+            entry.postSaveErrors,
+            entry.userReply,
+            entry.buttonText,
+            entry.text,
+            entry.option
+        ].filter(Boolean).join(' ').toLowerCase();
+
+        return entry.isSaveAction ||
+            entry.autoSubmit ||
+            entry.apiEndpoint ||
+            entry.userReply ||
+            blob.includes('save claim') ||
+            blob.includes('panel group') ||
+            blob.includes('draft') ||
+            blob.includes('quick fill') ||
+            blob.includes('procedure code') ||
+            blob.includes('diagnosis pointer');
+    });
+}
+
+function guardAgainstTransactionRestart(decision, quickFillState, history) {
+    if (!isNewProfessionalClaimStart(decision)) return '';
+
+    const formAlreadyOpened = quickFillState && quickFillState.active && (quickFillState.restartCount || 0) > 0;
+    const transactionHasProgress = hasClaimTransactionProgress(history);
+    if (!formAlreadyOpened && !transactionHasProgress) return '';
+
+    return 'TRANSACTION RESTART BLOCKED: You are already inside an active claim workflow with prior Quick Fill, API, save, validation, or human-input progress. '
+        + 'Do NOT click "New Professional Claim" again. Continue the current form or current draft state. '
+        + 'If the page shows a draft warning or saved state, call "finish"; otherwise fill the remaining validation fields and save.';
+}
+
 // ─── RESOLVE ELEMENT FROM OBSERVE DATA ─────────────────────────
 // Enriches history entries with xpath, id, text from the observation snapshot
 function resolveElementInfo(selector, observedElements) {
@@ -1445,6 +1499,19 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                 if (aiDecision.index !== undefined) historyEntry.index = aiDecision.index;
                 if (aiDecision.unselect) historyEntry.unselect = true;
 
+                const restartGuardDirective = guardAgainstTransactionRestart(aiDecision, quickFillState, actionHistory);
+                if (restartGuardDirective) {
+                    sendLogToPanel('Blocked restart action — continuing current transaction.', 'warn');
+                    historyEntry.actionSuccess = false;
+                    historyEntry.error = 'Restart action blocked';
+                    actionHistory.push(historyEntry);
+                    postPopupDirective = restartGuardDirective;
+                    failedActionCount = 0;
+                    lastActionFailed = false;
+                    lastActionError = '';
+                    continue;
+                }
+
                 // 6. Loop detection — FRONTIER APPROACH: blacklist + force forward
                 const loopResult = checkForLoop(aiDecision, actionRetryCount, lastActionKey);
                 lastActionKey = loopResult.actionKey;
@@ -1651,7 +1718,10 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                 // 7b. Handle FINISH
                 if (aiDecision.action === 'finish') {
                     if (AGENT_CONFIG.taskQueue) taskTransition(taskQueue, currentPlanStepIndex, 'complete');
-                    sendLogToPanel(`Agent finished: ${aiDecision.summary}`, 'decision');
+                    const finishSummary = aiDecision.summary || aiDecision.conversational_message || aiDecision.thought || 'Task finished.';
+                    historyEntry.summary = finishSummary;
+                    historyEntry.actionSuccess = true;
+                    sendLogToPanel(`Agent finished: ${finishSummary}`, 'decision');
                     actionHistory.push(historyEntry);
                     break;
                 }
@@ -2146,7 +2216,11 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
         }
 
         sendLogToPanel('Loop ended.', 'info');
-        chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: actionHistory.length > 0 }).catch(() => { });
+        chrome.runtime.sendMessage({
+            type: 'AGENT_DONE',
+            hasHistory: actionHistory.length > 0,
+            stepCount: actionHistory.length
+        }).catch(() => { });
     }
 }
 
@@ -2160,15 +2234,18 @@ function isClaimsListUrl(url) {
     }
 }
 
-function hasPatientSelectionEvidence(elements) {
+function hasPatientSelectionEvidence(elements, quickFillState = {}) {
     if (!elements || elements.length === 0) return false;
     const textBlob = elements.map(e => [e.text, e.ariaLabel, e.currentValue, e.selectedOptionText].filter(Boolean).join(' ')).join(' ').toLowerCase();
-    return textBlob.includes('save claim') ||
-        textBlob.includes('dev, aica') ||
-        textBlob.includes('aica, dev') ||
-        textBlob.includes('749416') ||
-        textBlob.includes('jan 01, 1900') ||
-        textBlob.includes('jan 1, 1900');
+    if (textBlob.includes('save claim')) return true;
+
+    const patientHints = [
+        quickFillState.patientName,
+        quickFillState.lastSearch
+    ].filter(Boolean).flatMap(value => String(value).toLowerCase().split(/[^a-z0-9]+/i));
+
+    const meaningfulHints = patientHints.filter(token => token.length >= 3);
+    return meaningfulHints.length > 0 && meaningfulHints.some(token => textBlob.includes(token));
 }
 
 function isPatientSearchType(action, observedElements) {
@@ -2220,7 +2297,7 @@ function updateQuickFillState(quickFillState, aiDecision, actionResult, currentT
         return 'QUICK FILL SELECTION REQUIRED: The patient dropdown opened after typing, but no exact patient option was selected. Do NOT click "New Professional Claim" again. Click the visible option that matches the patient name before continuing.';
     }
 
-    if (quickFillState.active && quickFillState.optionClicked && !hasPatientSelectionEvidence(observedElements) && isClaimsListUrl(currentTabUrl)) {
+    if (quickFillState.active && quickFillState.optionClicked && !hasPatientSelectionEvidence(observedElements, quickFillState) && isClaimsListUrl(currentTabUrl)) {
         return 'QUICK FILL DID NOT OPEN FORM: You clicked a patient option, but the page is still the Claims list and no patient/form evidence appeared. Do NOT restart from the Claims list. Re-open the current form if available, then select the exact patient option again.';
     }
 
