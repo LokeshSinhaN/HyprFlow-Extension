@@ -52,11 +52,37 @@ class ExtensionController extends Controller
             }
         }
 
-        $modeIndicator = !empty($imageBase64) && strlen($imageBase64) > 1000
+        $visionModeActive = !empty($imageBase64) && strlen($imageBase64) > 1000;
+
+        // Element Payload Compression: cap size + strip heavy keys for DOM-only mode.
+        $compressedElements = is_array($elements) ? array_slice($elements, 0, 45) : [];
+        if (!$visionModeActive) {
+            $heavyKeys = ['boundingBox', 'xpath', 'outerHTML', 'cssPath'];
+
+            foreach ($compressedElements as $i => $element) {
+                if (!is_array($element)) {
+                    continue;
+                }
+
+                foreach ($heavyKeys as $k) {
+                    unset($compressedElements[$i][$k]);
+                }
+
+                // Ensure text-only model fields remain (do not remove if present).
+                $requiredTextOnlyKeys = ['selector', 'text', 'tagName', 'attributes'];
+                foreach ($compressedElements[$i] as $key => $_v) {
+                    if (!in_array($key, $requiredTextOnlyKeys, true) && !in_array($key, $heavyKeys, true)) {
+                        unset($compressedElements[$i][$key]);
+                    }
+                }
+            }
+        }
+
+        $modeIndicator = $visionModeActive
             ? 'MODE: VISION (screenshot + DOM data)'
             : 'MODE: DOM-ONLY (element selectors, IDs, values)';
 
-        $userPrompt = $modeIndicator . "\nGoal: {$prompt}\n\n# CURRENT STATE\nURL: {$url}\nElements: " . json_encode($elements) . "\n\n# ACTION HISTORY\n{$historyJson}\n";
+        $userPrompt = $modeIndicator . "\nGoal: {$prompt}\n\n# CURRENT STATE\nURL: {$url}\nElements: " . json_encode($compressedElements) . "\n\n# ACTION HISTORY\n{$historyJson}\n";
 
         try {
             $response = null;
