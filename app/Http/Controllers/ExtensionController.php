@@ -92,13 +92,9 @@ class ExtensionController extends Controller
             if (!empty($imageBase64) && strlen($imageBase64) > 1000) {
                 $triedVision = true;
                 try {
-                    $visionPrompt = $systemPrompt ? ($systemPrompt . "\n\n" . $userPrompt) : $userPrompt;
-                    if (!empty(config('openai.api_key'))) {
-                        $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'openai');
-                    }
-                    if (!$response && !empty(config('gemini.api_key'))) {
-                        $response = $this->ai->generateVision($visionPrompt, $imageBase64, 'gemini');
-                    }
+                    $provider = config('automation.primary_ai', 'gemini');
+                    // Pass userPrompt and systemPrompt separately to preserve Gemini context caching
+                    $response = $this->ai->generateVision($userPrompt, $imageBase64, $provider, $systemPrompt);
                 } catch (\Throwable $e) {
                     Log::warning('Vision failed', ['error' => $e->getMessage()]);
                 }
