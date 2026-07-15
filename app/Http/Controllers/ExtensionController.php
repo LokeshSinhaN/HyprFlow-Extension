@@ -55,7 +55,7 @@ class ExtensionController extends Controller
         $visionModeActive = !empty($imageBase64) && strlen($imageBase64) > 1000;
 
         // Element Payload Compression: cap size + strip heavy keys for DOM-only mode.
-        $compressedElements = is_array($elements) ? array_slice($elements, 0, 45) : [];
+        $compressedElements = is_array($elements) ? array_slice($elements, 0, 120) : [];
         if (!$visionModeActive) {
             $heavyKeys = ['boundingBox', 'xpath', 'outerHTML', 'cssPath'];
 

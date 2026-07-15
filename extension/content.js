@@ -2885,10 +2885,15 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                 let priority = 0;
                 if (tag === 'input' || tag === 'textarea') priority = 10;
-                if (isCombobox) priority = 11; // Comboboxes get highest priority (need special handling)
+                if (isCombobox) priority = 11; // Comboboxes get highest priority
                 if (tag === 'select' || roleHint === 'listbox') priority = 5;
                 if (tag === 'button' || roleHint === 'button') priority = 3;
                 if (tag === 'a' || roleHint === 'link') priority = 2;
+                
+                // CRITICAL BOOST: Open dropdown options MUST be seen by the AI
+                if (tag === 'option' || roleHint === 'option' || roleHint === 'menuitem') {
+                    priority = 15; 
+                }
 
                 // BOOST: Submit/Save/Add buttons get highest priority so they're always
                 // included in the elements list — prevents "can't find submit button" problem
