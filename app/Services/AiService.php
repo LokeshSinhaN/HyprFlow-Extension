@@ -313,17 +313,17 @@ class AiService
                 ->withApiKey($apiKey)
                 ->make();
 
-            // FORCE STRICT JSON RESPONSE via generationConfig
-            // This prevents Gemini from wrapping JSON in Markdown code fences
-            // (```json ... ```) which causes downstream JSON parsing crashes
-            // in ReflexionService.php and ExtensionController.php
             $generativeModel = $geminiClient->generativeModel($model)
                 ->withGenerationConfig(new GenerationConfig(
                     responseMimeType: ResponseMimeType::APPLICATION_JSON,
                 ));
 
-            $fullPrompt = $systemPrompt ? $systemPrompt."\n\n".$prompt : $prompt;
-            $result = $generativeModel->generateContent($fullPrompt);
+            if ($systemPrompt) {
+                $generativeModel = $generativeModel->withSystemInstruction($systemPrompt);
+            }
+
+            // CORRECTED: Pass ONLY the user prompt to allow caching to work.
+            $result = $generativeModel->generateContent($prompt);
 
             $text = $result->text();
             Log::debug('Gemini API response received', ['response_length' => strlen($text)]);
@@ -331,18 +331,11 @@ class AiService
             return $text;
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
-            if (str_contains($errorMsg, 'SSL certificate problem') ||
-                str_contains($errorMsg, 'cURL error 60') ||
-                str_contains($errorMsg, 'unable to get local issuer') ||
-                str_contains($errorMsg, 'curl error')) {
+            if (str_contains($errorMsg, 'SSL certificate problem') || str_contains($errorMsg, 'cURL error 60')) {
                 Log::error('SSL Certificate Error', ['error' => $errorMsg]);
                 throw new \RuntimeException('SSL certificate error: '.$errorMsg.'. Set CURL_SSL_VERIFY_DISABLED=true in .env for development.');
             }
-            Log::error('Gemini API call failed', [
-                'model' => $model,
-                'error' => $errorMsg,
-                'exception_class' => get_class($e),
-            ]);
+            Log::error('Gemini API call failed', ['model' => $model, 'error' => $errorMsg, 'exception_class' => get_class($e)]);
             throw $e;
         }
     }
@@ -366,16 +359,15 @@ class AiService
 
             $generativeModel = $geminiClient->generativeModel($model);
 
+            if ($systemPrompt) {
+                $generativeModel = $generativeModel->withSystemInstruction($systemPrompt);
+            }
+
             $b64Data = preg_replace('#^data:image/[^;]+;base64,#', '', $imageBase64);
             $blob = new Blob(MimeType::IMAGE_JPEG, $b64Data);
 
-            if ($systemPrompt) {
-                // Combine system prompt with user prompt for vision
-                $fullPrompt = $systemPrompt."\n\n".$prompt;
-                $result = $generativeModel->generateContent(Content::parse([$fullPrompt, $blob]));
-            } else {
-                $result = $generativeModel->generateContent(Content::parse([$prompt, $blob]));
-            }
+            // CORRECTED: Pass ONLY the user prompt.
+            $result = $generativeModel->generateContent(Content::parse([$prompt, $blob]));
 
             $text = $result->text();
             Log::debug('Gemini Vision API response received', ['response_length' => strlen($text)]);
