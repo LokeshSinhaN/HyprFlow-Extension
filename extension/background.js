@@ -322,7 +322,7 @@ chrome.tabs.onRemoved.addListener((tabId) => { if (_cdpAttached.has(tabId)) cdpD
 
 // Tab auto-detection: track newly created tabs so we can detect popups
 let recentlyCreatedTabs = [];
-const TAB_DETECTION_WINDOW_MS = 5000;
+const TAB_DETECTION_WINDOW_MS = 2000;
 
 // ─── TAB AUTO-DETECTION LISTENERS ──────────────────────────────
 // When a click triggers window.open or target="_blank", Chrome creates a new tab.
@@ -799,7 +799,7 @@ async function detectNewTabAfterClick(tabCountBefore) {
     }
 
     // Extended polling: wait up to 3 more seconds
-    for (let poll = 0; poll < 6; poll++) {
+    for (let poll = 0; poll < 2; poll++) {
         await sleep(500);
         const lateNew = recentlyCreatedTabs.filter(
             t => (Date.now() - t.timestamp) < TAB_DETECTION_WINDOW_MS
@@ -1195,7 +1195,7 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                 const prevAction = actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null;
                 const isFormFilling = prevAction && ['type', 'select_option'].includes(prevAction.action) && prevAction.actionSuccess;
                 sendLogToPanel('Waiting for page stability...', 'info');
-                await waitForStability(currentTabId, isFormFilling ? 500 : 2000);
+                await waitForStability(currentTabId, isFormFilling ? 100 : 1500);
 
                 // 2. HYBRID MODE: DOM-primary with Vision-on-demand
                 // Vision is only triggered when the agent is confused/stuck
@@ -2154,11 +2154,6 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                 }
 
                 actionHistory.push(historyEntry);
-
-                // 10. Wait for UI to settle before next iteration
-                // SPEED: Shorter wait for form-filling actions
-                const justFilledField = aiDecision && ['type', 'select_option'].includes(aiDecision.action) && actionSuccess;
-                await waitForStability(currentTabId, justFilledField ? 500 : 1500);
 
                 // Log step duration for performance tracking
                 const stepDuration = ((Date.now() - stepStartTime) / 1000).toFixed(1);
