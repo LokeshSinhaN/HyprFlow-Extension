@@ -434,9 +434,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
-// ─── MAIN WORLD EVENT SIMULATION ───
+    // ─── MAIN WORLD EVENT SIMULATION ───
     // Content scripts run in an ISOLATED world where dispatched events have
-    // isTrusted:false. React/CMDK/Radix ignores these. This handler uses
     // chrome.scripting.executeScript with world:'MAIN' to run code in the
     // page's own JS context — CSP-proof and framework-compatible.
     if (message.type === 'SIMULATE_KEY_MAIN_WORLD') {
@@ -1121,7 +1120,7 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
     let lastPageUrl = '';             // Track URL changes for vision triggering
     let apiCallCounts = {};           // call_api attempts per endpoint (loop + fallback detection)
     let consecutiveApiFailures = 0;   // consecutive failed API calls → triggers human-input fallback
-// Quick Fill state — single source of truth for THIS agent run.
+    // Quick Fill state — single source of truth for THIS agent run.
     // Declared locally (per-run) so it resets cleanly between runs. It is passed BY
     // REFERENCE into updateQuickFillState() (a module-level helper) which mutates its
     // properties. The helper cannot see this local binding via scope, so it MUST receive
@@ -1385,76 +1384,103 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                     agentMode: isAgentMode
                 };
 
-                // 4. Ask the backend brain (AI) for the next action
-                let aiDecision;
-                try {
-                    sendLogToPanel('Thinking... (waiting for AI response)', 'info');
-                    const controller = new AbortController();
-                    const aiTimeoutMs = AGENT_CONFIG.aiTimeoutMs || 45000; // configurable (was hard-coded 90s)
-                    const apiTimeout = setTimeout(() => controller.abort(), aiTimeoutMs);
-                    const response = await fetch(API_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                        body: JSON.stringify(statePayload),
-                        signal: controller.signal
-                    });
-                    clearTimeout(apiTimeout);
-                    apiTimeoutCount = 0; // Reset timeout counter on successful response
-
-                    if (!response.ok) {
-                        const text = await response.text();
-                        sendLogToPanel(`Brain API error ${response.status}: ${text.slice(0, 200)}`, 'error');
-                        failedActionCount++;
-                        lastActionFailed = true;
-                        lastActionError = `HTTP ${response.status}`;
-                        actionHistory.push({
-                            step: step + 1,
-                            action: 'api_error',
-                            error: `HTTP ${response.status}`,
-                            actionSuccess: false
-                        });
-                        await waitForStability(currentTabId, 1500);
-                        continue;
+                // --- FIX 8: CLIENT-SIDE DECISION CACHE (Fast-path Form Filling) ---
+                let aiDecision = null;
+                const lastAction = actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null;
+                
+                // If the last action was a successful text input, the page didn't navigate, 
+                // and there are no validation errors, we can safely execute the next batch_fill or type 
+                // command from our plan without wasting an LLM round-trip.
+                if (lastAction && lastAction.actionSuccess && 
+                    ['type', 'batch_fill', 'select_option'].includes(lastAction.action) && 
+                    staleStateCount === 0 && 
+                    (!observeResult.validationErrors || observeResult.validationErrors.length === 0) &&
+                    AGENT_CONFIG.taskQueue && taskQueue[currentPlanStepIndex]) {
+                    
+                    const nextTask = taskQueue[currentPlanStepIndex];
+                    if (nextTask && nextTask.description.toLowerCase().includes('fill')) {
+                        sendLogToPanel('⚡ Fast-path active: Skipping LLM, continuing form fill locally', 'success');
+                        aiDecision = {
+                            thought: "Fast-path execution: Continuing form fill locally.",
+                            action: "batch_fill",
+                            fields: [], // The content script will dynamically find empty fields
+                            conversational_message: "Continuing to fill form fields...",
+                            planStepCompleted: true
+                        };
                     }
+                }
 
-                    const responseData = await response.json();
+                // 4. Ask the backend brain (AI) for the next action IF fast-path didn't trigger
+                if (!aiDecision) {
+                    try {
+                        sendLogToPanel('Thinking... (waiting for AI response)', 'info');
+                        const controller = new AbortController();
+                        const aiTimeoutMs = AGENT_CONFIG.aiTimeoutMs || 45000; // configurable (was hard-coded 90s)
+                        const apiTimeout = setTimeout(() => controller.abort(), aiTimeoutMs);
+                        const response = await fetch(API_URL, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify(statePayload),
+                            signal: controller.signal
+                        });
+                        clearTimeout(apiTimeout);
+                        apiTimeoutCount = 0; // Reset timeout counter on successful response
 
-                    // Check if we got an error response (e.g., empty selector)
-                    if (responseData.error) {
-                        sendLogToPanel(`AI Error: ${responseData.error}`, 'error');
-                        if (responseData.retry) {
-                            // Force a retry by not counting this as a proper step
-                            postPopupDirective = 'CRITICAL: You MUST provide a valid CSS selector. The previous response had an empty selector which is invalid. Look at the elements list and pick the correct selector.';
+                        if (!response.ok) {
+                            const text = await response.text();
+                            sendLogToPanel(`Brain API error ${response.status}: ${text.slice(0, 200)}`, 'error');
                             failedActionCount++;
-                            // Re-observe and try again
+                            lastActionFailed = true;
+                            lastActionError = `HTTP ${response.status}`;
+                            actionHistory.push({
+                                step: step + 1,
+                                action: 'api_error',
+                                error: `HTTP ${response.status}`,
+                                actionSuccess: false
+                            });
                             await waitForStability(currentTabId, 1500);
                             continue;
                         }
-                    }
 
-                    aiDecision = responseData;
-                } catch (error) {
-                    if (error.name === 'AbortError') {
-                        apiTimeoutCount++;
-                        sendLogToPanel(`AI API timed out after ${Math.round((AGENT_CONFIG.aiTimeoutMs || 45000) / 1000)}s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
-                        // API timeouts are infrastructure issues — use separate counter
-                        // Only count toward main failure counter if we've exhausted timeout retries
-                        if (apiTimeoutCount >= maxApiTimeouts) {
-                            failedActionCount = maxFailedActions; // Force stop
-                            sendLogToPanel(`AI API timed out ${maxApiTimeouts} times. Stopping agent.`, 'error');
-                        }
-                        actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
+                        const responseData = await response.json();
 
-                        // SMART RETRY: After first timeout, strip the image from the payload
-                        // to reduce processing time. The AI can still work with DOM elements alone.
-                        if (observeResult && observeResult.image && apiTimeoutCount >= 1) {
-                            observeResult.image = null;
-                            sendLogToPanel('Stripped image from payload for faster retry (DOM-only mode)', 'info');
+                        // Check if we got an error response (e.g., empty selector)
+                        if (responseData.error) {
+                            sendLogToPanel(`AI Error: ${responseData.error}`, 'error');
+                            if (responseData.retry) {
+                                // Force a retry by not counting this as a proper step
+                                postPopupDirective = 'CRITICAL: You MUST provide a valid CSS selector. The previous response had an empty selector which is invalid. Look at the elements list and pick the correct selector.';
+                                failedActionCount++;
+                                // Re-observe and try again
+                                await waitForStability(currentTabId, 1500);
+                                continue;
+                            }
                         }
-                        continue;
+
+                        aiDecision = responseData;
+                    } catch (error) {
+                        if (error.name === 'AbortError') {
+                            apiTimeoutCount++;
+                            sendLogToPanel(`AI API timed out after ${Math.round((AGENT_CONFIG.aiTimeoutMs || 45000) / 1000)}s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
+                            // API timeouts are infrastructure issues — use separate counter
+                            // Only count toward main failure counter if we've exhausted timeout retries
+                            if (apiTimeoutCount >= maxApiTimeouts) {
+                                failedActionCount = maxFailedActions; // Force stop
+                                sendLogToPanel(`AI API timed out ${maxApiTimeouts} times. Stopping agent.`, 'error');
+                            }
+                            actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
+
+                            // SMART RETRY: After first timeout, strip the image from the payload
+                            // to reduce processing time. The AI can still work with DOM elements alone.
+                            if (observeResult && observeResult.image && apiTimeoutCount >= 1) {
+                                observeResult.image = null;
+                                sendLogToPanel('Stripped image from payload for faster retry (DOM-only mode)', 'info');
+                            }
+                            continue;
+                        }
+                        sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
+                        break;
                     }
-                    sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
-                    break;
                 }
 
                 // Consume post-popup directive (one-shot)
