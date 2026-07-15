@@ -134,27 +134,9 @@ class AiService
      */
     private function getProviderChain(?string $provider = null): array
     {
-        $fallbackEnabled = (bool) config('automation.provider_fallback_enabled', true);
+        // FIXED: Strictly return only the primary provider. Disable all fallback failovers.
         $primary = $provider ?: config('automation.primary_ai', $this->primary);
-
-        // Fallback disabled → behave like before: only the requested/primary provider.
-        if (! $fallbackEnabled) {
-            return [$primary];
-        }
-
-        // Ordered, de-duplicated preference list: requested/primary → secondary → tertiary.
-        $ordered = array_values(array_unique(array_filter([
-            $primary,
-            config('automation.secondary_ai', $this->secondary),
-            config('automation.tertiary_ai', $this->tertiary),
-        ])));
-
-        // Keep only providers that actually have an API key configured.
-        $withKeys = array_values(array_filter($ordered, fn ($p) => $this->providerHasKey($p)));
-
-        // If nothing is configured, still return the primary so a meaningful
-        // "API key not configured" error surfaces to the caller.
-        return ! empty($withKeys) ? $withKeys : [$primary];
+        return [$primary];
     }
 
     /**
@@ -319,23 +301,18 @@ class AiService
                 ));
 
             if ($systemPrompt) {
-                $generativeModel = $generativeModel->withSystemInstruction($systemPrompt);
+                // FIXED: Must wrap string in Content::parse()
+                $generativeModel = $generativeModel->withSystemInstruction(\Gemini\Data\Content::parse($systemPrompt));
             }
 
-            // CORRECTED: Pass ONLY the user prompt to allow caching to work.
             $result = $generativeModel->generateContent($prompt);
-
             $text = $result->text();
             Log::debug('Gemini API response received', ['response_length' => strlen($text)]);
 
             return $text;
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
-            if (str_contains($errorMsg, 'SSL certificate problem') || str_contains($errorMsg, 'cURL error 60')) {
-                Log::error('SSL Certificate Error', ['error' => $errorMsg]);
-                throw new \RuntimeException('SSL certificate error: '.$errorMsg.'. Set CURL_SSL_VERIFY_DISABLED=true in .env for development.');
-            }
-            Log::error('Gemini API call failed', ['model' => $model, 'error' => $errorMsg, 'exception_class' => get_class($e)]);
+            Log::error('Gemini API call failed', ['model' => $model, 'error' => $errorMsg]);
             throw $e;
         }
     }
@@ -360,15 +337,14 @@ class AiService
             $generativeModel = $geminiClient->generativeModel($model);
 
             if ($systemPrompt) {
-                $generativeModel = $generativeModel->withSystemInstruction($systemPrompt);
+                // FIXED: Must wrap string in Content::parse()
+                $generativeModel = $generativeModel->withSystemInstruction(\Gemini\Data\Content::parse($systemPrompt));
             }
 
             $b64Data = preg_replace('#^data:image/[^;]+;base64,#', '', $imageBase64);
             $blob = new Blob(MimeType::IMAGE_JPEG, $b64Data);
 
-            // CORRECTED: Pass ONLY the user prompt.
             $result = $generativeModel->generateContent(Content::parse([$prompt, $blob]));
-
             $text = $result->text();
             Log::debug('Gemini Vision API response received', ['response_length' => strlen($text)]);
 

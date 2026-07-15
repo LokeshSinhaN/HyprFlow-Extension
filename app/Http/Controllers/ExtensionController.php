@@ -226,26 +226,35 @@ class ExtensionController extends Controller
 
     public function plan(Request $request): JsonResponse
     {
-        $prompt = (string) $request->input('prompt', '');
-        $isRejected = (bool) $request->input('rejected', false);
+        $prompt = (string)$request->input('prompt', '');
+        $isRejected = (bool)$request->input('rejected', false);
 
         if (!$prompt) {
             return response()->json(['error' => 'Prompt is required'], 400);
         }
 
-        $rejectionNote = $isRejected
+        $rejectionNote =$isRejected
             ? "\nCRITICAL: User REJECTED previous plan. Generate a COMPLETELY DIFFERENT approach."
             : '';
 
-        $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\nRespond with ONE JSON object: {\"plan\":[\"Step 1: ...\"]}\n";
+        // Fetch the strict system protocols to serve as cached System Instructions
+        $systemRules = $this->buildSystemPrompt();$apiCatalog = $this->getApiCatalog();$systemRules = str_replace('{{API_CATALOG_PLACEHOLDER}}', $apiCatalog,$systemRules);
+
+        // Keep the user prompt extremely lightweight
+        $aiPrompt = "You are a workflow planner for a browser automation agent processing medical claims.\n"
+            . "CRITICAL: You MUST base your plan EXACTLY on the system instructions provided to you. Do not make up generic steps.\n\n"
+            . "User Goal: {$prompt}{$rejectionNote}\n"
+            . "Respond with EXACTLY ONE JSON object: {\"plan\":[\"Step 1: ...\", \"Step 2: ...\"]}\n";
 
         try {
-            $response = $this->ai->generate($aiPrompt, config('automation.primary_ai', 'gemini'));
+            // PASS SYSTEM RULES AS THE 3RD PARAMETER TO UTILIZE CONTEXT CACHING
+            $response =$this->ai->generate($aiPrompt, config('automation.primary_ai', 'gemini'),$systemRules);
+            
             if (!$response) {
                 return response()->json(['error' => $this->ai->getLastError() ?: 'Planning failed'], 500);
             }
 
-            $cleanJson = preg_replace('/```(?:json)?\s*(.*?)\s*```/s', '$1', $response);
+            $cleanJson = preg_replace('/```(?:json)?\s*(.*?)\s*```/s', '$1',$response);
             $planData = json_decode(trim($cleanJson), true);
 
             if (!$planData || !isset($planData['plan'])) {
@@ -257,6 +266,7 @@ class ExtensionController extends Controller
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
+
 
     public function learn(Request $request): JsonResponse
     {
