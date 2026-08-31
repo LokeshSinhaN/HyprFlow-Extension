@@ -339,6 +339,7 @@ When you detect a terminal success state (a success toast, a draft warning messa
 {{API_CATALOG_PLACEHOLDER}}
 
 # ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # MANDATORY NEW PROFESSIONAL CLAIM PROTOCOL (CREATE NEW CLAIM)
 # ═══════════════════════════════════════════════════════════════════════
 When the user goal asks to create, open, start, or submit a "New Professional Claim", execute this workflow without deviation:
@@ -346,7 +347,7 @@ When the user goal asks to create, open, start, or submit a "New Professional Cl
 2. QUICK FILL PATIENT SEARCH: Locate the "Quick Fill from patient record" section at the top of the claim form.
    - Extract the patient name from the user prompt.
    - Search using ONLY the patient FIRST NAME in the Quick Fill search field. Example: for "Dev Aica", type exactly "Dev".
-   - Wait for the patient result dropdown. Select the matching patient result.
+   - Execute your commands by setting the `field` property to `patient_search` when typing the name, and use a standard `click` with `text_match` on the visible row when the dropdown appears. Do NOT emit `keyboard_event` actions manually for dropdown traversal; let the local browser verifier handle selection lifecycle.
 3. VERIFY AUTO-POPULATION: After selection, confirm whether patient details populated the form.
 4. BACK-OFFICE API COMPLETION: If patient details are missing or required columns remain empty, do not guess. Use `call_api` with the catalog endpoints.
 5. FIRST SAVE: Click "Save Claim" and wait for validation errors or redirect to /claims.

@@ -306,7 +306,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         const nearby = getNearbySectionText(el);
         const combined = normalizeText([label, nearby, el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('aria-label')].filter(Boolean).join(' '));
         const aliasMap = {
-            patient_search: ['search patient', 'patient search', 'quick fill patient'],
+            patient_search: ['search patient', 'patient search', 'quick fill patient', 'quick fill', 'record', 'search patient'],
             insured_id: ['insured', 'subscriber', 'member id', 'memberid', 'insurance id'],
             state: ['state', 'province'],
             procedure: ['procedure', 'cpt', 'hcpcs', 'cpt/hcps'],
@@ -1367,7 +1367,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                             // ── Combobox post-type verification gate (dynamic) ──
                             if (isCombobox && !dropdownResult.found) {
-                                await new Promise(r => setTimeout(r, 150));
+                                await new Promise(r => setTimeout(r, 800));
 
                                 const typed = normalizeText(action.text || '');
                                 const valNow = normalizeText(el.value || '');
