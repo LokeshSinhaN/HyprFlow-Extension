@@ -1,0 +1,1 @@
+{"root":["./src/background/index.ts","./src/content/builddomtree.ts","./src/content/index.ts","./src/sidepanel/sidepanel.tsx","./src/sidepanel/main.tsx","./vite.config.ts"],"version":"5.9.3"}

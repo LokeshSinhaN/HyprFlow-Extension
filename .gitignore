@@ -19,5 +19,7 @@ yarn-error.log
 /.vscode
 composer.lock
 
-# Extension build artifacts (if any)
+# Extension build artifacts
 extension/*.zip
+extension/node_modules/
+extension/dist/
