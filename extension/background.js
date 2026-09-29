@@ -307,7 +307,10 @@ async function cdpClickAtPoint(tabId, x, y) {
         return { success: true };
     } catch (e) { return { success: false, error: e.message }; }
 }
-// Coordinate click fallback from an element's bounding box (viewport-relative).
+// Coordinate click fallback from an element's bounding box.
+// COORDINATE CONTRACT: bbox MUST be VIEWPORT-relative (client coords) —
+// Input.dispatchMouseEvent operates in viewport space. content.js now stores
+// el.boundingBox in viewport coords (el.boundingBoxPage holds page-absolute).
 async function cdpClickElementFallback(tabId, bbox) {
     if (!bbox || typeof bbox.x !== 'number') return { success: false, error: 'No bbox' };
     return cdpClickAtPoint(tabId, Math.round(bbox.x + bbox.width / 2), Math.round(bbox.y + bbox.height / 2));
@@ -958,6 +961,15 @@ async function captureSoMScreenshot(tabId) {
             return null;
         }
 
+        // Scale metadata: captureVisibleTab returns DEVICE pixels, i.e.
+        // image_px = css_px × devicePixelRatio. Propagating this with the payload
+        // lets the backend normalize any raw pixel coordinates the VLM returns.
+        const scaleMeta = {
+            devicePixelRatio: result.devicePixelRatio || 1,
+            scaleFactor: result.scaleFactor || 1,
+            viewport: { width: result.viewportWidth || null, height: result.viewportHeight || null }
+        };
+
         // Get the tab's windowId FIRST (must be done outside the Promise constructor)
         let windowId = null;
         try {
@@ -983,7 +995,8 @@ async function captureSoMScreenshot(tabId) {
                 elements: result.elements,
                 elementCount: result.elementCount,
                 pageUrl: result.pageUrl,
-                pageTitle: result.pageTitle
+                pageTitle: result.pageTitle,
+                ...scaleMeta
             };
         }
 
@@ -1063,7 +1076,8 @@ async function captureSoMScreenshot(tabId) {
                 elements: result.elements,
                 elementCount: result.elementCount,
                 pageUrl: result.pageUrl,
-                pageTitle: result.pageTitle
+                pageTitle: result.pageTitle,
+                ...scaleMeta
             };
         } else {
             sendLogToPanel('Screenshot capture returned null after retry, using text-only mode', 'warn');
@@ -1075,7 +1089,8 @@ async function captureSoMScreenshot(tabId) {
                 elements: result.elements,
                 elementCount: result.elementCount,
                 pageUrl: result.pageUrl,
-                pageTitle: result.pageTitle
+                pageTitle: result.pageTitle,
+                ...scaleMeta
             };
         }
     } catch (e) {
@@ -1226,7 +1241,12 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                             title: somData.pageTitle || '',
                             elements: somData.elements,
                             image: somData.image,
-                            somMap: somData.somMap
+                            somMap: somData.somMap,
+                            // Carry scale metadata through to the AI payload so the
+                            // backend can normalize any raw pixel coordinates.
+                            scaleFactor: somData.scaleFactor || null,
+                            devicePixelRatio: somData.devicePixelRatio || null,
+                            viewport: somData.viewport || null
                         };
                         lastSomMap = somData.somMap || {};
                         lastObservedElements = somData.elements;
@@ -1365,6 +1385,11 @@ async function agentLoop(prompt, tabId, planSteps = [], resumeState = null) {
                     // Vision data
                     image: observeResult.image || null,
                     somMap: observeResult.somMap || {},
+                    // SCALE METADATA: lets the backend normalize VLM pixel coordinates.
+                    // image_px = css_px × devicePixelRatio (pre-downscale).
+                    scaleFactor: observeResult.scaleFactor || null,
+                    devicePixelRatio: observeResult.devicePixelRatio || null,
+                    viewport: observeResult.viewport || null,
                     // Dropdown states
                     dropdownStates: dropdownStates,
                     // Dynamic SOP progress

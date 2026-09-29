@@ -28,7 +28,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
     /**
      * Builds a lightweight Accessibility Tree of all interactive elements on the page.
      * Each element gets a stable ref_id (e.g., ref_1, ref_2) mapped to its semantic role,
-     * accessible name, and absolute X/Y center coordinates.
+     * accessible name, and viewport-relative X/Y center coordinates.
      *
      * Handles dynamic React/Radix UI elements that may unmount between calls by
      * re-scanning the DOM each invocation and only reusing refs for elements still in DOM.
@@ -76,9 +76,14 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     _refToElement.set(refId, el);
                 }
 
-                // Compute absolute center coordinates (viewport + scroll offset)
-                const x = Math.round(rect.left + rect.width / 2 + window.scrollX);
-                const y = Math.round(rect.top + rect.height / 2 + window.scrollY);
+                // COORDINATE CONTRACT (single source of truth):
+                // ALL coordinates in the HyprFlow pipeline are VIEWPORT-relative
+                // (client) coordinates — the space shared by Input.dispatchMouseEvent,
+                // document.elementFromPoint, getBoundingClientRect and SoM overlays.
+                // NEVER add scrollX/scrollY here; page-absolute coords caused silent
+                // mis-clicks (every click landed scrollY px too low under CDP).
+                const x = Math.round(rect.left + rect.width / 2);
+                const y = Math.round(rect.top + rect.height / 2);
 
                 // Determine semantic role
                 const tag = el.tagName.toLowerCase();
@@ -922,6 +927,9 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         // ─── CLEANUP SoM OVERLAY ────────────────────────────────
         if (message.type === 'CLEANUP_SOM') {
             try {
+                const overlayHost = document.getElementById('hyprflow-som-overlay-host');
+                if (overlayHost) overlayHost.remove();
+                // Legacy overlay (pre-ShadowRoot) cleanup
                 const overlay = document.getElementById('hyprflow-som-overlay');
                 if (overlay) overlay.remove();
             } catch (e) { /* ignore */ }
@@ -1676,9 +1684,19 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     }
                     // ── CLICK COORDINATE (Enhanced: fallback visual click with Universal Event Dispatcher) ──
                     else if (action.action === 'click_coordinate') {
-                        // Click by SoM bounding box center coordinates, direct x/y, or element center
+                        // Click by SoM mark-time coordinates, SoM bounding box center,
+                        // direct x/y, or element center.
                         let clickX, clickY, clickedEl;
-                        if (action.somIndex && action.boundingBox) {
+                        const somCoords = window.__hyprflow_somCoords || {};
+                        const somEntry = action.somIndex ? somCoords[String(action.somIndex)] : null;
+                        if (somEntry && typeof somEntry.x === 'number') {
+                            // FUNCTIONAL SoM PATH: use the coordinates captured when the
+                            // label was drawn. No DOM re-query — immune to re-render churn.
+                            clickX = somEntry.x;
+                            clickY = somEntry.y;
+                        } else if (action.somIndex && action.boundingBox) {
+                            // Legacy path: boundingBox is VIEWPORT-relative (see the
+                            // coordinate contract in captureScreenshotWithSoM).
                             const bb = action.boundingBox;
                             clickX = bb.x + bb.width / 2;
                             clickY = bb.y + bb.height / 2;
@@ -1696,6 +1714,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                         // Scroll element into view if coordinates are off-screen
                         if (clickY < 0 || clickY > window.innerHeight || clickX < 0 || clickX > window.innerWidth) {
+                            const scrollBefore = window.scrollY;
                             window.scrollBy({ top: clickY - window.innerHeight / 2, behavior: 'smooth' });
                             await new Promise(r => setTimeout(r, 400));
                             // Recalculate if we had a bounding box (it's relative to viewport)
@@ -1703,6 +1722,12 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                                 const newRect = el.getBoundingClientRect();
                                 clickX = newRect.x + newRect.width / 2;
                                 clickY = newRect.y + newRect.height / 2;
+                            } else if (somEntry && somEntry.bbox) {
+                                // No DOM element to re-measure — adjust the mark-time
+                                // viewport coords by the scroll delta we just applied.
+                                const scrolled = window.scrollY - scrollBefore;
+                                clickX = somEntry.bbox.x + somEntry.bbox.width / 2;
+                                clickY = somEntry.bbox.y + somEntry.bbox.height / 2 - scrolled;
                             }
                         }
 
@@ -2690,23 +2715,25 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             const elements = extractClickableElements();
             const topElements = elements.slice(0, config.maxElements || 60);
 
-            // ── Create SoM overlay container (draw BEFORE returning to background) ──
-            // Pointer-events none so the overlay does not affect clicks/scroll.
-            const overlay = document.createElement('div');
-            overlay.id = 'hyprflow-som-overlay';
-            overlay.style.position = 'absolute';
-            overlay.style.top = '0';
-            overlay.style.left = '0';
-            overlay.style.width = '100%';
-            overlay.style.height = '100%';
-            overlay.style.zIndex = '2147483647';
-            overlay.style.pointerEvents = 'none';
-            overlay.style.margin = '0';
-            overlay.style.padding = '0';
-            overlay.style.background = 'transparent';
+            // ── Create SoM overlay inside a CLOSED ShadowRoot ──
+            // A closed shadow root isolates the marks from page CSS (resets, z-index
+            // wars, transforms) and prevents page JS from mutating or removing them.
+            // The host is position:fixed at 0,0 so children positioned with viewport
+            // (client) coordinates land exactly on their targets.
+            const overlayHost = document.createElement('div');
+            overlayHost.id = 'hyprflow-som-overlay-host';
+            overlayHost.style.cssText =
+                'position:fixed;top:0;left:0;width:100%;height:100%;' +
+                'z-index:2147483647;pointer-events:none;margin:0;padding:0;';
+            const overlay = overlayHost.attachShadow({ mode: 'closed' });
+            const overlayRoot = document.createElement('div');
+            overlayRoot.style.cssText =
+                'position:absolute;top:0;left:0;width:100%;height:100%;' +
+                'margin:0;padding:0;background:transparent;pointer-events:none;';
+            overlay.appendChild(overlayRoot);
 
             // Ensure overlay is on top immediately (helps when screenshot capture is fast)
-            document.body.appendChild(overlay);
+            document.body.appendChild(overlayHost);
 
             const somMap = {};
             let index = 1;
@@ -2729,16 +2756,61 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 const rect = domEl.getBoundingClientRect();
                 if (rect.width < 5 || rect.height < 5) continue;
 
-                // Store bounding box in absolute (page) coords for background actions
+                // COORDINATE CONTRACT: boundingBox is VIEWPORT-relative (client coords).
+                // CDP Input.dispatchMouseEvent and elementFromPoint both expect viewport
+                // coordinates. Page-absolute coords are kept separately for legacy
+                // consumers (Selenium code-gen export).
                 el.boundingBox = {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height
+                };
+                el.boundingBoxPage = {
                     x: rect.x + window.scrollX,
                     y: rect.y + window.scrollY,
                     width: rect.width,
                     height: rect.height
                 };
 
-                // Store mapping for SoM
-                somMap[index.toString()] = el.selector;
+                // ── OCCLUSION GATE ──
+                // Verify the element is actually hittable before marking it. Sticky
+                // headers, modal backdrops and tooltips cover element centers; marking
+                // them blind guarantees the click lands on the wrong element. Walk a
+                // 3x3 grid over the bbox looking for an unobstructed hit point.
+                const findHittablePoint = (r, target) => {
+                    const fractions = [
+                        [0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75],
+                        [0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]
+                    ];
+                    for (const [fx, fy] of fractions) {
+                        const px = Math.round(r.x + r.width * fx);
+                        const py = Math.round(r.y + r.height * fy);
+                        let hit = null;
+                        try { hit = document.elementFromPoint(px, py); } catch (e) { /* ignore */ }
+                        if (hit && (hit === target || target.contains(hit) || hit.contains(target))) {
+                            return { x: px, y: py };
+                        }
+                    }
+                    return null;
+                };
+                const hitPoint = findHittablePoint(rect, domEl);
+                if (!hitPoint) continue; // fully occluded — drop the mark rather than mis-click
+
+                // ── FUNCTIONAL SoM: label → coordinates + metadata (NOT selectors) ──
+                // The executor clicks these captured coordinates directly; the DOM is
+                // never re-queried at execution time, so React re-renders and framework
+                // class churn cannot invalidate the target between mark and click.
+                somMap[index.toString()] = {
+                    x: hitPoint.x,
+                    y: hitPoint.y,
+                    bbox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                    role: el.roleHint || el.tagName || 'generic',
+                    name: ((el.ariaLabel || el.text || '') + '').slice(0, 80),
+                    tag: el.tagName || '',
+                    // Kept ONLY for Selenium code-gen export — never used for execution.
+                    selector: el.selector
+                };
                 el.somIndex = index;
 
                 // Draw overlay box in *viewport* coordinates (overlay is viewport-anchored)
@@ -2776,10 +2848,14 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 label.style.pointerEvents = 'none';
 
                 box.appendChild(label);
-                overlay.appendChild(box);
+                overlayRoot.appendChild(box);
 
                 index++;
             }
+
+            // Persist the functional SoM map so click_coordinate can resolve a label
+            // to its mark-time coordinates without touching the DOM again.
+            window.__hyprflow_somCoords = somMap;
 
             // Return success with elements - background will capture screenshot
             sendLogToContent('SoM prepared: ' + Object.keys(somMap).length + ' elements labeled');
@@ -2791,6 +2867,13 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 somMap: somMap,
                 viewportWidth: viewportWidth,
                 viewportHeight: viewportHeight,
+                // SCALE METADATA: captureVisibleTab returns DEVICE pixels, i.e.
+                // image_px = css_px × devicePixelRatio. Transmitting the factor lets
+                // the backend normalize any raw pixel coordinates the VLM returns.
+                devicePixelRatio: window.devicePixelRatio || 1,
+                scaleFactor: (config.maxWidth && viewportWidth)
+                    ? Math.min(1, config.maxWidth / (viewportWidth * (window.devicePixelRatio || 1)))
+                    : 1,
                 pageUrl: pageUrl,
                 pageTitle: pageTitle,
                 needsImageCapture: true
