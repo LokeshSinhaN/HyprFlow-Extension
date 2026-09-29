@@ -18,7 +18,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // Send message to background script to start the loop
       chrome.runtime.sendMessage({ 
           type: 'START_AGENT', 
-          payload: { prompt: prompt } 
+          payload: { prompt: prompt, source: 'popup' } 
       }, (response) => {
           if (chrome.runtime.lastError) {
               statusDiv.innerText = "Error: " + chrome.runtime.lastError.message;

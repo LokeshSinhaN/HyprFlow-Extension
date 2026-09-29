@@ -2,11 +2,105 @@
 // ENHANCED: Plan-Aware Execution, Post-Action Verification, Multi-Action Chaining,
 // Scroll Verification, Site Knowledge Learning, Coordinate Click support.
 
-const API_URL = "http://127.0.0.1:8001/api/extension/loop";
-const GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
-const PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
-const LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
-const CALL_API_URL = "http://127.0.0.1:8001/api/extension/call-api";
+// ─── BACKEND CONNECTIVITY & AUTO-PORT RESOLUTION ───────────────
+// Automatically detect whether Laravel is running on 8001 (custom/serve script) or 8000 (default artisan serve)
+const CANDIDATE_BACKEND_URLS = [
+    "http://127.0.0.1:8001",
+    "http://127.0.0.1:8000",
+    "http://localhost:8001",
+    "http://localhost:8000"
+];
+let activeBackendBase = null;
+
+// Endpoint getters/constants for backward compatibility
+let API_URL = "http://127.0.0.1:8001/api/extension/loop";
+let GENERATE_URL = "http://127.0.0.1:8001/api/extension/generate-selenium";
+let PLAN_URL = "http://127.0.0.1:8001/api/extension/plan";
+let LEARN_URL = "http://127.0.0.1:8001/api/extension/learn";
+let CALL_API_URL = "http://127.0.0.1:8001/api/extension/call-api";
+
+function updateEndpointConstants(base) {
+    activeBackendBase = base;
+    API_URL = `${base}/api/extension/loop`;
+    GENERATE_URL = `${base}/api/extension/generate-selenium`;
+    PLAN_URL = `${base}/api/extension/plan`;
+    LEARN_URL = `${base}/api/extension/learn`;
+    CALL_API_URL = `${base}/api/extension/call-api`;
+}
+
+/**
+ * Probes candidate URLs to auto-detect which port is active
+ */
+async function resolveBackendBaseUrl(forceRefresh = false) {
+    if (activeBackendBase && !forceRefresh) {
+        return activeBackendBase;
+    }
+
+    try {
+        const stored = await chrome.storage.local.get(['backendBaseUrl']);
+        const candidates = [];
+        if (stored.backendBaseUrl) {
+            candidates.push(stored.backendBaseUrl.replace(/\/+$/, ''));
+        }
+        candidates.push(...CANDIDATE_BACKEND_URLS);
+        const uniqueCandidates = [...new Set(candidates)];
+
+        for (const base of uniqueCandidates) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 1200);
+                const res = await fetch(`${base}/api/extension/health`, { signal: controller.signal });
+                clearTimeout(timeoutId);
+                if (res.ok) {
+                    const data = await res.json().catch(() => null);
+                    if (data && (data.status === 'ok' || data.service === 'hyprflow-ce')) {
+                        updateEndpointConstants(base);
+                        console.log(`[HyprFlow] Backend connected at: ${base}`);
+                        return base;
+                    }
+                }
+            } catch (e) {
+                // port not open or not responding, continue probing
+            }
+        }
+
+        if (stored.backendBaseUrl) {
+            const base = stored.backendBaseUrl.replace(/\/+$/, '');
+            updateEndpointConstants(base);
+            return base;
+        }
+
+        return null;
+    } catch (e) {
+        console.error('[HyprFlow] Error resolving backend URL:', e);
+        return null;
+    }
+}
+
+/**
+ * Robust fetch wrapper that handles dynamic backend URL and connection failover
+ */
+async function fetchBackend(endpoint, options = {}) {
+    let base = await resolveBackendBaseUrl();
+    if (!base) {
+        base = await resolveBackendBaseUrl(true);
+    }
+    if (!base) {
+        throw new Error('Backend not reachable on port 8001 or 8000. Please start the server using "php artisan serve --port=8001" or "php artisan serve".');
+    }
+
+    try {
+        return await fetch(`${base}${endpoint}`, options);
+    } catch (err) {
+        console.warn(`[HyprFlow] Fetch failed to ${base}${endpoint}, re-checking backend ports...`, err.message);
+        const newBase = await resolveBackendBaseUrl(true);
+        if (newBase && newBase !== base) {
+            console.log(`[HyprFlow] Re-routed backend request to: ${newBase}`);
+            return await fetch(`${newBase}${endpoint}`, options);
+        }
+        throw err;
+    }
+}
 
 // Enable side panel on icon click
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -56,23 +150,58 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 // ─── MESSAGE HANDLER ───────────────────────────────────────────
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'CHECK_BACKEND_STATUS') {
+        resolveBackendBaseUrl(true).then((base) => {
+            sendResponse({ connected: !!base, url: base });
+        });
+        return true;
+    }
+
     if (message.type === 'START_AGENT') {
         if (isRunning) {
             sendResponse({ status: 'already_running' });
             return true;
         }
         isRunning = true;
-        const prompt = message.payload.prompt;
-        isAgentMode = message.payload.agentMode;
+        const prompt = message.payload?.prompt;
+        isAgentMode = message.payload?.agentMode;
+        const source = message.payload?.source || 'panel';
 
         chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-            if (tabs.length === 0) return;
-            currentTabId = tabs[0].id;
-            await injectContentScript(currentTabId);
-            sendResponse({ status: 'started' });
+            try {
+                if (!tabs || tabs.length === 0) {
+                    sendLogToPanel('No active browser tab found to automate.', 'error');
+                    isRunning = false;
+                    chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: false }).catch(() => { });
+                    return;
+                }
+                currentTabId = tabs[0].id;
+                await injectContentScript(currentTabId);
+                sendResponse({ status: 'started' });
 
-            await generatePlan(prompt, false);
-            // Wait for APPROVE_PLAN message from panel before starting loop
+                // Check backend connectivity first
+                const backendBase = await resolveBackendBaseUrl(true);
+                if (!backendBase) {
+                    sendLogToPanel('❌ Cannot connect to HyprFlow backend server at port 8001 or 8000.', 'error');
+                    sendLogToPanel('💡 Please start the backend in terminal: php artisan serve --port=8001 (or php artisan serve)', 'warn');
+                    isRunning = false;
+                    chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: false }).catch(() => { });
+                    return;
+                }
+
+                sendLogToPanel(`Connected to backend: ${backendBase}`, 'info');
+
+                if (source === 'popup') {
+                    // Popup UI does not have plan approval buttons, run agent directly
+                    agentLoop(prompt, currentTabId, []);
+                } else {
+                    await generatePlan(prompt, false);
+                }
+            } catch (err) {
+                sendLogToPanel(`Agent startup error: ${err.message}`, 'error');
+                isRunning = false;
+                chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: false }).catch(() => { });
+            }
         });
 
         return true;
@@ -226,24 +355,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function generatePlan(prompt, rejected = false) {
     sendLogToPanel(rejected ? 'Drafting Alternative Workflow Plan...' : 'Drafting Workflow Plan...', 'info');
     try {
-        const res = await fetch(PLAN_URL, {
+        const res = await fetchBackend('/api/extension/plan', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify({ prompt, rejected })
         });
         if (!res.ok) {
-            sendLogToPanel(`Plan generation failed: ${res.status}`, 'warn');
+            sendLogToPanel(`Plan generation returned HTTP ${res.status}. Proceeding with direct execution...`, 'warn');
+            currentPlanSteps = [];
+            agentLoop(prompt, currentTabId, []);
             return;
         }
         const result = await res.json();
-        if (result.plan && Array.isArray(result.plan)) {
+        if (result.plan && Array.isArray(result.plan) && result.plan.length > 0) {
             currentPlanSteps = result.plan; // Enhancement 1: Store for plan-aware execution
             sendLogToPanel('Plan of Action:', 'info');
             result.plan.forEach(step => sendLogToPanel(step, 'step'));
             chrome.runtime.sendMessage({ type: 'PLAN_GENERATED', payload: { plan: result.plan } }).catch(() => { });
+        } else {
+            sendLogToPanel('No specific plan generated. Proceeding with autonomous execution...', 'info');
+            currentPlanSteps = [];
+            agentLoop(prompt, currentTabId, []);
         }
     } catch (e) {
         sendLogToPanel(`Plan generation error: ${e.message}`, 'warn');
+        sendLogToPanel('Proceeding with autonomous execution...', 'info');
+        currentPlanSteps = [];
+        agentLoop(prompt, currentTabId, []);
     }
 }
 
@@ -253,7 +391,7 @@ async function generatePlan(prompt, rejected = false) {
 async function performGeneration(sendResponse) {
     sendLogToPanel('Generating Selenium code...', 'info');
     try {
-        const res = await fetch(GENERATE_URL, {
+        const res = await fetchBackend('/api/extension/generate-selenium', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify({
@@ -894,7 +1032,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     sendLogToPanel('Thinking... (waiting for AI response)', 'info');
                     const controller = new AbortController();
                     const apiTimeout = setTimeout(() => controller.abort(), 90000); // 90s timeout (complex pages need more AI processing time)
-                    const response = await fetch(API_URL, {
+                    const response = await fetchBackend('/api/extension/loop', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
                         body: JSON.stringify(statePayload),
@@ -1125,7 +1263,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                     let apiResult = null;
                     try {
-                        const apiResponse = await fetch(CALL_API_URL, {
+                        const apiResponse = await fetchBackend('/api/extension/call-api', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
                             body: JSON.stringify({ method: apiMethod, endpoint: apiEndpoint, params: apiParams })
@@ -1644,7 +1782,7 @@ async function agentLoop(prompt, tabId, planSteps = []) {
         // Gap C: Site Knowledge Learning — submit to backend after run
         if (lastAgentStartUrl && actionHistory.length > 2) {
             try {
-                fetch(LEARN_URL, {
+                fetchBackend('/api/extension/learn', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url: lastAgentStartUrl, history: actionHistory, prompt: lastAgentPrompt })

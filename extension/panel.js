@@ -81,6 +81,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const planApprovalContainer = document.getElementById('planApprovalContainer');
     const approvePlanBtn = document.getElementById('approvePlanBtn');
     const rejectPlanBtn = document.getElementById('rejectPlanBtn');
+    const cancelPlanBtn = document.getElementById('cancelPlanBtn');
+
+    // Check backend health on open
+    chrome.runtime.sendMessage({ type: 'CHECK_BACKEND_STATUS' }, (res) => {
+        if (chrome.runtime.lastError) return;
+        if (res && res.connected) {
+            statusText.textContent = `Ready (${res.url})`;
+        } else {
+            statusText.textContent = 'Backend offline (run: php artisan serve)';
+            statusText.style.color = '#f87171';
+        }
+    });
 
     const codeBanner = document.getElementById('codeBanner');
     const codeBannerHeader = document.getElementById('codeBannerHeader');
@@ -295,6 +307,7 @@ document.addEventListener('DOMContentLoaded', () => {
         runBtn.disabled = running;
         stopBtn.style.display = running ? 'block' : 'none';
         statusBar.classList.toggle('active', running);
+        statusText.style.color = '';
         if (running) {
             agentStartTime = Date.now();
             lastLogTimestamp = Date.now();
@@ -468,7 +481,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         chrome.runtime.sendMessage({
             type: 'START_AGENT',
-            payload: { prompt, agentMode: isAgentMode }
+            payload: { prompt, agentMode: isAgentMode, source: 'panel' }
         }, (response) => {
             if (chrome.runtime.lastError) {
                 appendLog('Error: ' + chrome.runtime.lastError.message, 'error');
@@ -528,6 +541,16 @@ document.addEventListener('DOMContentLoaded', () => {
             payload: { prompt }
         });
     });
+
+    if (cancelPlanBtn) {
+        cancelPlanBtn.addEventListener('click', () => {
+            planApprovalContainer.style.display = 'none';
+            chrome.runtime.sendMessage({ type: 'STOP_AGENT' }, () => {
+                appendLog('Agent cancelled by user.', 'info');
+                setRunning(false);
+            });
+        });
+    }
 
     // ── VIEW TOGGLE ──
     collapseAllBtn.addEventListener('click', () => {
