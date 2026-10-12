@@ -1344,13 +1344,48 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     }
                 }
 
+                // --- CONTEXT & GOAL STATE DETECTION ---
+                const currentUrlLower = (currentTabUrl || '').toLowerCase();
+                const isCartUrl = currentUrlLower.includes('/cart') || currentUrlLower.includes('/basket') || currentUrlLower.includes('checkout') || currentUrlLower.includes('view.html');
+                const isCartGoal = /\b(cart|basket|buy|purchase|add to cart)\b/i.test(prompt);
+
+                if (isCartUrl && isCartGoal && !postPopupDirective) {
+                    postPopupDirective = 'CURRENT PAGE IS CART/BASKET: Look at the cart summary. If the target item is listed in the cart, set "goal_satisfied": true and "action": "finish". If the cart is empty, do NOT re-search from scratch; navigate back to the product page.';
+                    sendLogToPanel('🛒 Cart/Basket page detected — checking for goal satisfaction.', 'info');
+                }
+
+                // Detect "Added to Cart" confirmation banner / drawer on any page
+                if (isCartGoal && !postPopupDirective && observeResult.elements) {
+                    const addedConfirmation = observeResult.elements.find(el => {
+                        const t = (el.text || '').toLowerCase();
+                        return (t.includes('added to cart') || t.includes('added to basket') || t.includes('added to bag') || t.includes('item added')) &&
+                               t.length < 100;
+                    });
+                    if (addedConfirmation) {
+                        postPopupDirective = `GOAL SATISFACTION DETECTED: Confirmation "${addedConfirmation.text}" is visible on screen! The item was successfully added to cart. Set "goal_satisfied": true and "action": "finish" now!`;
+                        sendLogToPanel(`🎉 Confirmation detected: "${addedConfirmation.text}"`, 'success');
+                    }
+                }
+
+                // Detect optional upsell / warranty dialogs (e.g. AppleCare+, Protection plans)
+                if (!postPopupDirective && observeResult.elements) {
+                    const upsellDismissEl = observeResult.elements.find(el => {
+                        const txt = (el.text || el.ariaLabel || '').trim().toLowerCase();
+                        return /\b(no thanks|no, thanks|not now|skip|continue without|no protection|dismiss|close)\b/i.test(txt) &&
+                               !/\b(add|buy|accept|yes|protect)\b/i.test(txt);
+                    });
+                    if (upsellDismissEl) {
+                        postPopupDirective = `UPSELL / OVERLAY DETECTED: An optional dialog with "${upsellDismissEl.text}" is visible. Click it to dismiss the modal and continue to the cart.`;
+                    }
+                }
+
                 // --- INJECT FAILURE DIRECTIVE ---
                 // If the previous action failed, tell the AI about it so it retries
                 if (lastActionFailed && !postPopupDirective) {
                     postPopupDirective = `ACTION FAILED: The last action returned success=false` +
                         (lastActionError ? ` (error: ${lastActionError})` : '') +
                         `. You MUST retry this step with a DIFFERENT selector or approach. ` +
-                        `Do NOT skip to the next SOP step. Do NOT call finish.`;
+                        `If the goal is already achieved despite this error, call finish with goal_satisfied=true.`;
                 }
 
                 // --- DYNAMIC SOP PROGRESS DETECTION ---
@@ -1572,9 +1607,46 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                 };
                 if (aiDecision.option) historyEntry.option = aiDecision.option;
                 if (aiDecision.text) historyEntry.text = aiDecision.text;
+                if (aiDecision.text_match) historyEntry.textMatch = aiDecision.text_match;
                 if (aiDecision.url) historyEntry.url = aiDecision.url;
                 if (aiDecision.index !== undefined) historyEntry.index = aiDecision.index;
-                if (aiDecision.unselect) historyEntry.unselect = true;
+                // ── GOAL SATISFACTION EARLY TERMINATION ──
+                if (aiDecision.goal_satisfied === true || aiDecision.action === 'finish') {
+                    const finishSummary = aiDecision.summary || aiDecision.conversational_message || aiDecision.thought || 'Goal satisfied successfully.';
+                    sendLogToPanel(`🎯 Goal Achieved: ${finishSummary}`, 'success');
+                    aiDecision.action = 'finish';
+                    historyEntry.action = 'finish';
+                    historyEntry.actionSuccess = true;
+                    actionHistory.push(historyEntry);
+                    break;
+                }
+
+                // ── MACRO-LOOP DETECTION: Detect and break high-level cycle loops ──
+                const hasAttemptedAddToCart = actionHistory.some(h => 
+                    (h.action === 'click' && /add to cart|add-to-cart|buy now/i.test((h.selector || '') + ' ' + (h.thought || '') + ' ' + (h.textMatch || ''))) ||
+                    (h.url && /\/(dp|gp\/product)\//i.test(h.url))
+                );
+
+                let isReSearchAction = false;
+                if (aiDecision.action === 'type') {
+                    isReSearchAction = /search|nav-search|search_query|twotabsearchtextbox/i.test(aiDecision.selector || '') ||
+                        (aiDecision.text && prompt.toLowerCase().includes(aiDecision.text.toLowerCase().trim()));
+                } else if (aiDecision.action === 'action_sequence' && Array.isArray(aiDecision.actions)) {
+                    isReSearchAction = aiDecision.actions.some(sub => 
+                        /search|nav-search|search_query|twotabsearchtextbox/i.test(sub.selector || '') ||
+                        (sub.text && prompt.toLowerCase().includes(sub.text.toLowerCase().trim()))
+                    );
+                }
+
+                if (hasAttemptedAddToCart && isReSearchAction) {
+                    sendLogToPanel('⚠️ Macro-loop prevented: Re-search blocked because product was already processed.', 'warn');
+                    const lastProductUrl = [...actionHistory].reverse().find(h => h.url && /\/(dp|gp\/product)\//i.test(h.url))?.url;
+                    postPopupDirective = 'MACRO-LOOP DETECTED: You have ALREADY navigated to this product. DO NOT re-search. '
+                        + (lastProductUrl ? `If you need to return to the product page, navigate to: ${lastProductUrl}. ` : '')
+                        + 'If on the cart page and the item is listed, call "finish" with goal_satisfied=true. '
+                        + 'If an upsell/protection modal is open, click "No thanks" or "Skip".';
+                    continue;
+                }
 
                 // 6. Loop detection — FRONTIER APPROACH: blacklist + force forward
                 const loopResult = checkForLoop(aiDecision, actionRetryCount, lastActionKey);
@@ -1800,7 +1872,8 @@ async function agentLoop(prompt, tabId, planSteps = []) {
 
                 // 7b. Handle FINISH
                 if (aiDecision.action === 'finish') {
-                    sendLogToPanel(`Agent finished: ${aiDecision.summary}`, 'decision');
+                    const finishSummary = aiDecision.summary || aiDecision.conversational_message || aiDecision.thought || 'Task completed successfully.';
+                    sendLogToPanel(`Agent finished: ${finishSummary}`, 'decision');
                     actionHistory.push(historyEntry);
                     break;
                 }
@@ -1973,10 +2046,10 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                         if (aiDecision.action === 'click' && actionResult.success) {
                             // Check if this was an "Add to Cart" or similar critical action
                             const clickedEl = lastObservedElements.find(e => e.selector === aiDecision.selector);
-                            const clickedText = (clickedEl?.text || '').toLowerCase();
+                            const clickedText = (clickedEl?.text || actionResult.matchedText || aiDecision.text_match || aiDecision.selector || '').toLowerCase();
                             if (clickedText.includes('add to cart') || clickedText.includes('add to bag') || clickedText.includes('buy now')) {
                                 historyEntry.isCartAction = true;
-                                postPopupDirective = 'VERIFY: You clicked "Add to Cart". Next step: check if cart confirmation appeared (popup, badge, redirect). If cart empty or no confirmation, the action FAILED — retry differently.';
+                                postPopupDirective = 'VERIFY: You clicked "Add to Cart". Next step: 1) If an upsell modal (warranty/protection) appears, click "No thanks" or "Skip". 2) If "Added to Cart" confirmation or drawer is visible, the goal is satisfied -> finish. 3) If on the Cart page, verify the item is in the cart -> finish. DO NOT navigate away or click Cart link unless no confirmation appears.';
                             }
 
                             // ── POST-SAVE EXCEPTION HANDLING ──

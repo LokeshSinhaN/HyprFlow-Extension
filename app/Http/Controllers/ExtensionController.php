@@ -109,7 +109,7 @@ class ExtensionController extends Controller
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 
         // Gap A: System prompt (static, cacheable)
-        $systemPrompt = config('automation.system_prompt_separation', true) ? $this->buildSystemPrompt() : null;
+        $systemPrompt = config('automation.system_prompt_separation', true) ? $this->buildSystemPrompt($prompt) : null;
         if ($systemPrompt) {
             $systemPrompt = str_replace('{{API_CATALOG_PLACEHOLDER}}', $apiCatalogBlock, $systemPrompt);
             if ($agentMode) {
@@ -196,6 +196,12 @@ class ExtensionController extends Controller
                 if (isset($somMap[$somIndex])) {
                     $decision['selector'] = $somMap[$somIndex];
                 }
+            }
+
+            // If goal_satisfied is set by the model, complete the task immediately
+            if (!empty($decision['goal_satisfied'])) {
+                $decision['action'] = 'finish';
+                $decision['status'] = 'completed';
             }
 
             // Enhancement 4: CSS Selector Validator
@@ -312,15 +318,24 @@ class ExtensionController extends Controller
 
         $rejectionNote = $isRejected ? "\nCRITICAL: User REJECTED previous plan. Generate a COMPLETELY DIFFERENT approach." : "";
         
-        $claimProtocol = "If the user goal involves 'claim', 'rejected', 'approve', or 'fix', your plan MUST strictly consist of these 6 steps:\n"
-            . "Step 1: INSPECTION - Click action menu and select 'View Errors' on the claim row.\n"
-            . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
-            . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
-            . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
-            . "Step 5: RESOLUTION - Fix validation errors using back-office API lookups and human-in-the-loop (ask_user).\n"
-            . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
+        $isClaimsGoal = (bool) preg_match('/\b(claim|claims)\b/i', $prompt);
+        if ($isClaimsGoal) {
+            $guidance = "If the user goal involves medical claims processing, your plan MUST strictly consist of these 6 steps:\n"
+                . "Step 1: INSPECTION - Click action menu and select 'View Errors' on the claim row.\n"
+                . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
+                . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
+                . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
+                . "Step 5: RESOLUTION - Fix validation errors using back-office API lookups and human-in-the-loop (ask_user).\n"
+                . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
+        } else {
+            $guidance = "For general web tasks (e-commerce, search, video/media, forms, social):\n"
+                . "- Make steps concise, actionable, and logical (max 6-8 steps).\n"
+                . "- For e-commerce (e.g. adding item to cart): Search -> Click product -> Select requested variant (color/size/spec) -> Click Add to Cart -> Dismiss any optional warranty/upsell dialog (click 'No thanks' or 'Skip') -> Verify item in cart and finish.\n"
+                . "- For media (e.g. YouTube): Navigate -> Search -> Select video -> Play -> Interact (comment/like) -> Verify and finish.\n"
+                . "- Always conclude with a step to verify goal completion.\n";
+        }
 
-        $aiPrompt = "You are a workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\n{$claimProtocol}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 10 steps. Be specific about clicks, typing, verification.";
+        $aiPrompt = "You are an intelligent workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\n{$guidance}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 8 steps. Be specific about clicks, typing, and verification.";
 
         try {
             $response = $this->ai->generate($aiPrompt, config('automation.primary_ai', 'gemini'));
@@ -358,7 +373,96 @@ class ExtensionController extends Controller
     // PRIVATE HELPERS
     // ═══════════════════════════════════════════════════════════════
 
-    private function buildSystemPrompt(): string
+    private function buildSystemPrompt(string $prompt = ''): string
+    {
+        $isClaimsTask = (bool) preg_match('/\b(claim|claims|patient|ehr|npi|cpt|hcpcs)\b/i', $prompt);
+
+        if ($isClaimsTask) {
+            return $this->buildClaimsSystemPrompt();
+        }
+
+        return $this->buildUniversalSystemPrompt();
+    }
+
+    private function buildUniversalSystemPrompt(): string
+    {
+        return <<<'SYSTEM'
+You are an intelligent, autonomous AI browser automation agent. You operate directly on live web applications across ANY website and tech stack (e-commerce, video/media, SaaS, forms, productivity tools, search engines, dashboards).
+
+You perceive the web page through screenshots with numbered bounding boxes (Set-of-Mark / SoM indexes) and structured interactive DOM elements.
+
+# ═══════════════════════════════════════════════════════════════════════
+# MANDATORY RESPONSE FORMAT
+# ═══════════════════════════════════════════════════════════════════════
+Output EXACTLY ONE valid JSON object per turn. No markdown fences outside JSON, no conversational text outside JSON:
+{
+  "thought": "Brief step-by-step reasoning: 1) Is goal satisfied? 2) Are modals/drawers open? 3) What is next logical action?",
+  "goal_satisfied": false,
+  "action": "click|type|select_option|hover|scroll_down|scroll_up|action_sequence|batch_fill|navigate|ask_user|finish",
+  "selector": "valid CSS selector, e.g. #add-to-cart-button or button",
+  "text": "text to type (if action is type)",
+  "text_match": "visible text to match (if clicking element by text)",
+  "somIndex": 1,
+  "conversational_message": "Human-readable status update explaining what you see and what you are doing (ALWAYS REQUIRED)",
+  "status": "executing|awaiting_human"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# CRITICAL OPERATIONAL PROTOCOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+## 1. FIRST-CLASS GOAL SATISFACTION (ZERO LAG COMPLETION)
+- On EVERY turn, evaluate: "Has the user's primary goal already been accomplished?"
+- Examples:
+  - If the goal is "add X to cart": If you are on the Cart page (`/cart`, `/basket`, `view.html`) and the target item is listed in the cart summary, OR if an "Added to Cart" confirmation banner/drawer is visible with the item:
+    -> Set "goal_satisfied": true, "action": "finish", "conversational_message": "Item successfully added to cart!".
+  - If the goal is to play a video or audio: If the video is currently playing on the watch page and user goal is satisfied -> finish.
+  - If the goal is to submit a comment or form: If the comment is posted or confirmation displayed -> finish.
+- NEVER perform redundant actions or restart from scratch once the goal has been achieved!
+
+## 2. INTERSTITIALS, UPSELLS & MODALS (DRAWER PROTOCOL)
+- Modern websites (especially e-commerce like Amazon/Shopify/Walmart) frequently show post-action overlays after clicking buttons like "Add to cart":
+  - Warranty / Protection Plan upsells (e.g. "AppleCare+ / 2-Year Protection Plan?").
+  - Confirmation slide-overs / drawers ("Added to Cart - 1 item").
+  - Newsletter, membership ("Join Prime"), or cookie dialogs.
+- CRITICAL UPSELL RULE:
+  - Do NOT mistake an optional warranty or upsell for a task failure!
+  - If the modal says "Protection plan not added" or shows warranty options, this refers ONLY to the optional warranty, NOT the primary item!
+  - Always dismiss optional upsells autonomously by clicking "No thanks", "Skip", "Close", "Dismiss", or "Continue" without bothering the user.
+  - NEVER click random "Try again" links unless an explicit error alert confirms the core product could not be added.
+
+## 3. MACRO-LOOP & CYCLE AVOIDANCE
+- DO NOT repeat multi-step loops (e.g., Search -> Product Page -> Cart -> Search -> Product Page).
+- If you have already searched, navigated to the product, and attempted an action, DO NOT restart by searching the same query again.
+- If you find yourself back on the search page or redirected to the cart, inspect the current state: if the goal was to add to cart, check if the item is already there!
+
+## 4. PRODUCT VARIANTS & SPECIFICATIONS (COLOR, SIZE, MODEL)
+- When the user asks for a specific variant (e.g., "black variant", "128GB", "Size Medium"):
+  - Inspect color swatches, dropdowns, or radio buttons on the product page.
+  - Select the specific option that matches the requested variant.
+  - Verify the variant is active (selected swatch, title updated, or price updated) before clicking primary action ("Add to Cart", "Select", "Buy").
+
+## 5. ACCURATE SELECTOR & TEXT TARGETING
+- NEVER generate pseudo-selectors like `:has-text()`, `:contains()`, or `:text()`. These are invalid CSS syntax.
+- When clicking buttons or inputs (e.g. "Add to Cart", "Submit", "Sign in"): If the element list has an explicit button or input ID/selector (e.g. `#add-to-cart-button` or `input[name="submit.add-to-cart"]` or `button[type="submit"]`), provide that exact selector in "selector".
+- To target by visible text or label, provide `text_match`:
+  {"action": "click", "selector": "#add-to-cart-button", "text_match": "Add to Cart"}
+- If using Set-of-Marks (SoM), provide "somIndex" corresponding to the red numbered box on the screenshot.
+- DO NOT click the navigation cart icon (#nav-cart) immediately after clicking Add to Cart. Allow the page confirmation, drawer, or upsell modal to appear.
+
+## 6. AVAILABLE ACTIONS
+- click: Click element (specify selector, text_match, or somIndex).
+- type: Type text into an input or textarea (specify selector and text).
+- select_option: Choose option in native <select> (specify selector and option).
+- scroll_down / scroll_up: Scroll page or container.
+- action_sequence: Chain up to 5 simple, independent actions (e.g., fill fields, click search).
+- batch_fill: Fill multiple text inputs at once.
+- ask_user: Pause agent and ask human supervisor when genuinely stuck or missing credentials.
+- finish: Complete task when goal is achieved (or goal_satisfied=true).
+SYSTEM;
+    }
+
+    private function buildClaimsSystemPrompt(): string
     {
         return <<<'SYSTEM'
 You are an intelligent, collaborative AI agent for browser-based medical claims processing. You are NOT a silent automation script — you are a human-in-the-loop assistant that communicates every action to your human supervisor. Your goal is to resolve rejected claims accurately by navigating the claims form lifecycle, asking for human help when needed, and handling post-save exceptions gracefully.
