@@ -416,6 +416,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
     // The background script reads this flag after click actions.
     window.__hyprflow_popupOpened = false;
     window.__hyprflow_popupUrl = '';
+    window.__hyprflow_synthetic_action = false;
     const _originalWindowOpen = window.open;
     window.open = function (...args) {
         window.__hyprflow_popupOpened = true;
@@ -423,7 +424,120 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
         return _originalWindowOpen.apply(this, args);
     };
 
+    // ─── USER INTERACTION & ACTION RECORDER (DISPATCH TO LAYA) ────────
+    // Captures user clicks and inputs in real time and dispatches to Laya
+    // for high-frequency (~30ms) intent classification and safety verification
+    function setupUserInteractionRecorder() {
+        if (window.__hyprflow_recorder_initialized) return;
+        window.__hyprflow_recorder_initialized = true;
+
+        // Capture user clicks on interactive elements
+        document.addEventListener('click', (e) => {
+            if (window.__hyprflow_synthetic_action) return;
+            const target = e.target.closest('button, a, input, select, [role="button"], [role="link"], [role="menuitem"], [role="tab"]') || e.target;
+            if (!target || target === document.body || target === document.documentElement) return;
+
+            try {
+                const selector = generateCss(target);
+                const text = (target.textContent || target.value || target.getAttribute('aria-label') || target.title || '').trim().slice(0, 100);
+                const role = target.getAttribute('role') || target.tagName.toLowerCase();
+                const rect = target.getBoundingClientRect();
+
+                chrome.runtime.sendMessage({
+                    type: 'RECORD_USER_ACTION',
+                    payload: {
+                        action: 'click',
+                        selector: selector,
+                        text: text,
+                        role: role,
+                        tagName: target.tagName.toLowerCase(),
+                        url: window.location.href,
+                        title: document.title,
+                        x: Math.round(rect.left + rect.width / 2),
+                        y: Math.round(rect.top + rect.height / 2),
+                        timestamp: Date.now()
+                    }
+                }).catch(() => { });
+            } catch (err) {
+                // Ignore recording errors
+            }
+        }, true);
+
+        // Capture form inputs and dropdown changes
+        document.addEventListener('change', (e) => {
+            if (window.__hyprflow_synthetic_action) return;
+            const target = e.target;
+            if (!target || !['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+
+            try {
+                const selector = generateCss(target);
+                const isSelect = target.tagName === 'SELECT';
+                const text = isSelect
+                    ? (target.options[target.selectedIndex]?.text || target.value || '')
+                    : (target.type === 'password' ? '***' : target.value);
+
+                chrome.runtime.sendMessage({
+                    type: 'RECORD_USER_ACTION',
+                    payload: {
+                        action: isSelect ? 'select_option' : 'type',
+                        selector: selector,
+                        text: text ? text.slice(0, 100) : '',
+                        option: isSelect ? text : undefined,
+                        tagName: target.tagName.toLowerCase(),
+                        type: target.type || '',
+                        url: window.location.href,
+                        title: document.title,
+                        timestamp: Date.now()
+                    }
+                }).catch(() => { });
+            } catch (err) {
+                // Ignore recording errors
+            }
+        }, true);
+    }
+
+    setupUserInteractionRecorder();
+
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+
+        // ─── LAYA ELEMENT INTENT & SAFETY DISPATCH ───────────────
+        if (message.type === 'CLASSIFY_ELEMENT_WITH_LAYA') {
+            const selector = message.payload?.selector;
+            const candidateIntents = message.payload?.candidateIntents;
+            const el = selector ? document.querySelector(selector) : null;
+            const contextText = el
+                ? `Element: ${el.tagName.toLowerCase()} text="${(el.textContent || el.value || '').trim()}" role="${el.getAttribute('role') || ''}" url="${window.location.href}"`
+                : (message.payload?.contextText || '');
+
+            chrome.runtime.sendMessage({
+                type: 'LAYA_CLASSIFY_INTENT',
+                payload: { context: contextText, candidateIntents }
+            }, (response) => {
+                sendResponse(response || { success: false, error: 'No response from background Laya handler' });
+            });
+            return true;
+        }
+
+        if (message.type === 'VERIFY_ACTION_SAFETY_WITH_LAYA') {
+            const selector = message.payload?.selector;
+            const actionDescription = message.payload?.actionDescription || '';
+            const el = selector ? document.querySelector(selector) : null;
+            const domContext = el ? {
+                tag: el.tagName.toLowerCase(),
+                text: (el.textContent || el.value || '').trim().slice(0, 100),
+                role: el.getAttribute('role') || '',
+                selector: selector,
+                url: window.location.href
+            } : { selector, url: window.location.href };
+
+            chrome.runtime.sendMessage({
+                type: 'LAYA_VERIFY_SAFETY',
+                payload: { domContext, actionDescription }
+            }, (response) => {
+                sendResponse(response || { success: false, error: 'No response from background Laya handler' });
+            });
+            return true;
+        }
 
         // ─── BUILD ACCESSIBILITY TREE ────────────────────────────
         if (message.type === 'BUILD_A11Y_TREE') {
@@ -603,6 +717,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             const action = message.payload;
 
             (async () => {
+                window.__hyprflow_synthetic_action = true;
                 let success = false;
                 let extraData = {};
                 try {
@@ -1237,6 +1352,8 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 } catch (e) {
                     console.error("Action failed:", e);
                     extraData.error = e.message;
+                } finally {
+                    window.__hyprflow_synthetic_action = false;
                 }
 
                 sendResponse({ success, ...extraData });

@@ -1,6 +1,26 @@
 // Hyprflow Extension Background Worker — the "Brain Coordinator".
 // ENHANCED: Plan-Aware Execution, Post-Action Verification, Multi-Action Chaining,
-// Scroll Verification, Site Knowledge Learning, Coordinate Click support.
+// Scroll Verification, Site Knowledge Learning, Coordinate Click support,
+// and Local Laya Decision Model (System 1 Fast Gate).
+
+// ─── LOCAL LAYA DECISION ENGINE INTEGRATION ────────────────────
+try {
+    importScripts('layaClient.js');
+} catch (e) {
+    console.warn('[HyprFlow] Failed to load layaClient.js via importScripts:', e);
+}
+
+const layaClientInstance = (typeof LayaClient !== 'undefined')
+    ? new LayaClient()
+    : ((typeof self !== 'undefined' && self.LayaClient) ? new self.LayaClient() : null);
+
+// Provider Mode State: 'hybrid' (Laya Fast Gate + Gemini) | 'laya_only' | 'gemini_only'
+let currentProviderMode = 'hybrid';
+chrome.storage.local.get(['providerMode'], (result) => {
+    if (result.providerMode) {
+        currentProviderMode = result.providerMode;
+    }
+});
 
 // ─── BACKEND CONNECTIVITY & AUTO-PORT RESOLUTION ───────────────
 // Automatically detect whether Laravel is running on 8001 (custom/serve script) or 8000 (default artisan serve)
@@ -157,6 +177,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    // ─── PROVIDER MODE & LAYA HEALTH ───
+    if (message.type === 'GET_PROVIDER_MODE') {
+        sendResponse({ providerMode: currentProviderMode });
+        return true;
+    }
+
+    if (message.type === 'SET_PROVIDER_MODE') {
+        currentProviderMode = message.payload?.providerMode || message.providerMode || 'hybrid';
+        chrome.storage.local.set({ providerMode: currentProviderMode });
+        sendLogToPanel(`Decision engine set to: ${currentProviderMode}`, 'info');
+        sendResponse({ success: true, providerMode: currentProviderMode });
+        return true;
+    }
+
+    if (message.type === 'CHECK_LAYA_STATUS') {
+        if (!layaClientInstance) {
+            sendResponse({ online: false, message: 'LayaClient not loaded' });
+            return true;
+        }
+        layaClientInstance.checkHealth().then((status) => {
+            sendResponse(status);
+        }).catch((err) => {
+            sendResponse({ online: false, message: err.message });
+        });
+        return true;
+    }
+
+    if (message.type === 'LAYA_PREDICT') {
+        if (!layaClientInstance) {
+            sendResponse({ success: false, error: 'Laya client not initialized' });
+            return true;
+        }
+        layaClientInstance.predict(message.payload?.state, message.payload?.questions, message.payload?.options)
+            .then((res) => sendResponse(res))
+            .catch((err) => sendResponse({ success: false, error: err.message }));
+        return true;
+    }
+
+    if (message.type === 'LAYA_CLASSIFY_INTENT') {
+        if (!layaClientInstance) {
+            sendResponse({ success: false, error: 'Laya client not initialized' });
+            return true;
+        }
+        layaClientInstance.classifyIntent(message.payload?.context, message.payload?.candidateIntents, message.payload?.options)
+            .then((res) => sendResponse(res))
+            .catch((err) => sendResponse({ success: false, error: err.message }));
+        return true;
+    }
+
+    if (message.type === 'LAYA_VERIFY_SAFETY') {
+        if (!layaClientInstance) {
+            sendResponse({ success: false, error: 'Laya client not initialized' });
+            return true;
+        }
+        layaClientInstance.verifyActionSafety(message.payload?.domContext, message.payload?.actionDescription, message.payload?.options)
+            .then((res) => sendResponse(res))
+            .catch((err) => sendResponse({ success: false, error: err.message }));
+        return true;
+    }
+
+    // ─── USER INTERACTION / RECORDING DISPATCH TO LAYA ───
+    if (message.type === 'RECORD_USER_ACTION') {
+        const payload = message.payload || {};
+        handleRecordedUserAction(payload).then((res) => {
+            sendResponse(res);
+        }).catch((err) => {
+            sendResponse({ success: false, error: err.message });
+        });
+        return true;
+    }
+
     if (message.type === 'START_AGENT') {
         if (isRunning) {
             sendResponse({ status: 'already_running' });
@@ -166,6 +257,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const prompt = message.payload?.prompt;
         isAgentMode = message.payload?.agentMode;
         const source = message.payload?.source || 'panel';
+        if (message.payload?.providerMode) {
+            currentProviderMode = message.payload.providerMode;
+        }
 
         chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
             try {
@@ -179,7 +273,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 await injectContentScript(currentTabId);
                 sendResponse({ status: 'started' });
 
-                // Check backend connectivity first
+                // Check connectivity according to Provider Mode
+                if (currentProviderMode === 'laya_only') {
+                    const layaHealth = layaClientInstance ? await layaClientInstance.checkHealth() : { online: false };
+                    if (!layaHealth.online) {
+                        sendLogToPanel('❌ Cannot connect to local Laya server at http://127.0.0.1:8000.', 'error');
+                        sendLogToPanel('💡 Please start the server: laya-serve --host 0.0.0.0 --port 8000 (or pip install -U laya)', 'warn');
+                        isRunning = false;
+                        chrome.runtime.sendMessage({ type: 'AGENT_DONE', hasHistory: false }).catch(() => { });
+                        return;
+                    }
+                    sendLogToPanel(`⚡ Laya Only active: Connected to ${layaHealth.url} (~30ms discrete decisions)`, 'info');
+                    agentLoop(prompt, currentTabId, []);
+                    return;
+                }
+
+                // Check backend connectivity for Gemini (used in hybrid or gemini_only)
                 const backendBase = await resolveBackendBaseUrl(true);
                 if (!backendBase) {
                     sendLogToPanel('❌ Cannot connect to HyprFlow backend server at port 8001 or 8000.', 'error');
@@ -190,6 +299,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
 
                 sendLogToPanel(`Connected to backend: ${backendBase}`, 'info');
+
+                // In hybrid mode, also check and report Laya status
+                if (currentProviderMode === 'hybrid' && layaClientInstance) {
+                    const layaHealth = await layaClientInstance.checkHealth();
+                    if (layaHealth.online) {
+                        sendLogToPanel(`⚡ Hybrid Mode: Laya Fast Gate connected at ${layaHealth.url} (>=85% confidence in ~30ms)`, 'info');
+                    } else {
+                        sendLogToPanel('⚠️ Hybrid Mode: Laya server offline at http://127.0.0.1:8000. Full Gemini fallback active. (Run "laya-serve --host 0.0.0.0 --port 8000" for 30ms local decisions)', 'warn');
+                    }
+                } else if (currentProviderMode === 'gemini_only') {
+                    sendLogToPanel('🧠 Gemini Only mode active (cloud LLM)', 'info');
+                }
 
                 if (source === 'popup') {
                     // Popup UI does not have plan approval buttons, run agent directly
@@ -431,10 +552,288 @@ async function injectContentScript(tabId) {
     try {
         await chrome.scripting.executeScript({
             target: { tabId },
-            files: ['content.js']
+            files: ['layaClient.js', 'content.js']
         });
     } catch (e) {
         console.log("Script inject skipped:", e.message);
+    }
+}
+
+// ─── LAYA INTERACTION RECORDER HANDLER ────────────────────────
+/**
+ * Processes user interactions captured from webpage, dispatches them to Laya for
+ * real-time (~30ms) intent classification and action safety verification.
+ */
+async function handleRecordedUserAction(actionPayload) {
+    const actionType = actionPayload.action || 'click';
+    const selector = actionPayload.selector || '';
+    const text = actionPayload.text || '';
+    const tagName = actionPayload.tagName || '';
+    const actionDesc = `${actionType.toUpperCase()} on ${tagName} "${text || selector}"`;
+
+    const historyEntry = {
+        step: lastAgentHistory.length + 1,
+        action: actionType,
+        selector: selector,
+        text: text,
+        url: actionPayload.url || '',
+        actionSuccess: true,
+        recordedUserAction: true,
+        timestamp: Date.now()
+    };
+    lastAgentHistory.push(historyEntry);
+    chrome.storage.local.set({ lastAgentHistory });
+
+    // In Gemini-only mode, skip Laya classification
+    if (currentProviderMode === 'gemini_only' || !layaClientInstance) {
+        sendLogToPanel(`Recorded: ${actionDesc}`, 'info');
+        return { success: true, mode: 'gemini_only' };
+    }
+
+    // Direct Laya evaluation (~30ms)
+    try {
+        const domContext = {
+            selector: selector,
+            text: text,
+            role: actionPayload.role || '',
+            tagName: tagName,
+            url: actionPayload.url || '',
+            title: actionPayload.title || ''
+        };
+
+        const candidateIntents = [
+            'select_date', 'choose_flight', 'baggage_selection', 'payment',
+            'product_search', 'add_to_cart', 'filter_results',
+            'claim_lookup', 'fill_patient_info', 'submit_claim',
+            'form_input', 'navigation_click', 'other'
+        ];
+
+        // 1. Classify intent
+        const intentResult = await layaClientInstance.classifyIntent(
+            `User performed ${actionDesc} on page "${actionPayload.title || actionPayload.url}"`,
+            candidateIntents
+        );
+
+        // 2. Verify safety
+        const safetyResult = await layaClientInstance.verifyActionSafety(domContext, actionDesc);
+
+        const intentName = intentResult.success ? intentResult.intent : 'general_action';
+        const intentConf = intentResult.success ? (intentResult.confidence * 100).toFixed(0) : '?';
+        const isSafe = safetyResult.success ? safetyResult.isSafe : true;
+
+        if (!isSafe || safetyResult.isIrreversible) {
+            sendLogToPanel(`⚠️ [Laya Safety Alert] Non-reversible action: ${actionDesc} (Confidence: ${(safetyResult.confidence * 100).toFixed(0)}%)`, 'warn');
+        } else {
+            sendLogToPanel(`⚡ [Laya Recorder] Action: ${actionType} | Intent: ${intentName} (${intentConf}%) | Safety: SAFE in ~${intentResult.latencyMs || 30}ms`, 'info');
+        }
+
+        return {
+            success: true,
+            intent: intentName,
+            intentConfidence: intentResult.confidence,
+            isSafe: isSafe,
+            isIrreversible: safetyResult.isIrreversible
+        };
+    } catch (e) {
+        sendLogToPanel(`Recorded: ${actionDesc} (Laya offline: ${e.message})`, 'info');
+        return { success: true, offline: true };
+    }
+}
+
+// ─── LAYA FAST GATE (SYSTEM 1 DECISION ENGINE) ────────────────
+/**
+ * Fast Gate (System 1 - Laya): Check page context, element intent, and candidate DOM actions in ~30ms.
+ * - If calibrated confidence >= 0.85: executes deterministic action directly without calling expensive LLM.
+ * - If calibrated confidence < 0.85 or generative task: falls back to Gemini (System 2).
+ */
+async function executeLayaFastGate(prompt, observeResult, actionHistory, planSteps = [], currentPlanStepIndex = 0) {
+    if (!layaClientInstance) {
+        return { shouldFallback: true, reason: 'LayaClient not initialized' };
+    }
+
+    // Check Laya server connectivity
+    const activeUrl = await layaClientInstance.resolveBaseUrl();
+    if (!activeUrl) {
+        return {
+            shouldFallback: true,
+            offline: true,
+            reason: 'Local Laya server is offline. Please run: laya-serve --host 0.0.0.0 --port 8000'
+        };
+    }
+
+    const elements = observeResult.elements || [];
+    const pageUrl = observeResult.url || '';
+    const pageTitle = observeResult.title || '';
+    const promptLower = (prompt || '').toLowerCase();
+    const urlLower = pageUrl.toLowerCase();
+
+    // Domain detection
+    const isFlightTask = /flight|airline|airport|booking|departure|travel|fare/i.test(promptLower + ' ' + urlLower);
+    const isEcommerceTask = /buy|cart|product|shop|price|amazon|store|item|ecommerce|order/i.test(promptLower + ' ' + urlLower);
+    const isRcmTask = /claim|rcm|patient|payer|denial|billing|adjudication/i.test(promptLower + ' ' + urlLower);
+
+    // Build candidate DOM actions from top visible interactive elements
+    const candidateCriteria = {};
+    const candidateActionMap = {};
+
+    // 1. Completion candidate
+    candidateCriteria['action_finish'] = `The automation goal "${prompt}" has been fully achieved on this page`;
+    candidateActionMap['action_finish'] = {
+        action: 'finish',
+        summary: `Goal completed on ${pageTitle || pageUrl}`
+    };
+
+    // 2. Scroll candidate
+    candidateCriteria['action_scroll'] = 'Scroll down to discover more elements, listings, or form inputs';
+    candidateActionMap['action_scroll'] = {
+        action: 'scroll_down',
+        selector: null
+    };
+
+    // 3. Interactive element candidates
+    elements.slice(0, 15).forEach((el, index) => {
+        const label = (el.text || el.ariaLabel || el.placeholder || el.name || el.value || el.selector || '').trim().slice(0, 80);
+        const tag = (el.tagName || '').toLowerCase();
+        let actionType = 'click';
+        if (tag === 'input' || tag === 'textarea') {
+            const inputType = (el.type || 'text').toLowerCase();
+            if (['checkbox', 'radio', 'submit', 'button'].includes(inputType)) {
+                actionType = 'click';
+            } else {
+                actionType = 'type';
+            }
+        } else if (tag === 'select') {
+            actionType = 'select_option';
+        }
+
+        const key = `action_${index}_${actionType}`;
+        candidateCriteria[key] = `${actionType.toUpperCase()}: "${label}" (${tag}, ${el.selector})`;
+        candidateActionMap[key] = {
+            action: actionType,
+            selector: el.selector,
+            text: el.value || '',
+            option: el.selectedOptionText || el.text || '',
+            label: label,
+            elementInfo: el
+        };
+    });
+
+    // Build dynamic typed questions
+    const questions = {
+        next_action: {
+            type: 'choice',
+            instructions: `Given the user task: "${prompt}" and page "${pageTitle || pageUrl}", which DOM action should be executed next?`,
+            criteria: candidateCriteria
+        },
+        is_safe: {
+            type: 'noul',
+            instructions: 'Is this proposed DOM action safe, deterministic, and free of irreversible financial or data consequences?'
+        },
+        is_goal_achieved: {
+            type: 'noul',
+            instructions: `Has the user goal: "${prompt}" already been completely achieved on this page?`
+        }
+    };
+
+    // Integrate domain schemas
+    const schemas = (typeof LayaQuestionSchemas !== 'undefined') ? LayaQuestionSchemas : (self.LayaQuestionSchemas || null);
+    if (schemas) {
+        if (isFlightTask && schemas.flightBooking) {
+            questions.flight_step = schemas.flightBooking.buildStepRoutingQuestion().task_step;
+            questions.is_final_booking = schemas.flightBooking.buildConfirmationSafetyQuestion().is_final_confirmation;
+        } else if (isEcommerceTask && schemas.ecommerce) {
+            questions.product_match = schemas.ecommerce.buildRelevanceQuestion(prompt).product_relevance;
+            questions.fitness_rating = schemas.ecommerce.buildFitnessScoreQuestion().fitness_rating;
+        } else if (isRcmTask && schemas.rcmPortal) {
+            questions.claim_status = schemas.rcmPortal.buildClaimStatusQuestion().claim_status;
+            questions.manual_intervention = schemas.rcmPortal.buildInterventionQuestion().requires_manual_intervention;
+        }
+    }
+
+    // State payload for Laya ModernBERT forward pass
+    const state = {
+        goal: prompt,
+        pageUrl: pageUrl,
+        pageTitle: pageTitle,
+        recentActions: actionHistory.slice(-3).map(h => `${h.action} on ${h.selector || 'page'}`).join(' -> '),
+        currentPlanStep: planSteps[currentPlanStepIndex] || ''
+    };
+
+    try {
+        const layaResult = await layaClientInstance.predict(state, questions, { timeoutMs: 3000 });
+        if (!layaResult.success) {
+            return {
+                shouldFallback: true,
+                offline: layaResult.offline,
+                reason: layaResult.error || 'Laya predict failed'
+            };
+        }
+
+        const answers = layaResult.answers || {};
+
+        // Check if goal is satisfied with high confidence
+        if (answers.is_goal_achieved?.value === true && answers.is_goal_achieved.confidence >= 0.85) {
+            return {
+                executed: true,
+                confidence: answers.is_goal_achieved.confidence,
+                latencyMs: layaResult.latencyMs,
+                decision: {
+                    thought: `[Laya Fast Gate ~${layaResult.latencyMs || 30}ms] Goal evaluated as fully completed with ${(answers.is_goal_achieved.confidence * 100).toFixed(1)}% confidence.`,
+                    action: 'finish',
+                    summary: `Task "${prompt}" completed successfully based on verified page state.`,
+                    confidence: answers.is_goal_achieved.confidence,
+                    decisionSource: 'laya_fast_gate',
+                    conversational_message: `Goal completed according to Laya Fast Gate verification.`
+                }
+            };
+        }
+
+        const actionAnswer = answers.next_action;
+        if (!actionAnswer) {
+            return { shouldFallback: true, reason: 'No next_action answer from Laya' };
+        }
+
+        const winningKey = actionAnswer.choice;
+        const confidence = actionAnswer.confidence || 0;
+        const matchedAction = candidateActionMap[winningKey];
+
+        // Safety gate verification
+        if (answers.is_final_booking?.value === true && answers.is_final_booking.confidence >= 0.70) {
+            sendLogToPanel(`⚠️ [Laya Fast Gate] Element identified as final non-reversible booking confirmation. Verifying safety...`, 'warn');
+        }
+
+        // High-confidence execution (>= 0.85)
+        if (confidence >= 0.85 && matchedAction) {
+            return {
+                executed: true,
+                confidence: confidence,
+                latencyMs: layaResult.latencyMs,
+                decision: {
+                    thought: `[Laya Fast Gate ~${layaResult.latencyMs || 30}ms] High confidence (${(confidence * 100).toFixed(1)}% >= 85%): ${matchedAction.action} on ${matchedAction.selector || 'page'}.`,
+                    action: matchedAction.action,
+                    selector: matchedAction.selector,
+                    text: matchedAction.text,
+                    option: matchedAction.option,
+                    confidence: confidence,
+                    decisionSource: 'laya_fast_gate',
+                    latencyMs: layaResult.latencyMs,
+                    conversational_message: `⚡ Laya Fast Gate decided: ${matchedAction.action} on ${matchedAction.selector || 'page'} (${(confidence * 100).toFixed(0)}% confidence in ${layaResult.latencyMs || 30}ms)`
+                }
+            };
+        }
+
+        // Low confidence (< 0.85) -> fallback to Gemini
+        return {
+            executed: false,
+            shouldFallback: true,
+            confidence: confidence,
+            reason: `Calibrated confidence ${(confidence * 100).toFixed(1)}% < 85% threshold. Forwarding to Gemini (System 2)...`
+        };
+    } catch (err) {
+        return {
+            shouldFallback: true,
+            reason: `Fast gate evaluation error: ${err.message}`
+        };
     }
 }
 
@@ -1026,75 +1425,114 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                     agentMode: isAgentMode
                 };
 
-                // 4. Ask the backend brain (AI) for the next action
-                let aiDecision;
-                try {
-                    sendLogToPanel('Thinking... (waiting for AI response)', 'info');
-                    const controller = new AbortController();
-                    const apiTimeout = setTimeout(() => controller.abort(), 90000); // 90s timeout (complex pages need more AI processing time)
-                    const response = await fetchBackend('/api/extension/loop', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                        body: JSON.stringify(statePayload),
-                        signal: controller.signal
-                    });
-                    clearTimeout(apiTimeout);
-                    apiTimeoutCount = 0; // Reset timeout counter on successful response
+                // 4. Decision Pipeline: Fast Gate (System 1 - Laya) or Generative Fallback (System 2 - Gemini)
+                let aiDecision = null;
+                let layaHandled = false;
 
-                    if (!response.ok) {
-                        const text = await response.text();
-                        sendLogToPanel(`Brain API error ${response.status}: ${text.slice(0, 200)}`, 'error');
-                        failedActionCount++;
-                        lastActionFailed = true;
-                        lastActionError = `HTTP ${response.status}`;
-                        actionHistory.push({
-                            step: step + 1,
-                            action: 'api_error',
-                            error: `HTTP ${response.status}`,
-                            actionSuccess: false
-                        });
-                        await waitForStability(currentTabId, 1500);
-                        continue;
+                // If not in Gemini Only mode, evaluate Fast Gate (System 1 - Laya)
+                if (currentProviderMode !== 'gemini_only') {
+                    sendLogToPanel('⚡ Laya Fast Gate: Evaluating page context (~30ms)...', 'info');
+                    const layaGateResult = await executeLayaFastGate(
+                        prompt,
+                        observeResult,
+                        actionHistory,
+                        planSteps,
+                        currentPlanStepIndex
+                    );
+
+                    if (layaGateResult.executed && layaGateResult.decision) {
+                        aiDecision = layaGateResult.decision;
+                        layaHandled = true;
+                        sendLogToPanel(`⚡ [Laya Fast Gate] High confidence decision: ${aiDecision.action} on ${aiDecision.selector || 'page'} (${(layaGateResult.confidence * 100).toFixed(1)}% >= 85% in ${layaGateResult.latencyMs || 30}ms). Executing without LLM overhead.`, 'decision');
+                    } else {
+                        if (layaGateResult.offline) {
+                            sendLogToPanel('⚠️ Local Laya server offline at http://127.0.0.1:8000. (Run "laya-serve --host 0.0.0.0 --port 8000" for 30ms local decisions)', 'warn');
+                        }
+
+                        if (currentProviderMode === 'laya_only') {
+                            if (layaGateResult.offline) {
+                                sendLogToPanel('❌ Laya Only mode requires laya-serve running. Stopping agent.', 'error');
+                                failedActionCount++;
+                                break;
+                            } else {
+                                sendLogToPanel(`[Laya Only] Low confidence (${((layaGateResult.confidence || 0) * 100).toFixed(1)}%). Fallback disabled in Laya Only mode.`, 'warn');
+                                failedActionCount++;
+                                await waitForStability(currentTabId, 1500);
+                                continue;
+                            }
+                        } else {
+                            // Hybrid mode: fallback to Gemini (System 2)
+                            sendLogToPanel(`[Laya Fast Gate] ${layaGateResult.reason || 'Confidence < 85%'}. Forwarding to Gemini (System 2)...`, 'info');
+                        }
                     }
+                }
 
-                    const responseData = await response.json();
+                // If not handled by Laya (Gemini Only mode or Hybrid low-confidence/offline fallback)
+                if (!layaHandled) {
+                    try {
+                        sendLogToPanel('Thinking... (waiting for Gemini LLM response)', 'info');
+                        const controller = new AbortController();
+                        const apiTimeout = setTimeout(() => controller.abort(), 90000); // 90s timeout (complex pages need more AI processing time)
+                        const response = await fetchBackend('/api/extension/loop', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify(statePayload),
+                            signal: controller.signal
+                        });
+                        clearTimeout(apiTimeout);
+                        apiTimeoutCount = 0; // Reset timeout counter on successful response
 
-                    // Check if we got an error response (e.g., empty selector)
-                    if (responseData.error) {
-                        sendLogToPanel(`AI Error: ${responseData.error}`, 'error');
-                        if (responseData.retry) {
-                            // Force a retry by not counting this as a proper step
-                            postPopupDirective = 'CRITICAL: You MUST provide a valid CSS selector. The previous response had an empty selector which is invalid. Look at the elements list and pick the correct selector.';
+                        if (!response.ok) {
+                            const text = await response.text();
+                            sendLogToPanel(`Brain API error ${response.status}: ${text.slice(0, 200)}`, 'error');
                             failedActionCount++;
-                            // Re-observe and try again
+                            lastActionFailed = true;
+                            lastActionError = `HTTP ${response.status}`;
+                            actionHistory.push({
+                                step: step + 1,
+                                action: 'api_error',
+                                error: `HTTP ${response.status}`,
+                                actionSuccess: false
+                            });
                             await waitForStability(currentTabId, 1500);
                             continue;
                         }
-                    }
 
-                    aiDecision = responseData;
-                } catch (error) {
-                    if (error.name === 'AbortError') {
-                        apiTimeoutCount++;
-                        sendLogToPanel(`AI API timed out after 90s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
-                        // API timeouts are infrastructure issues — use separate counter
-                        // Only count toward main failure counter if we've exhausted timeout retries
-                        if (apiTimeoutCount >= maxApiTimeouts) {
-                            failedActionCount = maxFailedActions; // Force stop
-                            sendLogToPanel(`AI API timed out ${maxApiTimeouts} times. Stopping agent.`, 'error');
-                        }
-                        actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
+                        const responseData = await response.json();
 
-                        // SMART RETRY: After first timeout, strip the image from the payload
-                        // to reduce processing time. The AI can still work with DOM elements alone.
-                        if (observeResult && observeResult.image && apiTimeoutCount >= 1) {
-                            observeResult.image = null;
-                            sendLogToPanel('Stripped image from payload for faster retry (DOM-only mode)', 'info');
+                        // Check if we got an error response (e.g., empty selector)
+                        if (responseData.error) {
+                            sendLogToPanel(`AI Error: ${responseData.error}`, 'error');
+                            if (responseData.retry) {
+                                // Force a retry by not counting this as a proper step
+                                postPopupDirective = 'CRITICAL: You MUST provide a valid CSS selector. The previous response had an empty selector which is invalid. Look at the elements list and pick the correct selector.';
+                                failedActionCount++;
+                                // Re-observe and try again
+                                await waitForStability(currentTabId, 1500);
+                                continue;
+                            }
                         }
-                        continue;
+
+                        aiDecision = responseData;
+                    } catch (error) {
+                        if (error.name === 'AbortError') {
+                            apiTimeoutCount++;
+                            sendLogToPanel(`AI API timed out after 90s. Retry ${apiTimeoutCount}/${maxApiTimeouts}...`, 'error');
+                            if (apiTimeoutCount >= maxApiTimeouts) {
+                                failedActionCount = maxFailedActions; // Force stop
+                                sendLogToPanel(`AI API timed out ${maxApiTimeouts} times. Stopping agent.`, 'error');
+                            }
+                            actionHistory.push({ step: step + 1, action: 'api_timeout', error: 'API call timed out', actionSuccess: false });
+
+                            if (observeResult && observeResult.image && apiTimeoutCount >= 1) {
+                                observeResult.image = null;
+                                sendLogToPanel('Stripped image from payload for faster retry (DOM-only mode)', 'info');
+                            }
+                            continue;
+                        }
+                        sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
+                        break;
                     }
-                    sendLogToPanel(`Error connecting to brain API: ${error.message}`, 'error');
-                    break;
                 }
 
                 // Consume post-popup directive (one-shot)

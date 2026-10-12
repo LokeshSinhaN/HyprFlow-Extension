@@ -2,6 +2,23 @@ document.addEventListener('DOMContentLoaded', () => {
     const runBtn = document.getElementById('runBtn');
     const promptInput = document.getElementById('promptInput');
     const statusDiv = document.getElementById('status');
+    const providerModeSelect = document.getElementById('providerModeSelect');
+
+    // Initialize Provider Mode from storage
+    if (providerModeSelect) {
+        chrome.storage.local.get(['providerMode'], (result) => {
+            providerModeSelect.value = result.providerMode || 'hybrid';
+        });
+
+        providerModeSelect.addEventListener('change', () => {
+            const mode = providerModeSelect.value;
+            chrome.storage.local.set({ providerMode: mode });
+            chrome.runtime.sendMessage({
+                type: 'SET_PROVIDER_MODE',
+                payload: { providerMode: mode }
+            });
+        });
+    }
   
     runBtn.addEventListener('click', () => {
       const prompt = promptInput.value.trim();

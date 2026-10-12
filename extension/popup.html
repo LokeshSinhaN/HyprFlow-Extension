@@ -77,9 +77,18 @@
 <body>
    <h2>Hyprflow</h2>
    <div class="subtitle">Use the side panel for full control</div>
+   <div style="margin-bottom: 10px;">
+     <label for="providerModeSelect" style="font-size: 11px; color: #a3a3a3; display: block; margin-bottom: 4px; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Engine:</label>
+     <select id="providerModeSelect" style="width: 100%; padding: 6px 8px; border: 1px solid #262626; border-radius: 6px; background-color: #1a1a1a; color: #f5f5f5; font-size: 12px; outline: none; cursor: pointer;">
+       <option value="hybrid">⚡ Hybrid: Laya + Gemini</option>
+       <option value="laya_only">⚡ Laya Only (Decisions)</option>
+       <option value="gemini_only">🧠 Gemini Only</option>
+     </select>
+   </div>
   <textarea id="promptInput" placeholder="What do you want me to do on this page?"></textarea>
    <button id="runBtn">Run Agent</button>
   <div id="status"></div>
+  <script src="layaClient.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

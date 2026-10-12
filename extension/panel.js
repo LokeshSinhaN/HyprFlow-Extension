@@ -83,7 +83,56 @@ document.addEventListener('DOMContentLoaded', () => {
     const rejectPlanBtn = document.getElementById('rejectPlanBtn');
     const cancelPlanBtn = document.getElementById('cancelPlanBtn');
 
-    // Check backend health on open
+    // ── DECISION ENGINE & LAYA STATUS ──
+    const providerModeSelect = document.getElementById('providerModeSelect');
+    const layaStatusDot = document.getElementById('layaStatusDot');
+    const layaStatusText = document.getElementById('layaStatusText');
+
+    function updateLayaStatusDisplay(online, url) {
+        if (!layaStatusText || !layaStatusDot) return;
+        if (online) {
+            layaStatusDot.style.backgroundColor = '#22c55e';
+            layaStatusText.textContent = 'Laya: 30ms';
+            layaStatusText.style.color = '#34d399';
+            layaStatusText.title = `Laya decision server active at ${url || 'http://127.0.0.1:8000'}`;
+        } else {
+            layaStatusDot.style.backgroundColor = '#737373';
+            layaStatusText.textContent = 'Laya: Offline';
+            layaStatusText.style.color = '#737373';
+            layaStatusText.title = 'Laya server offline. Run: laya-serve --host 0.0.0.0 --port 8000';
+        }
+    }
+
+    function checkLayaHealth() {
+        chrome.runtime.sendMessage({ type: 'CHECK_LAYA_STATUS' }, (res) => {
+            if (chrome.runtime.lastError) return;
+            if (res && res.online) {
+                updateLayaStatusDisplay(true, res.url);
+            } else {
+                updateLayaStatusDisplay(false, null);
+            }
+        });
+    }
+
+    if (providerModeSelect) {
+        chrome.storage.local.get(['providerMode'], (res) => {
+            const mode = res.providerMode || 'hybrid';
+            providerModeSelect.value = mode;
+        });
+
+        providerModeSelect.addEventListener('change', () => {
+            const mode = providerModeSelect.value;
+            chrome.storage.local.set({ providerMode: mode });
+            chrome.runtime.sendMessage({
+                type: 'SET_PROVIDER_MODE',
+                payload: { providerMode: mode }
+            });
+            const modeLabel = providerModeSelect.options[providerModeSelect.selectedIndex].text;
+            appendLog(`Decision engine switched to: ${modeLabel}`, 'info');
+        });
+    }
+
+    // Check backend health and Laya health on open
     chrome.runtime.sendMessage({ type: 'CHECK_BACKEND_STATUS' }, (res) => {
         if (chrome.runtime.lastError) return;
         if (res && res.connected) {
@@ -93,6 +142,10 @@ document.addEventListener('DOMContentLoaded', () => {
             statusText.style.color = '#f87171';
         }
     });
+
+    checkLayaHealth();
+    // Poll Laya health every 15 seconds while panel is open
+    setInterval(checkLayaHealth, 15000);
 
     const codeBanner = document.getElementById('codeBanner');
     const codeBannerHeader = document.getElementById('codeBannerHeader');
@@ -479,9 +532,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const isAgentMode = agentModeToggle.checked;
         appendLog(`Starting ${isAgentMode ? 'Autonomous Agent' : 'Record'} mode...`, 'info');
 
+        const currentMode = providerModeSelect?.value || 'hybrid';
         chrome.runtime.sendMessage({
             type: 'START_AGENT',
-            payload: { prompt, agentMode: isAgentMode, source: 'panel' }
+            payload: { prompt, agentMode: isAgentMode, source: 'panel', providerMode: currentMode }
         }, (response) => {
             if (chrome.runtime.lastError) {
                 appendLog('Error: ' + chrome.runtime.lastError.message, 'error');
