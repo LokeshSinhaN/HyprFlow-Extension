@@ -238,6 +238,105 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
      * @param {{ text_match: string, role_hint?: string, scope_hint?: string }} action
      * @returns {Element|null} The best-matching DOM element or null
      */
+    /**
+     * Resolves a target element to its actual interactive control.
+     * Prevents the "Inner Span Click Trap" where click events are fired
+     * on passive styling elements (<span>, <div>, <b>) instead of the
+     * enclosing <button>, <a>, or associated <input type="submit">.
+     *
+     * Universal across Amazon, Shopify, Bootstrap, Tailwind, Material-UI, Radix, etc.
+     *
+     * @param {Element} el - The matched or selected element
+     * @returns {Element} The interactive DOM element to interact with
+     */
+    function getInteractiveTarget(el) {
+        if (!el || !(el instanceof Element)) return el;
+
+        const tag = el.tagName.toLowerCase();
+        const inputType = (tag === 'input' ? (el.type || '').toLowerCase() : '');
+
+        // 1. If el is ALREADY a primary interactive control, return as-is
+        if (tag === 'button' || tag === 'select' || tag === 'textarea') return el;
+        if (tag === 'a' && (el.hasAttribute('href') || el.hasAttribute('role'))) return el;
+        if (tag === 'input' && ['submit', 'button', 'reset', 'checkbox', 'radio', 'image'].includes(inputType)) return el;
+
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        if (['button', 'link', 'menuitem', 'tab', 'checkbox', 'radio', 'switch', 'option'].includes(role)) {
+            return el;
+        }
+
+        // 2. Check for interactive ANCESTOR (e.g. <span> inside <button> or <a href> or [role="button"])
+        const interactiveAncestor = el.closest(
+            'button, a[href], [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="switch"], [role="option"]'
+        );
+        if (interactiveAncestor) {
+            return interactiveAncestor;
+        }
+
+        // 3. Check for aria-labelledby / label reference
+        // (e.g. <input id="add-to-cart-button" aria-labelledby="submit.add-to-cart-announce">)
+        if (el.id) {
+            try {
+                const referencedControl = document.querySelector(`[aria-labelledby~="${CSS.escape(el.id)}"]`);
+                if (referencedControl) return referencedControl;
+            } catch (e) {}
+
+            try {
+                const labelForControl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                if (labelForControl) {
+                    const inputEl = document.getElementById(el.id);
+                    if (inputEl) return inputEl;
+                }
+            } catch (e) {}
+        }
+
+        // 4. Check if el is inside a <label>
+        const parentLabel = el.closest('label');
+        if (parentLabel) {
+            if (parentLabel.htmlFor) {
+                const targetInput = document.getElementById(parentLabel.htmlFor);
+                if (targetInput) return targetInput;
+            }
+            const nestedInput = parentLabel.querySelector('input, select, textarea, button');
+            if (nestedInput) return nestedInput;
+        }
+
+        // 5. Button wrapper pattern (Amazon, Walmart, custom design systems)
+        // e.g. <span class="a-button"><span class="a-button-inner"><input type="submit"><span>Text</span></span></span>
+        // Check sibling or parent container for an input[type="submit"], input[type="button"], or button
+        const buttonContainer = el.closest('.a-button, .btn, .button, [class*="button" i], [class*="btn" i], form, fieldset') || el.parentElement;
+        if (buttonContainer && buttonContainer !== document.body) {
+            const controlInContainer = buttonContainer.querySelector('input[type="submit"], input[type="button"], button, [role="button"]');
+            if (controlInContainer && controlInContainer !== el) {
+                return controlInContainer;
+            }
+        }
+
+        // 6. Direct sibling input/button
+        if (el.parentElement) {
+            const siblingControl = el.parentElement.querySelector('input[type="submit"], input[type="button"], button, [role="button"]');
+            if (siblingControl && siblingControl !== el) {
+                return siblingControl;
+            }
+        }
+
+        return el;
+    }
+
+    /**
+     * Resolves a DOM element by visible text content or accessible name.
+     * Iterates all interactive elements in the DOM and scores them based on
+     * textContent and aria-label matching against the given text_match.
+     *
+     * SMART CONTEXT SCOPING: When action.scope_hint is provided, elements
+     * within the matching scope (modal, form, dropdown, etc.) receive a
+     * large score bonus, and elements at a higher z-index are prioritized.
+     * This prevents clicking background "Add Patient" when the modal's
+     * "Add Patient" submit button is the intended target.
+     *
+     * @param {{ text_match: string, role_hint?: string, scope_hint?: string }} action
+     * @returns {Element|null} The best-matching DOM element or null
+     */
     function resolveSemanticTarget(action) {
         if (!action.text_match) return null;
 
@@ -291,38 +390,77 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 if (rect.width === 0 || rect.height === 0) continue;
                 const style = window.getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden') continue;
-                if (parseFloat(style.opacity) === 0) continue;
+
+                const tag = el.tagName.toLowerCase();
+                const inputType = (tag === 'input' ? (el.type || '').toLowerCase() : '');
+
+                // Invisible overlay inputs (e.g. Amazon's .a-button-input or custom file/checkbox overlays) have opacity: 0
+                // but are positioned directly over the button to intercept native clicks. Do not skip them!
+                const isOverlayInput = (tag === 'input' && ['submit', 'button', 'checkbox', 'radio', 'file', 'image'].includes(inputType)) ||
+                    el.classList.contains('a-button-input');
+                if (parseFloat(style.opacity) === 0 && !isOverlayInput) continue;
 
                 // Compute text sources
                 const textContent = (el.textContent || '').trim().toLowerCase();
                 const firstLine = textContent.split('\n')[0].trim();
                 const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase().trim();
+                const titleText = (el.getAttribute('title') || '').toLowerCase().trim();
                 const elRole = (el.getAttribute('role') || '').toLowerCase();
-                const tag = el.tagName.toLowerCase();
+
+                let inputValue = '';
+                if (tag === 'input') {
+                    inputValue = (el.value || el.getAttribute('value') || el.placeholder || '').trim().toLowerCase();
+                }
+
+                let labelledByText = '';
+                const labelledById = el.getAttribute('aria-labelledby');
+                if (labelledById) {
+                    try {
+                        labelledByText = labelledById.split(/\s+/).map(id => {
+                            const lEl = document.getElementById(id);
+                            return lEl ? (lEl.textContent || '').trim().toLowerCase() : '';
+                        }).filter(Boolean).join(' ');
+                    } catch (e) {}
+                }
 
                 // Derive implicit role for role_hint matching
                 let impliedRole = elRole;
                 if (!impliedRole) {
                     if (tag === 'button') impliedRole = 'button';
                     else if (tag === 'a') impliedRole = 'link';
-                    else if (tag === 'input') impliedRole = 'textbox';
+                    else if (tag === 'input') {
+                        if (['submit', 'button', 'reset', 'image'].includes(inputType)) impliedRole = 'button';
+                        else if (['checkbox', 'radio'].includes(inputType)) impliedRole = inputType;
+                        else impliedRole = 'textbox';
+                    }
                     else if (tag === 'select') impliedRole = 'combobox';
                 }
 
                 // Score the element
                 let score = 0;
 
-                // Exact match on first line of text content (highest confidence)
-                if (firstLine === searchText) score = 100;
-                else if (ariaLabel === searchText) score = 95;
-                else if (textContent === searchText) score = 90;
+                // Exact match (highest confidence)
+                if (firstLine === searchText || inputValue === searchText || labelledByText === searchText) {
+                    score = 100;
+                } else if (ariaLabel === searchText || titleText === searchText) {
+                    score = 95;
+                } else if (textContent === searchText) {
+                    score = 90;
+                }
                 // Starts-with match
-                else if (firstLine.startsWith(searchText)) score = 75;
-                else if (ariaLabel.startsWith(searchText)) score = 70;
+                else if (firstLine.startsWith(searchText) || inputValue.startsWith(searchText) || labelledByText.startsWith(searchText)) {
+                    score = 75;
+                } else if (ariaLabel.startsWith(searchText) || titleText.startsWith(searchText)) {
+                    score = 70;
+                }
                 // Contains match
-                else if (firstLine.includes(searchText)) score = 55;
-                else if (ariaLabel.includes(searchText)) score = 50;
-                else if (textContent.includes(searchText)) score = 30;
+                else if (firstLine.includes(searchText) || inputValue.includes(searchText) || labelledByText.includes(searchText)) {
+                    score = 55;
+                } else if (ariaLabel.includes(searchText) || titleText.includes(searchText)) {
+                    score = 50;
+                } else if (textContent.includes(searchText)) {
+                    score = 30;
+                }
 
                 if (score === 0) continue;
 
@@ -333,6 +471,17 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
 
                 // Bonus for shorter/more precise text (less container noise)
                 if (firstLine.length < 40) score += 5;
+
+                // Penalize aria-hidden decorative elements (like inner Amazon styling spans)
+                if (el.getAttribute('aria-hidden') === 'true') {
+                    score -= 30;
+                }
+
+                // Bonus for native interactive controls over passive spans/divs
+                if (tag === 'button' || (tag === 'input' && ['submit', 'button'].includes(inputType)) ||
+                    tag === 'a' || ['button', 'link'].includes(elRole)) {
+                    score += 15;
+                }
 
                 // Bonus for role_hint match
                 if (roleHint && impliedRole === roleHint) {
@@ -379,8 +528,11 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
             }
         }
 
-        // Require a minimum confidence score
-        return bestScore >= 25 ? bestEl : null;
+        // Require a minimum confidence score, and promote matched element to its interactive control
+        if (bestScore >= 25 && bestEl) {
+            return getInteractiveTarget(bestEl);
+        }
+        return null;
     }
 
     /**
@@ -608,13 +760,12 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                 try {
                     // ── SEMANTIC TARGET RESOLUTION ──
                     // If the AI provides text_match, resolve by visible text/accessible name
-                    // BEFORE falling back to CSS selector lookup.
                     let semanticEl = null;
                     if (action.text_match) {
                         semanticEl = await waitForSemanticTarget(action, 1500);
                         if (semanticEl) {
                             extraData.resolvedViaTextMatch = true;
-                            extraData.matchedText = (semanticEl.textContent || '').trim().slice(0, 80);
+                            extraData.matchedText = (semanticEl.textContent || semanticEl.value || '').trim().slice(0, 80);
                             extraData.matchedTag = semanticEl.tagName.toLowerCase();
                         } else {
                             extraData.textMatchFailed = true;
@@ -622,18 +773,64 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                         }
                     }
 
-                    // Enhancement 4: Pre-flight CSS Selector Validation
-                    if (action.selector && !action.text_match && !['navigate', 'extract', 'scroll_down', 'scroll_up'].includes(action.action)) {
-                        try { document.createDocumentFragment().querySelector(action.selector); }
-                        catch (syntaxErr) {
+                    // Pre-flight CSS Selector Validation & Lookup
+                    let selectorEl = null;
+                    if (action.selector && !['navigate', 'extract', 'scroll_down', 'scroll_up', 'click_coordinate', 'keyboard_event'].includes(action.action)) {
+                        try {
+                            selectorEl = document.querySelector(action.selector);
+                        } catch (syntaxErr) {
                             extraData.error = `INVALID_SELECTOR_SYNTAX: "${action.selector}" — ${syntaxErr.message}. Use valid CSS only.`;
                             sendResponse({ success: false, ...extraData });
                             return;
                         }
                     }
 
-                    // Resolve element: semantic target takes priority over CSS selector
-                    const el = semanticEl || (action.selector ? document.querySelector(action.selector) : null);
+                    // ── ELEMENT RESOLUTION ──
+                    // If a specific selector (like #add-to-cart-button or input[name="submit.add-to-cart"]) was provided,
+                    // prioritize selectorEl over an inner/styling span match if they relate to the same component.
+                    const isGenericSelector = !action.selector ||
+                        /^(button|a|input|span|div|li|\*|\.btn|\.button)(,\s*(button|a|input|span|div|li|\*|\.btn|\.button))*$/i.test(action.selector.trim());
+
+                    let el = null;
+                    if (selectorEl && !isGenericSelector) {
+                        if (!semanticEl) {
+                            el = selectorEl;
+                        } else {
+                            const selectorTag = selectorEl.tagName.toLowerCase();
+                            const selectorInputType = (selectorTag === 'input' ? (selectorEl.type || '').toLowerCase() : '');
+                            const isSelectorInteractive = selectorTag === 'button' || selectorTag === 'a' ||
+                                (selectorTag === 'input' && ['submit', 'button', 'checkbox', 'radio'].includes(selectorInputType)) ||
+                                selectorEl.hasAttribute('role');
+
+                            const areRelated = selectorEl.contains(semanticEl) || semanticEl.contains(selectorEl) ||
+                                (selectorEl.parentElement && selectorEl.parentElement === semanticEl.parentElement) ||
+                                (selectorEl.closest('.a-button, .btn, form') && selectorEl.closest('.a-button, .btn, form') === semanticEl.closest('.a-button, .btn, form'));
+
+                            if (isSelectorInteractive && areRelated) {
+                                el = selectorEl;
+                                extraData.prioritizedSelectorOverSpan = true;
+                            } else {
+                                el = semanticEl;
+                            }
+                        }
+                    } else {
+                        el = semanticEl || selectorEl;
+                    }
+
+                    // Always promote target to the actual interactive control (button, input[type=submit], etc.)
+                    if (el && (action.action === 'click' || action.action === 'hover')) {
+                        const originalEl = el;
+                        el = getInteractiveTarget(el);
+                        if (el !== originalEl) {
+                            extraData.promotedToInteractiveControl = {
+                                fromTag: originalEl.tagName.toLowerCase(),
+                                toTag: el.tagName.toLowerCase(),
+                                toId: el.id || null,
+                                toType: el.getAttribute('type') || null
+                            };
+                        }
+                    }
+
                     // Actions that can work WITHOUT a selector
                     const selectorOptionalActions = ['navigate', 'extract', 'scroll_down', 'scroll_up', 'click_coordinate', 'keyboard_event'];
                     if (!el && !selectorOptionalActions.includes(action.action)) {
@@ -644,7 +841,7 @@ if (typeof window.hyprflowListenerAdded === 'undefined') {
                     }
 
                     if (el) {
-                        try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { }
+                        try { el.scrollIntoView({ behavior: 'auto', block: 'center' }); } catch (e) { }
                     }
 
                     // ── CLICK ──
