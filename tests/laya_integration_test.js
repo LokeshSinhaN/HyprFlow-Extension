@@ -72,7 +72,7 @@ async function runTests() {
 
         assert(questions.fitness_rating, 'Should have fitness_rating score');
         assert.strictEqual(questions.fitness_rating.type, 'score');
-        assert.deepStrictEqual(questions.fitness_rating.levels, ['poor', 'fair', 'good', 'excellent']);
+        assert.deepStrictEqual(questions.fitness_rating.criteria, ['poor', 'fair', 'good', 'excellent']);
     });
 
     await it('RCM / Portal schema builds claim status choice and manual intervention noul', () => {
@@ -129,14 +129,20 @@ async function runTests() {
     // ─── SECTION 3: MOCK LAYA SERVER WITH PROTOCOL EMULATION ───
     console.log('\n[3] Protocol Validation with Mock Laya HTTP Server:');
 
-    // Create a local mock Laya server on an available test port (8000 or custom)
-    const MOCK_PORT = 8000;
+    // Create a local mock Laya server on a dedicated test port
+    const MOCK_PORT = 59998;
     let mockServer;
     let serverStarted = false;
 
     try {
         mockServer = http.createServer((req, res) => {
-            if (req.method === 'POST' && req.url === '/predict') {
+            if (req.method === 'GET' && req.url === '/health') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'ok', device: 'cpu' }));
+                return;
+            }
+
+            if (req.method === 'POST' && (req.url === '/v1/systemone' || req.url === '/predict')) {
                 let body = '';
                 req.on('data', chunk => { body += chunk; });
                 req.on('end', () => {
@@ -193,7 +199,6 @@ async function runTests() {
                 resolve();
             });
             mockServer.on('error', (err) => {
-                // If port 8000 already in use, skip mock server test or bind other
                 resolve();
             });
         });

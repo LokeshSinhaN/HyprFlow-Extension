@@ -18,7 +18,7 @@
         'http://127.0.0.1:8000',
         'http://localhost:8000'
     ];
-    const DEFAULT_TIMEOUT_MS = 5000; // Fast System 1 responses expected within 30-100ms
+    const DEFAULT_TIMEOUT_MS = 25000; // Allows comfortable CPU inference on local machines (30-100ms with GPU, 2-15s on CPU)
     const HIGH_CONFIDENCE_THRESHOLD = 0.85;
 
     /**
@@ -90,7 +90,7 @@
                 fitness_rating: {
                     type: 'score',
                     instructions: `Rate the ${rubricDescription} relative to user budget and requirements`,
-                    levels: ['poor', 'fair', 'good', 'excellent']
+                    criteria: ['poor', 'fair', 'good', 'excellent']
                 }
             }),
 
@@ -107,7 +107,7 @@
                 fitness_rating: {
                     type: 'score',
                     instructions: 'Rate the quality/price fitness rating of this product on a 4-tier scale',
-                    levels: ['poor', 'fair', 'good', 'excellent']
+                    criteria: ['poor', 'fair', 'good', 'excellent']
                 }
             })
         },
@@ -214,6 +214,7 @@
     class LayaClient {
         constructor(options = {}) {
             this.baseUrl = options.baseUrl || DEFAULT_LAYA_URL;
+            this.isExplicitUrl = !!options.baseUrl;
             this.timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
             this.lastKnownOnline = null;
             this.lastResolvedUrl = null;
@@ -229,7 +230,9 @@
                 return this.lastResolvedUrl;
             }
 
-            const candidateUrls = [this.baseUrl, ...CANDIDATE_LAYA_URLS];
+            const candidateUrls = this.isExplicitUrl
+                ? [this.baseUrl]
+                : [this.baseUrl, ...CANDIDATE_LAYA_URLS];
             const uniqueUrls = [...new Set(candidateUrls)];
 
             for (const url of uniqueUrls) {
@@ -250,17 +253,30 @@
         }
 
         /**
-         * Pings a Laya server candidate by sending a lightweight preflight probe or dummy predict
+         * Pings a Laya server candidate by probing /health (standard laya-serve endpoint)
+         * or fallback endpoints (/v1/systemone, /predict)
          * @param {string} targetUrl
          * @returns {Promise<boolean>}
          */
         async ping(targetUrl = this.baseUrl) {
+            const cleanUrl = targetUrl.replace(/\/+$/, '');
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 1200);
+            const timeoutId = setTimeout(() => controller.abort(), 1500);
 
             try {
-                // Try sending a minimal probe predict request
-                const res = await fetch(`${targetUrl.replace(/\/+$/, '')}/predict`, {
+                // 1. Primary check: GET /health (Standard laya-serve FastAPI endpoint)
+                const healthRes = await fetch(`${cleanUrl}/health`, {
+                    method: 'GET',
+                    signal: controller.signal
+                }).catch(() => null);
+
+                if (healthRes && (healthRes.ok || healthRes.status === 200)) {
+                    clearTimeout(timeoutId);
+                    return true;
+                }
+
+                // 2. Secondary check: Probe POST /v1/systemone (TypeSafe Jev wire protocol)
+                const sysOneRes = await fetch(`${cleanUrl}/v1/systemone`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -273,9 +289,31 @@
                         }
                     }),
                     signal: controller.signal
-                });
+                }).catch(() => null);
+
+                if (sysOneRes && (sysOneRes.ok || sysOneRes.status === 422 || sysOneRes.status === 400)) {
+                    clearTimeout(timeoutId);
+                    return true;
+                }
+
+                // 3. Backward compatibility / mock server fallback: /predict
+                const predictRes = await fetch(`${cleanUrl}/predict`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        state: { body: 'ping' },
+                        questions: {
+                            is_active: {
+                                type: 'noul',
+                                instructions: 'Is server active?'
+                            }
+                        }
+                    }),
+                    signal: controller.signal
+                }).catch(() => null);
+
                 clearTimeout(timeoutId);
-                return res.ok || res.status === 422 || res.status === 400; // Any response from laya-serve indicates server is running
+                return !!(predictRes && (predictRes.ok || predictRes.status === 422 || predictRes.status === 400));
             } catch (err) {
                 clearTimeout(timeoutId);
                 return false;
@@ -319,7 +357,54 @@
         }
 
         /**
-         * Direct predict request to http://127.0.0.1:8000/predict
+         * Normalizes questions dictionary to match Laya's strict schema requirements:
+         * - 'instructions' field is required on all questions
+         * - 'score' question expects 'criteria' as an array of string level descriptions
+         * - 'choice' question expects 'criteria' as an object or dictionary
+         * @param {object} questions
+         * @returns {object}
+         */
+        normalizeQuestions(questions) {
+            if (!questions || typeof questions !== 'object') {
+                return {};
+            }
+
+            const normalized = {};
+            for (const [key, q] of Object.entries(questions)) {
+                if (!q || typeof q !== 'object') continue;
+                const copy = { ...q };
+
+                // Ensure 'instructions' is populated
+                if (!copy.instructions) {
+                    copy.instructions = copy.text || copy.prompt || copy.title || key;
+                }
+
+                // Normalise score questions: criteria must be an array of level descriptions
+                if (copy.type === 'score') {
+                    if (!copy.criteria && Array.isArray(copy.levels)) {
+                        copy.criteria = copy.levels;
+                    }
+                    if (!Array.isArray(copy.criteria)) {
+                        copy.criteria = ['poor', 'fair', 'good', 'excellent'];
+                    }
+                }
+
+                // Normalise choice questions: criteria should be an object mapping choice -> description
+                if (copy.type === 'choice' && Array.isArray(copy.criteria)) {
+                    const criteriaObj = {};
+                    copy.criteria.forEach((c) => { criteriaObj[c] = null; });
+                    copy.criteria = criteriaObj;
+                }
+
+                normalized[key] = copy;
+            }
+
+            return normalized;
+        }
+
+        /**
+         * Direct predict request to local Laya server
+         * Uses TypeSafe Jev protocol (/v1/systemone) with automatic fallback to /predict
          * Evaluates a state against structured questions in a single forward pass (~30ms)
          *
          * @param {string|object} state - Text, DOM context, or state dictionary
@@ -339,20 +424,22 @@
                 };
             }
 
+            const cleanBase = activeUrl.replace(/\/+$/, '');
             const normalizedState = this.normalizeState(state);
+            const normalizedQuestions = this.normalizeQuestions(questions);
             const payload = {
                 state: normalizedState,
-                questions: questions || {}
+                questions: normalizedQuestions
             };
 
             const timeoutMs = options.timeoutMs || this.timeoutMs;
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
             const startTime = Date.now();
 
             try {
-                const response = await fetch(`${activeUrl.replace(/\/+$/, '')}/predict`, {
+                // Try TypeSafe Jev endpoint (/v1/systemone) first
+                let response = await fetch(`${cleanBase}/v1/systemone`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -361,6 +448,19 @@
                     body: JSON.stringify(payload),
                     signal: controller.signal
                 });
+
+                // Fallback to /predict if /v1/systemone returned 404 Not Found (e.g. custom mock server)
+                if (response.status === 404) {
+                    response = await fetch(`${cleanBase}/predict`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        },
+                        body: JSON.stringify(payload),
+                        signal: controller.signal
+                    });
+                }
 
                 clearTimeout(timeoutId);
                 const latencyMs = Date.now() - startTime;
