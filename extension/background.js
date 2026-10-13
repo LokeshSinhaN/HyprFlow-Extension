@@ -690,8 +690,8 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         selector: null
     };
 
-    // 3. Interactive element candidates
-    elements.slice(0, 15).forEach((el, index) => {
+    // 3. Interactive element candidates (top 8 prominent interactive elements for fast gating)
+    elements.slice(0, 8).forEach((el, index) => {
         const label = (el.text || el.ariaLabel || el.placeholder || el.name || el.value || el.selector || '').trim().slice(0, 80);
         const tag = (el.tagName || '').toLowerCase();
         let actionType = 'click';
@@ -760,7 +760,8 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
     };
 
     try {
-        const layaResult = await layaClientInstance.predict(state, questions, { timeoutMs: 3000 });
+        const timeoutMs = layaClientInstance.timeoutMs || 25000;
+        const layaResult = await layaClientInstance.predict(state, questions, { timeoutMs });
         if (!layaResult.success) {
             return {
                 shouldFallback: true,
@@ -1490,7 +1491,11 @@ async function agentLoop(prompt, tabId, planSteps = []) {
                                 failedActionCount++;
                                 break;
                             } else {
-                                sendLogToPanel(`[Laya Only] Low confidence (${((layaGateResult.confidence || 0) * 100).toFixed(1)}%). Fallback disabled in Laya Only mode.`, 'warn');
+                                const failureReason = layaGateResult.reason || 'Confidence < 85%';
+                                const confStr = layaGateResult.confidence !== undefined
+                                    ? `Confidence: ${(layaGateResult.confidence * 100).toFixed(1)}%`
+                                    : 'Evaluation unavailable';
+                                sendLogToPanel(`[Laya Only] ${confStr} (${failureReason}). Fallback disabled in Laya Only mode. Tip: Use "Hybrid: Laya + Gemini" mode so Gemini handles generative actions.`, 'warn');
                                 failedActionCount++;
                                 await waitForStability(currentTabId, 1500);
                                 continue;
