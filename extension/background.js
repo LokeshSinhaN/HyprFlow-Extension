@@ -690,8 +690,44 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         selector: null
     };
 
-    // 3. Interactive element candidates (top 8 prominent interactive elements for fast gating)
-    elements.slice(0, 8).forEach((el, index) => {
+    // 3. Extract keywords from user goal for relevance ranking
+    const promptWords = promptLower
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 2 && !['and', 'the', 'for', 'click', 'select', 'first', 'from', 'with', 'onto', 'into'].includes(w));
+
+    // Score and rank elements by goal keyword matches and interactivity
+    const scoredElements = elements.map((el, originalIndex) => {
+        const text = (el.text || '').toLowerCase();
+        const aria = (el.ariaLabel || '').toLowerCase();
+        const title = (el.title || '').toLowerCase();
+        const placeholder = (el.placeholder || '').toLowerCase();
+        const name = (el.name || '').toLowerCase();
+        const sel = (el.selector || '').toLowerCase();
+        const combined = `${text} ${aria} ${title} ${placeholder} ${name} ${sel}`;
+
+        let score = 0;
+        promptWords.forEach(word => {
+            if (combined.includes(word)) {
+                score += 15;
+            }
+        });
+
+        // Boost clickable links, buttons, and inputs
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'button' || tag === 'a' || tag === 'input') score += 2;
+        if (el.isPrimary || (el.className || '').includes('primary') || (el.className || '').includes('btn')) score += 3;
+
+        return { el, score, originalIndex };
+    });
+
+    // Sort by relevance score descending so best-matching elements appear first
+    scoredElements.sort((a, b) => b.score - a.score);
+
+    // Pick top candidates (up to 10 top relevant elements)
+    const topCandidates = scoredElements.slice(0, 10).map(item => item.el);
+
+    topCandidates.forEach((el, index) => {
         const label = (el.text || el.ariaLabel || el.placeholder || el.name || el.value || el.selector || '').trim().slice(0, 80);
         const tag = (el.tagName || '').toLowerCase();
         let actionType = 'click';
@@ -750,8 +786,9 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         }
     }
 
-    // State payload for Laya ModernBERT forward pass
+    // State payload with rich synthesized body for ModernBERT tokenization
     const state = {
+        body: `Page: ${pageTitle || 'Webpage'} (${pageUrl}). User goal: ${prompt}.`,
         goal: prompt,
         pageUrl: pageUrl,
         pageTitle: pageTitle,
@@ -803,14 +840,18 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
             sendLogToPanel(`⚠️ [Laya Fast Gate] Element identified as final non-reversible booking confirmation. Verifying safety...`, 'warn');
         }
 
-        // High-confidence execution (>= 0.85)
-        if (confidence >= 0.85 && matchedAction) {
+        // Adaptive confidence threshold:
+        // - In Laya Only mode: Laya is the sole decision engine (threshold 0.40 since 40% over 10 options is a strong majority)
+        // - In Hybrid mode: threshold is 0.85 (>= 85% executes directly, < 85% falls back to Gemini)
+        const requiredConfidence = (currentProviderMode === 'laya_only') ? 0.40 : 0.85;
+
+        if (confidence >= requiredConfidence && matchedAction) {
             return {
                 executed: true,
                 confidence: confidence,
                 latencyMs: layaResult.latencyMs,
                 decision: {
-                    thought: `[Laya Fast Gate ~${layaResult.latencyMs || 30}ms] High confidence (${(confidence * 100).toFixed(1)}% >= 85%): ${matchedAction.action} on ${matchedAction.selector || 'page'}.`,
+                    thought: `[Laya Fast Gate ~${layaResult.latencyMs || 30}ms] Confidence (${(confidence * 100).toFixed(1)}% >= ${(requiredConfidence * 100).toFixed(0)}%): ${matchedAction.action} on ${matchedAction.selector || 'page'}.`,
                     action: matchedAction.action,
                     selector: matchedAction.selector,
                     text: matchedAction.text,
@@ -823,12 +864,12 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
             };
         }
 
-        // Low confidence (< 0.85) -> fallback to Gemini
+        // Low confidence -> fallback
         return {
             executed: false,
             shouldFallback: true,
             confidence: confidence,
-            reason: `Calibrated confidence ${(confidence * 100).toFixed(1)}% < 85% threshold. Forwarding to Gemini (System 2)...`
+            reason: `Calibrated confidence ${(confidence * 100).toFixed(1)}% < ${(requiredConfidence * 100).toFixed(0)}% threshold.`
         };
     } catch (err) {
         return {

@@ -351,6 +351,16 @@
                 return { body: state };
             }
             if (state && typeof state === 'object') {
+                if (!state.body) {
+                    const parts = [];
+                    if (state.goal) parts.push(`User goal: ${state.goal}`);
+                    if (state.pageTitle) parts.push(`Page title: ${state.pageTitle}`);
+                    if (state.pageUrl) parts.push(`URL: ${state.pageUrl}`);
+                    if (state.recentActions) parts.push(`Recent actions: ${state.recentActions}`);
+                    if (state.currentPlanStep) parts.push(`Plan step: ${state.currentPlanStep}`);
+                    const bodyText = parts.length > 0 ? parts.join(' | ') : JSON.stringify(state);
+                    return { ...state, body: bodyText };
+                }
                 return state;
             }
             return { body: String(state || '') };
