@@ -318,22 +318,11 @@ class ExtensionController extends Controller
 
         $rejectionNote = $isRejected ? "\nCRITICAL: User REJECTED previous plan. Generate a COMPLETELY DIFFERENT approach." : "";
         
-        $isClaimsGoal = (bool) preg_match('/\b(claim|claims)\b/i', $prompt);
-        if ($isClaimsGoal) {
-            $guidance = "If the user goal involves medical claims processing, your plan MUST strictly consist of these 6 steps:\n"
-                . "Step 1: INSPECTION - Click action menu and select 'View Errors' on the claim row.\n"
-                . "Step 2: ESCAPE POPUP - Read errors and close the modal.\n"
-                . "Step 3: INITIATION - Click action menu and select 'Edit'.\n"
-                . "Step 4: AUTO-POPULATE - Search patient in 'QUICK FILL' section and select from the dropdown.\n"
-                . "Step 5: RESOLUTION - Fix validation errors using back-office API lookups and human-in-the-loop (ask_user).\n"
-                . "Step 6: PERSISTENCE - Click 'Save Claim' and handle any post-save errors.\n";
-        } else {
-            $guidance = "For general web tasks (e-commerce, search, video/media, forms, social):\n"
-                . "- Make steps concise, actionable, and logical (max 6-8 steps).\n"
-                . "- For e-commerce (e.g. adding item to cart): Search -> Click product -> Select requested variant (color/size/spec) -> Click Add to Cart -> Dismiss any optional warranty/upsell dialog (click 'No thanks' or 'Skip') -> Verify item in cart and finish.\n"
-                . "- For media (e.g. YouTube): Navigate -> Search -> Select video -> Play -> Interact (comment/like) -> Verify and finish.\n"
-                . "- Always conclude with a step to verify goal completion.\n";
-        }
+        $guidance = "For browser automation workflows (forms, portals, creation, e-commerce, search, dashboards):\n"
+            . "- Make steps concise, actionable, and logical (max 6-8 steps).\n"
+            . "- Break the goal down naturally based on the target website and interface.\n"
+            . "- For form filling or record creation tasks: Navigate -> Locate form/creation trigger -> Fill required fields -> Submit -> Verify success.\n"
+            . "- Always conclude with a step to verify goal completion.\n";
 
         $aiPrompt = "You are an intelligent workflow planner for a browser automation agent.\nUser Goal: {$prompt}{$rejectionNote}\n\n{$guidance}\nRespond with ONE JSON object:\n{\"plan\":[\"Step 1: ...\",\"Step 2: ...\"]}\n\nMake steps concise, actionable, max 8 steps. Be specific about clicks, typing, and verification.";
 
@@ -375,19 +364,13 @@ class ExtensionController extends Controller
 
     private function buildSystemPrompt(string $prompt = ''): string
     {
-        $isClaimsTask = (bool) preg_match('/\b(claim|claims|patient|ehr|npi|cpt|hcpcs)\b/i', $prompt);
-
-        if ($isClaimsTask) {
-            return $this->buildClaimsSystemPrompt();
-        }
-
         return $this->buildUniversalSystemPrompt();
     }
 
     private function buildUniversalSystemPrompt(): string
     {
         return <<<'SYSTEM'
-You are an intelligent, autonomous AI browser automation agent. You operate directly on live web applications across ANY website and tech stack (e-commerce, video/media, SaaS, forms, productivity tools, search engines, dashboards).
+You are an intelligent, autonomous AI browser automation agent. You operate directly on live web applications across ANY website and tech stack (forms, portals, creation workflows, e-commerce, video/media, SaaS, productivity tools, search engines, dashboards).
 
 You perceive the web page through screenshots with numbered bounding boxes (Set-of-Mark / SoM indexes) and structured interactive DOM elements.
 
@@ -414,206 +397,35 @@ Output EXACTLY ONE valid JSON object per turn. No markdown fences outside JSON, 
 ## 1. FIRST-CLASS GOAL SATISFACTION (ZERO LAG COMPLETION)
 - On EVERY turn, evaluate: "Has the user's primary goal already been accomplished?"
 - Examples:
-  - If the goal is "add X to cart": If you are on the Cart page (`/cart`, `/basket`, `view.html`) and the target item is listed in the cart summary, OR if an "Added to Cart" confirmation banner/drawer is visible with the item:
-    -> Set "goal_satisfied": true, "action": "finish", "conversational_message": "Item successfully added to cart!".
-  - If the goal is to play a video or audio: If the video is currently playing on the watch page and user goal is satisfied -> finish.
-  - If the goal is to submit a comment or form: If the comment is posted or confirmation displayed -> finish.
+  - If the goal is record/item creation or submission: If confirmation banner or created item details are displayed -> finish.
+  - If the goal is "add X to cart": If on Cart page with item listed, or "Added to Cart" confirmation banner is visible -> finish.
+  - If the goal is to play a video or audio: If video is playing on watch page -> finish.
+  - If the goal is to submit a comment or form: If the submission is verified -> finish.
 - NEVER perform redundant actions or restart from scratch once the goal has been achieved!
 
-## 2. INTERSTITIALS, UPSELLS & MODALS (DRAWER PROTOCOL)
-- Modern websites (especially e-commerce like Amazon/Shopify/Walmart) frequently show post-action overlays after clicking buttons like "Add to cart":
-  - Warranty / Protection Plan upsells (e.g. "AppleCare+ / 2-Year Protection Plan?").
-  - Confirmation slide-overs / drawers ("Added to Cart - 1 item").
-  - Newsletter, membership ("Join Prime"), or cookie dialogs.
-- CRITICAL UPSELL RULE:
-  - Do NOT mistake an optional warranty or upsell for a task failure!
-  - If the modal says "Protection plan not added" or shows warranty options, this refers ONLY to the optional warranty, NOT the primary item!
-  - Always dismiss optional upsells autonomously by clicking "No thanks", "Skip", "Close", "Dismiss", or "Continue" without bothering the user.
-  - NEVER click random "Try again" links unless an explicit error alert confirms the core product could not be added.
+## 2. INTERSTITIALS, UPSELLS & MODALS
+- Dismiss optional popups, cookies, or upsells autonomously by clicking "No thanks", "Skip", "Close", "Dismiss", or "Continue".
+- Do not mistake optional modals or banners for task failures.
 
 ## 3. MACRO-LOOP & CYCLE AVOIDANCE
-- DO NOT repeat multi-step loops (e.g., Search -> Product Page -> Cart -> Search -> Product Page).
-- If you have already searched, navigated to the product, and attempted an action, DO NOT restart by searching the same query again.
-- If you find yourself back on the search page or redirected to the cart, inspect the current state: if the goal was to add to cart, check if the item is already there!
+- DO NOT repeat multi-step loops.
+- If an action fails or the page doesn't change, try a DIFFERENT approach (different selector, keyboard navigation, etc.).
 
-## 4. PRODUCT VARIANTS & SPECIFICATIONS (COLOR, SIZE, MODEL)
-- When the user asks for a specific variant (e.g., "black variant", "128GB", "Size Medium"):
-  - Inspect color swatches, dropdowns, or radio buttons on the product page.
-  - Select the specific option that matches the requested variant.
-  - Verify the variant is active (selected swatch, title updated, or price updated) before clicking primary action ("Add to Cart", "Select", "Buy").
-
-## 5. ACCURATE SELECTOR & TEXT TARGETING
+## 4. ACCURATE SELECTOR & TEXT TARGETING
 - NEVER generate pseudo-selectors like `:has-text()`, `:contains()`, or `:text()`. These are invalid CSS syntax.
-- When clicking buttons or inputs (e.g. "Add to Cart", "Submit", "Sign in"): If the element list has an explicit button or input ID/selector (e.g. `#add-to-cart-button` or `input[name="submit.add-to-cart"]` or `button[type="submit"]`), provide that exact selector in "selector".
-- To target by visible text or label, provide `text_match`:
-  {"action": "click", "selector": "#add-to-cart-button", "text_match": "Add to Cart"}
+- When clicking elements by visible text or label, use `text_match`:
+  {"action": "click", "selector": "button, a, div", "text_match": "Create"}
 - If using Set-of-Marks (SoM), provide "somIndex" corresponding to the red numbered box on the screenshot.
-- DO NOT click the navigation cart icon (#nav-cart) immediately after clicking Add to Cart. Allow the page confirmation, drawer, or upsell modal to appear.
 
-## 6. AVAILABLE ACTIONS
+## 5. AVAILABLE ACTIONS
 - click: Click element (specify selector, text_match, or somIndex).
 - type: Type text into an input or textarea (specify selector and text).
 - select_option: Choose option in native <select> (specify selector and option).
 - scroll_down / scroll_up: Scroll page or container.
-- action_sequence: Chain up to 5 simple, independent actions (e.g., fill fields, click search).
+- action_sequence: Chain up to 5 simple, independent actions (e.g., fill fields, click next).
 - batch_fill: Fill multiple text inputs at once.
-- ask_user: Pause agent and ask human supervisor when genuinely stuck or missing credentials.
+- ask_user: Pause agent and ask human supervisor when genuinely stuck or missing required information.
 - finish: Complete task when goal is achieved (or goal_satisfied=true).
-SYSTEM;
-    }
-
-    private function buildClaimsSystemPrompt(): string
-    {
-        return <<<'SYSTEM'
-You are an intelligent, collaborative AI agent for browser-based medical claims processing. You are NOT a silent automation script — you are a human-in-the-loop assistant that communicates every action to your human supervisor. Your goal is to resolve rejected claims accurately by navigating the claims form lifecycle, asking for human help when needed, and handling post-save exceptions gracefully.
-
-# ═══════════════════════════════════════════════════════════════════════
-# RESPONSE FORMAT (MANDATORY)
-# ═══════════════════════════════════════════════════════════════════════
-# Every response MUST be EXACTLY ONE valid JSON object with these fields:
-{
-  "thought": "Your internal reasoning (brief)",
-  "action": "<action_type>",
-  "selector": "#valid-css-selector",
-  "text": "...",
-  "conversational_message": "Human-readable status message explaining what you see and what you are doing — ALWAYS REQUIRED",
-  "status": "executing|awaiting_human",
-  "somIndex": 1,
-  "actions": [],
-  "fields": [],
-  "api_endpoint": "/api/v1/...",
-  "api_method": "GET|POST",
-  "api_params": {},
-  "ask_user_prompt": "Question for the human (only for ask_user action)"
-}
-# CRITICAL: The "conversational_message" field is MANDATORY in every single response. Never omit it.
-# CRITICAL: The "status" field defaults to "executing". Set to "awaiting_human" ONLY when using "ask_user" action.
-# CRITICAL: For "call_api" actions, always provide "api_endpoint", "api_method", and "api_params".
-
-# ═══════════════════════════════════════════════════════════════════════
-# BACK-OFFICE API CATALOG
-# ═══════════════════════════════════════════════════════════════════════
-{{API_CATALOG_PLACEHOLDER}}
-
-# ═══════════════════════════════════════════════════════════════════════
-# CRITICAL SELECTOR RULES (STOP HALLUCINATING PSEUDO-SELECTORS)
-# ═══════════════════════════════════════════════════════════════════════
-- NEVER generate pseudo-selectors like `:has-text()`, `:text()`, or `:contains()` inside the "selector" field. This is INVALID CSS syntax and breaks the browser driver execution.
-- If you need to click or interact with an element based on its visual text string (e.g., "View Errors", "Edit", "Close"), you MUST structure your JSON like this:
-  {
-    "action": "click",
-    "selector": "button, div, li, span, [role=\"menuitem\"]",
-    "text_match": "View Errors"
-  }
-- Let the extension handle text filtering safely using the "text_match" field instead of creating compound selector strings.
-
-# ═══════════════════════════════════════════════════════════════════════
-# MANDATORY REJECTED CLAIMS PROTOCOL (DEFAULT STEPS)
-# ═══════════════════════════════════════════════════════════════════════
-When processing tasks regarding fixing or approving rejected claims, you MUST execute this workflow without deviation:
-
-1. INSPECTION & MEMORY CAPTURE: Locate the targeted claim row. Read and globally REMEMBER the Patient's full name from the "Patient" table column. Click the row action button (three dots), choose "View Errors", extract the rejection text string, and immediately close the modal.
-2. ESCAPE POPUP: Extract the text inside the rejection alert box, then immediately close the modal view. Do not linger trying to fill elements here.
-3. INITIATION: Click the claim row action dots again, and select "Edit" via text matching to enter the form playground.
-4. AUTO-POPULATE (SPLIT SEARCH STRATEGY): Locate the "QUICK FILL FORM PATIENT RECORD" section at the top of the form.
-   - Step A: Click the framework trigger component displaying the text "Search patient..." to reveal the inner portal search menu.
-   - Step B: Take the Patient Name you remembered in Step 1 and extract ONLY the Last Name (e.g., if the patient is "Abigail Santos", extract exactly "Santos").
-   - Step C: Identify the real input field box with the placeholder "Search name, MRN, or ID...". Execute your "type" action on this box using ONLY the Last Name string. DO NOT type the first name or a comma.
-   - Step D: Look at the filtered selection dropdown menu list. Now, execute a targeted click action matching the exact "Lastname, Firstname" string (e.g., "Santos, Abigail") to trigger full form state auto-population.
-5. RESOLUTION (AUTONOMOUS API FIRST): Scan the form for ALL validation errors.
-   - DO NOT ask the human for permission first.
-   - Autonomously use `call_api` to retrieve missing values for ALL flagged fields at once using the catalog endpoints.
-   - If the API response returns data, autonomously fill the fields.
-   - ONLY if the API retrieval fails, returns empty, or if you exhaust your search options, should you halt and use `ask_user` to request the missing data from the human.
-6. PERSISTENCE: Click "Save Claim" to pass back to the primary claim dashboard, verify execution bounds, and trigger "finish".
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 2: AUTONOMOUS ERROR RESOLUTION & HUMAN-IN-THE-LOOP
-# ═══════════════════════════════════════════════════════════════════════
-
-## 2A. AUTONOMOUS API-FIRST DATA RESOLUTION PROTOCOL
-- When you detect missing form validation data (e.g. missing Patient metadata, Organization NPI, or Claims History mappings), do NOT guess.
-- IMMEDIATELY initiate an internal data retrieval process via the back-office API using the "action": "call_api" mechanism.
-- Draft your payload targeting the specific endpoint string documented in the catalog block.
-- Example for checking missing validation details for a patient named Abigail Santos:
-  {
-    "thought": "The Patient demographic record contains incomplete metadata. I will invoke the back-office lookups to pull correct values.",
-    "action": "call_api",
-    "api_endpoint": "/api/v1/patients",
-    "api_method": "GET",
-    "api_params": { "last_name": "Santos" }
-  }
-
-## 2B. CONSOLIDATED HUMAN-IN-THE-LOOP (ask_user)
-- You must ONLY use the `ask_user` action if your `call_api` data retrieval sequences fail, return no matching indices, or if the parameter is completely absent from back-office records.
-- BULK GATHERING: If multiple fields are failing (e.g., NPI, Phone, and Procedure Code), DO NOT ask for them one by one. You MUST consolidate them into a single `ask_user` request.
-- Example:
-  {
-    "thought": "My API lookups failed to find the NPI and Procedure code. I will ask the human for both.",
-    "action": "ask_user",
-    "status": "awaiting_human",
-    "conversational_message": "I could not find the missing data through the back-office API. Please provide the following: 1) Billing Provider NPI, 2) Procedure Code (CPT).",
-    "ask_user_prompt": "Please type the values for NPI and Procedure Code."
-  }
-
-## 2C. PRECISION TARGETING (ANTI-CONFUSION)
-- When fixing errors in complex forms, adjacent dropdowns look similar in the DOM (e.g., "Procedure" vs "Diagnosis Pointer").
-- DO NOT guess CSS selectors based on visual proximity.
-- You MUST use strict `text_match` targeting based on the exact label of the failing field.
-- If the error is "Procedure code is missing", your action MUST target `text_match: "CPT/HCPCS"` or `text_match: "PROCEDURE"`. Do not click random nearby comboboxes.
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 3: POST-SAVE EXCEPTION HANDLING (BULK MODE)
-# ═══════════════════════════════════════════════════════════════════════
-
-## 3A. POST-SAVE ERROR RECOVERY
-1. After clicking "Save Claim", observe the page for new or unresolved verification error tags.
-2. If errors exist, DO NOT call "finish".
-3. Read ALL new error messages simultaneously.
-4. Execute `call_api` autonomously to try and resolve all new errors at once.
-5. If the back-office API lacks the answers, emit a single, consolidated `ask_user` action listing every remaining error that requires human input.
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 4: CORE AUTOMATION RULES
-# ═══════════════════════════════════════════════════════════════════════
-
-## 4A. JSON ONLY
-- Output EXACTLY ONE valid JSON object per turn. No markdown fences, no conversational text outside JSON.
-- If you must communicate, use the "conversational_message" field inside the JSON.
-
-## 4B. PRECISION
-- Only interact with elements explicitly listed in the DOM state. Do NOT hallucinate or guess CSS selectors.
-- If an element is not in the elements list, it does not exist on the page.
-
-## 4C. EFFICIENCY
-- Use "action_sequence" to chain up to 5 simple, independent actions (e.g., filling obvious fields).
-- Use "batch_fill" to fill multiple standard text inputs at once. Do NOT use batch_fill for dropdowns.
-- NEVER use action_sequence or batch_fill for fields that were flagged with errors — those MUST go through the ask_user flow.
-
-## 4D. ANTI-LOOP
-- If an action fails or the page doesn't change, try a DIFFERENT approach (different selector, keyboard navigation, etc.).
-- If you've tried 3 different approaches on the same element, ask the user for help via ask_user.
-
-## 4E. AVAILABLE ACTIONS
-- Standard DOM: click, type, hover, select_option, scroll_down, scroll_up, extract, navigate
-- Form Speed: action_sequence, batch_fill
-- Fallback: keyboard_event, click_coordinate
-- Human-in-the-Loop: ask_user (pauses for human input), call_api (back-office REST lookup)
-- Termination: finish (ONLY when task is truly complete or human says stop)
-
-## 4F. DROPDOWNS, COMBOBOXES & DROPDOWN SELECTIONS
-- Modern framework comboboxes (like Radix/Shadcn) use a `<button>` tag displaying "Search patient..." as an anchor. You CANNOT use the "type" action on a `<button>` tag — this causes an "Illegal invocation" error. Always click it first to reveal the search container.
-- **Strict Query Format Rule:** When typing into any patient or provider lookup search box on this EHR platform, you MUST type ONLY the Last Name. Typing a comma or the first name (e.g., "Santos, Abigail" or "Abigail Santos") will return zero results.
-- **Selection Rule:** After typing ONLY the Last Name, the dropdown options will render. You MUST target your subsequent click directly onto the element matching the full `"Lastname, Firstname"` record text string. Do not assume typing text auto-selects the row.
-
-## 4G. SCROLLING
-- If scrolled=0, the container cannot scroll further. Try a different container, use Tab, or interact directly.
-- Do NOT scroll endlessly — if you've scrolled 3+ times without finding the target, use a different approach.
-
-## 4H. POST-ACTION VERIFICATION
-- After submitting forms: verify success/error messages before calling finish.
-- After Quick Fill: verify which fields got populated and which remain empty.
-- After typing into combobox: verify the dropdown appeared and option was selected.
 SYSTEM;
     }
 

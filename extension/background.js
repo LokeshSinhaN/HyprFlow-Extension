@@ -604,7 +604,7 @@ async function handleRecordedUserAction(actionPayload) {
         const candidateIntents = [
             'select_date', 'choose_flight', 'baggage_selection', 'payment',
             'product_search', 'add_to_cart', 'filter_results',
-            'claim_lookup', 'fill_patient_info', 'submit_claim',
+            'form_submit', 'button_click', 'data_entry',
             'form_input', 'navigation_click', 'other'
         ];
 
@@ -621,7 +621,7 @@ async function handleRecordedUserAction(actionPayload) {
         const intentConf = intentResult.success ? (intentResult.confidence * 100).toFixed(0) : '?';
         const isSafe = safetyResult.success ? safetyResult.isSafe : true;
 
-        if (!isSafe || safetyResult.isIrreversible) {
+        if ((!isSafe || safetyResult.isIrreversible) && (safetyResult.confidence || 0) >= 0.75) {
             sendLogToPanel(`⚠️ [Laya Safety Alert] Non-reversible action: ${actionDesc} (Confidence: ${(safetyResult.confidence * 100).toFixed(0)}%)`, 'warn');
         } else {
             sendLogToPanel(`⚡ [Laya Recorder] Action: ${actionType} | Intent: ${intentName} (${intentConf}%) | Safety: SAFE in ~${intentResult.latencyMs || 30}ms`, 'info');
@@ -667,34 +667,51 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
     const promptLower = (prompt || '').toLowerCase();
     const urlLower = pageUrl.toLowerCase();
 
-    // Domain detection
-    const isFlightTask = /flight|airline|airport|booking|departure|travel|fare/i.test(promptLower + ' ' + urlLower);
-    const isEcommerceTask = /buy|cart|product|shop|price|amazon|store|item|ecommerce|order/i.test(promptLower + ' ' + urlLower);
-    const isRcmTask = /claim|rcm|patient|payer|denial|billing|adjudication/i.test(promptLower + ' ' + urlLower);
+    const hasPlan = Array.isArray(planSteps) && planSteps.length > 0;
+    const currentStepText = (hasPlan && planSteps[currentPlanStepIndex]) ? String(planSteps[currentPlanStepIndex]).toLowerCase() : '';
+    const isLastPlanStep = !hasPlan || (currentPlanStepIndex >= planSteps.length - 1);
+
+    // Hard physical DOM confirmation check:
+    const isCartUrl = /cart|basket|checkout|view\.html/i.test(urlLower);
+    const hasAddedToCartBanner = elements.some(el => {
+        const t = (el.text || '').toLowerCase();
+        return (t.includes('added to cart') || t.includes('added to basket') || t.includes('item added')) && t.length < 100;
+    });
+    const isCartGoal = /cart|basket|buy|purchase|add to cart/i.test(promptLower);
+    // Goal is only physically complete if verified in cart or on last step with confirmed state
+    const isFactualGoalCompletion = isCartGoal ? (isCartUrl || hasAddedToCartBanner) : (isLastPlanStep && actionHistory.length > 3);
 
     // Build candidate DOM actions from top visible interactive elements
     const candidateCriteria = {};
     const candidateActionMap = {};
 
-    // 1. Completion candidate
-    candidateCriteria['action_finish'] = `The automation goal "${prompt}" has been fully achieved on this page`;
-    candidateActionMap['action_finish'] = {
-        action: 'finish',
-        summary: `Goal completed on ${pageTitle || pageUrl}`
-    };
+    // ONLY include finish candidate IF we are verified on the final step or cart confirmed!
+    if (isFactualGoalCompletion) {
+        candidateCriteria['action_finish'] = `The automation goal "${prompt}" has been fully achieved on this page`;
+        candidateActionMap['action_finish'] = {
+            action: 'finish',
+            summary: `Goal completed on ${pageTitle || pageUrl}`
+        };
+    }
 
-    // 2. Scroll candidate
+    // Scroll candidate
     candidateCriteria['action_scroll'] = 'Scroll down to discover more elements, listings, or form inputs';
     candidateActionMap['action_scroll'] = {
         action: 'scroll_down',
         selector: null
     };
 
-    // 3. Extract keywords from user goal for relevance ranking
+    // Extract prompt keywords (weight 10)
     const promptWords = promptLower
         .replace(/[^\w\s]/g, ' ')
         .split(/\s+/)
-        .filter(w => w.length > 2 && !['and', 'the', 'for', 'click', 'select', 'first', 'from', 'with', 'onto', 'into'].includes(w));
+        .filter(w => w.length > 2 && !['and', 'the', 'for', 'click', 'select', 'first', 'from', 'with', 'onto', 'into', 'search', 'page'].includes(w));
+
+    // Extract current plan step keywords (weight 30 - primary focus!)
+    const stepWords = currentStepText
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 2 && !['and', 'the', 'for', 'click', 'select', 'first', 'from', 'with', 'onto', 'into', 'step', 'using', 'relevant'].includes(w));
 
     // Score and rank elements by goal keyword matches and interactivity
     const scoredElements = elements.map((el, originalIndex) => {
@@ -707,9 +724,18 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         const combined = `${text} ${aria} ${title} ${placeholder} ${name} ${sel}`;
 
         let score = 0;
+
+        // Current plan step matches get highest priority
+        stepWords.forEach(word => {
+            if (combined.includes(word)) {
+                score += 30;
+            }
+        });
+
+        // Overall goal prompt matches get secondary priority
         promptWords.forEach(word => {
             if (combined.includes(word)) {
-                score += 15;
+                score += 10;
             }
         });
 
@@ -718,17 +744,24 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         if (tag === 'button' || tag === 'a' || tag === 'input') score += 2;
         if (el.isPrimary || (el.className || '').includes('primary') || (el.className || '').includes('btn')) score += 3;
 
+        // Downrank generic noise links (like privacy, sell, header flags) if they have no keyword match
+        if (score <= 5 && (tag === 'a' || tag === 'button')) {
+            if (/privacy|terms|help|feedback|sell|customer service|registry|gift cards|\.in|\.com/i.test(combined)) {
+                score -= 20;
+            }
+        }
+
         return { el, score, originalIndex };
     });
 
     // Sort by relevance score descending so best-matching elements appear first
     scoredElements.sort((a, b) => b.score - a.score);
 
-    // Pick top candidates (up to 10 top relevant elements)
-    const topCandidates = scoredElements.slice(0, 10).map(item => item.el);
+    // Pick top candidates (max 6 high-relevance candidates for speed and precision)
+    const topCandidates = scoredElements.slice(0, 6).map(item => item.el);
 
     topCandidates.forEach((el, index) => {
-        const label = (el.text || el.ariaLabel || el.placeholder || el.name || el.value || el.selector || '').trim().slice(0, 80);
+        const label = (el.text || el.ariaLabel || el.placeholder || el.name || el.value || el.selector || '').trim().slice(0, 60);
         const tag = (el.tagName || '').toLowerCase();
         let actionType = 'click';
         if (tag === 'input' || tag === 'textarea') {
@@ -743,7 +776,7 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         }
 
         const key = `action_${index}_${actionType}`;
-        candidateCriteria[key] = `${actionType.toUpperCase()}: "${label}" (${tag}, ${el.selector})`;
+        candidateCriteria[key] = `${actionType.toUpperCase()}: "${label}" (${tag})`;
         candidateActionMap[key] = {
             action: actionType,
             selector: el.selector,
@@ -754,63 +787,51 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         };
     });
 
-    // Build dynamic typed questions
+    // Build lean typed questions (single question for maximum inference speed)
     const questions = {
         next_action: {
             type: 'choice',
-            instructions: `Given the user task: "${prompt}" and page "${pageTitle || pageUrl}", which DOM action should be executed next?`,
+            instructions: currentStepText
+                ? `Given step "${currentStepText}" of task "${prompt}", which DOM action should be executed next?`
+                : `Given task "${prompt}" on "${pageTitle || pageUrl}", which DOM action should be executed next?`,
             criteria: candidateCriteria
-        },
-        is_safe: {
-            type: 'noul',
-            instructions: 'Is this proposed DOM action safe, deterministic, and free of irreversible financial or data consequences?'
-        },
-        is_goal_achieved: {
-            type: 'noul',
-            instructions: `Has the user goal: "${prompt}" already been completely achieved on this page?`
         }
     };
 
-    // Integrate domain schemas
-    const schemas = (typeof LayaQuestionSchemas !== 'undefined') ? LayaQuestionSchemas : (self.LayaQuestionSchemas || null);
-    if (schemas) {
-        if (isFlightTask && schemas.flightBooking) {
-            questions.flight_step = schemas.flightBooking.buildStepRoutingQuestion().task_step;
-            questions.is_final_booking = schemas.flightBooking.buildConfirmationSafetyQuestion().is_final_confirmation;
-        } else if (isEcommerceTask && schemas.ecommerce) {
-            questions.product_match = schemas.ecommerce.buildRelevanceQuestion(prompt).product_relevance;
-            questions.fitness_rating = schemas.ecommerce.buildFitnessScoreQuestion().fitness_rating;
-        } else if (isRcmTask && schemas.rcmPortal) {
-            questions.claim_status = schemas.rcmPortal.buildClaimStatusQuestion().claim_status;
-            questions.manual_intervention = schemas.rcmPortal.buildInterventionQuestion().requires_manual_intervention;
-        }
+    // ONLY evaluate is_goal_achieved if factual completion signals exist!
+    if (isFactualGoalCompletion) {
+        questions.is_goal_achieved = {
+            type: 'noul',
+            instructions: `Has the user goal: "${prompt}" already been completely achieved on this page?`
+        };
     }
 
-    // State payload with rich synthesized body for ModernBERT tokenization
+    // Compact state payload for fast ModernBERT tokenization (keeps context lean)
     const state = {
-        body: `Page: ${pageTitle || 'Webpage'} (${pageUrl}). User goal: ${prompt}.`,
-        goal: prompt,
+        body: `Page: ${(pageTitle || 'Webpage').slice(0, 60)} (${(pageUrl || '').slice(0, 80)}). Step: ${(currentStepText || prompt).slice(0, 100)}.`,
+        goal: prompt.slice(0, 150),
         pageUrl: pageUrl,
         pageTitle: pageTitle,
-        recentActions: actionHistory.slice(-3).map(h => `${h.action} on ${h.selector || 'page'}`).join(' -> '),
-        currentPlanStep: planSteps[currentPlanStepIndex] || ''
+        recentActions: actionHistory.slice(-2).map(h => `${h.action} on ${h.selector || 'page'}`).join(' -> '),
+        currentPlanStep: currentStepText
     };
 
     try {
-        const timeoutMs = layaClientInstance.timeoutMs || 25000;
+        // Strict fast timeout: 3500ms in Hybrid mode (if CPU inference exceeds 3.5s, fall back to Gemini immediately)
+        const timeoutMs = (currentProviderMode === 'hybrid') ? 3500 : (layaClientInstance.timeoutMs || 25000);
         const layaResult = await layaClientInstance.predict(state, questions, { timeoutMs });
         if (!layaResult.success) {
             return {
                 shouldFallback: true,
                 offline: layaResult.offline,
-                reason: layaResult.error || 'Laya predict failed'
+                reason: layaResult.error || 'Laya predict failed or timed out'
             };
         }
 
         const answers = layaResult.answers || {};
 
-        // Check if goal is satisfied with high confidence
-        if (answers.is_goal_achieved?.value === true && answers.is_goal_achieved.confidence >= 0.85) {
+        // Check if goal is satisfied with high confidence ONLY when permitted
+        if (isFactualGoalCompletion && answers.is_goal_achieved?.value === true && answers.is_goal_achieved.confidence >= 0.90) {
             return {
                 executed: true,
                 confidence: answers.is_goal_achieved.confidence,
@@ -835,17 +856,15 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
         const confidence = actionAnswer.confidence || 0;
         const matchedAction = candidateActionMap[winningKey];
 
-        // Safety gate verification
-        if (answers.is_final_booking?.value === true && answers.is_final_booking.confidence >= 0.70) {
-            sendLogToPanel(`⚠️ [Laya Fast Gate] Element identified as final non-reversible booking confirmation. Verifying safety...`, 'warn');
-        }
-
         // Adaptive confidence threshold:
-        // - In Laya Only mode: Laya is the sole decision engine (threshold 0.40 since 40% over 10 options is a strong majority)
-        // - In Hybrid mode: threshold is 0.85 (>= 85% executes directly, < 85% falls back to Gemini)
+        // - In Laya Only mode: 0.40
+        // - In Hybrid mode: 0.85 (>= 85% executes directly, < 85% falls back to Gemini)
         const requiredConfidence = (currentProviderMode === 'laya_only') ? 0.40 : 0.85;
 
         if (confidence >= requiredConfidence && matchedAction) {
+            // Advance plan step if a real UI element was clicked/typed
+            const completesPlanStep = hasPlan && matchedAction.action !== 'scroll_down' && matchedAction.action !== 'finish';
+
             return {
                 executed: true,
                 confidence: confidence,
@@ -857,14 +876,15 @@ async function executeLayaFastGate(prompt, observeResult, actionHistory, planSte
                     text: matchedAction.text,
                     option: matchedAction.option,
                     confidence: confidence,
+                    planStepCompleted: completesPlanStep,
                     decisionSource: 'laya_fast_gate',
                     latencyMs: layaResult.latencyMs,
-                    conversational_message: `⚡ Laya Fast Gate decided: ${matchedAction.action} on ${matchedAction.selector || 'page'} (${(confidence * 100).toFixed(0)}% confidence in ${layaResult.latencyMs || 30}ms)`
+                    conversational_message: `⚡ Laya Fast Gate decided: ${matchedAction.action} on ${matchedAction.selector || 'page'} (${(confidence * 100).toFixed(0)}% in ${layaResult.latencyMs || 30}ms)`
                 }
             };
         }
 
-        // Low confidence -> fallback
+        // Low confidence -> fallback to Gemini
         return {
             executed: false,
             shouldFallback: true,

@@ -75,20 +75,6 @@ async function runTests() {
         assert.deepStrictEqual(questions.fitness_rating.criteria, ['poor', 'fair', 'good', 'excellent']);
     });
 
-    await it('RCM / Portal schema builds claim status choice and manual intervention noul', () => {
-        const questions = LayaQuestionSchemas.rcmPortal.buildClaimTriageQuestions();
-        assert(questions.claim_status, 'Should have claim_status');
-        assert.strictEqual(questions.claim_status.type, 'choice');
-        assert(questions.claim_status.criteria.paid);
-        assert(questions.claim_status.criteria.denied);
-        assert(questions.claim_status.criteria.pending);
-        assert(questions.claim_status.criteria.requires_info);
-        assert(questions.claim_status.criteria.appealed);
-
-        assert(questions.requires_manual_intervention, 'Should have requires_manual_intervention');
-        assert.strictEqual(questions.requires_manual_intervention.type, 'noul');
-        assert(questions.requires_manual_intervention.instructions.includes('manual human intervention'));
-    });
 
     await it('Generic automation builds intent routing and action safety questions', () => {
         const candidateIntents = ['click_button', 'fill_field', 'navigate_page'];
@@ -251,10 +237,7 @@ async function runTests() {
             assert(prodRes.answers.product_relevance);
             assert(prodRes.answers.fitness_rating);
 
-            const rcmRes = await client.evaluateRcmClaim('Claim #90210 Status: Denied code CO-16');
-            assert(rcmRes.success);
-            assert(rcmRes.answers.claim_status);
-            assert(rcmRes.answers.requires_manual_intervention);
+
         });
 
         // Close mock server

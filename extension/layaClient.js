@@ -112,49 +112,6 @@
             })
         },
 
-        /**
-         * RCM / Healthcare Portal Domain Schemas
-         */
-        rcmPortal: {
-            buildClaimStatusQuestion: () => ({
-                claim_status: {
-                    type: 'choice',
-                    instructions: 'Categorize the medical claim status or adjudication outcome on the portal',
-                    criteria: {
-                        paid: 'Claim has been fully or partially paid, settled, or approved',
-                        denied: 'Claim has been denied, rejected, or disputed with reason codes',
-                        pending: 'Claim is in process, under review, or awaiting initial adjudication',
-                        requires_info: 'Claim requires medical records, proof of service, or additional documentation',
-                        appealed: 'Claim is currently undergoing formal dispute or appeal'
-                    }
-                }
-            }),
-
-            buildInterventionQuestion: () => ({
-                requires_manual_intervention: {
-                    type: 'noul',
-                    instructions: 'Does this claim status or error code require manual human intervention?'
-                }
-            }),
-
-            buildClaimTriageQuestions: () => ({
-                claim_status: {
-                    type: 'choice',
-                    instructions: 'Categorize the medical claim status or adjudication outcome on the portal',
-                    criteria: {
-                        paid: 'Claim has been fully or partially paid, settled, or approved',
-                        denied: 'Claim has been denied, rejected, or disputed with reason codes',
-                        pending: 'Claim is in process, under review, or awaiting initial adjudication',
-                        requires_info: 'Claim requires medical records, proof of service, or additional documentation',
-                        appealed: 'Claim is currently undergoing formal dispute or appeal'
-                    }
-                },
-                requires_manual_intervention: {
-                    type: 'noul',
-                    instructions: 'Does this claim status or error code require manual human intervention?'
-                }
-            })
-        },
 
         /**
          * Generic Web Automation & Action Classification Schemas
@@ -703,13 +660,7 @@
             return await this.predict(productState, questions, options);
         }
 
-        /**
-         * Domain evaluation: RCM Claim Status & Manual Intervention Flag
-         */
-        async evaluateRcmClaim(claimState, options = {}) {
-            const questions = LayaQuestionSchemas.rcmPortal.buildClaimTriageQuestions();
-            return await this.predict(claimState, questions, options);
-        }
+
     }
 
     // Singleton instance for convenience
