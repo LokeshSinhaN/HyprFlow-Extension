@@ -21,3 +21,8 @@ composer.lock
 
 # Extension build artifacts (if any)
 extension/*.zip
+
+# Dependencies & Build
+node_modules/
+dist/
+package-lock.json
